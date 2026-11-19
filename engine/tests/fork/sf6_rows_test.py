@@ -11,8 +11,9 @@ block in cumulative_local_expert_recv_stats, the clone table with the coded maps
      rows agree bit for bit; then promotion merges put the native rows back (the coded bank is again the coding of
      the uncoded one) and an extract from a coded row gives the uncoded row's record
   3. call time, uncoded against coded, as CUDA-graph replays (k31_fork_common.timeit): min / median us per call
-env: E (128), TMAX (64), TS_EXACT (1,4,16,64), TIMING (1), PDL, NSMS; k31_fork_common.import_dg's MODE (fork) etc.
-ENGINE (/engine): the engine tree. Run by tests/fork/run_sf6_rows.sh.
+env: E (128), TMAX (64), TS_EXACT (1,4,16,64), TIMING (1), TS_TIME (1:16,2:27,4:44,4:64,16:96: rows:distinct experts
+of the timed calls), PDL, NSMS; k31_fork_common.import_dg's MODE (fork) etc. ENGINE (/engine): the engine tree.
+Prompt-sized calls: TMAX=4096 TS_EXACT=256,1024,4096 TS_TIME=1024:128,4096:128. Run by tests/fork/run_sf6_rows.sh.
 """
 import os
 import sys
@@ -165,7 +166,7 @@ bad += bad2
 
 # ---- 3. call time
 if TIMING:
-    for T, nd in ((1, 16), (2, 27), (4, 44), (4, 64), (16, 96)):
+    for T, nd in (tuple(int(v) for v in p.split(":")) for p in os.environ.get("TS_TIME", "1:16,2:27,4:44,4:64,16:96").split(",")):
         ids = c.make_ids(T, E, nd, 16, g, "cyc")
         x = torch.randn(T, c.H, dtype=torch.bfloat16, device=dev, generator=g)
         w = torch.softmax(torch.randn(T, c.K, device=dev, generator=g), -1).float()
