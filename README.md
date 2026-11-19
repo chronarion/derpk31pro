@@ -31,7 +31,7 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 
 | profile | decode, 1 conversation | reading a prompt (32K / 128K tokens) | KLD: 512 samples / long context / prompts |
 |---|---|---|---|
-| `default` (GB300 + RTX PRO 6000) | TBD tokens/s | TBD / TBD tokens/s | TBD / TBD / TBD |
+| `default` (GB300 + RTX PRO 6000) | 105.1 tokens/s | 2,138 / 2,164 tokens/s | TBD / 0.0240 / 0.0247 |
 | `nortx` (GB300 alone) | TBD tokens/s | TBD / TBD tokens/s | 0.0756 / TBD / TBD |
 
 Both profiles serve one conversation of up to 262,144 tokens (a 260,000-token prompt reads at about 2,000 tokens/s).
@@ -51,9 +51,11 @@ Both profiles serve one conversation of up to 262,144 tokens (a 260,000-token pr
   same server. They check what KLD cannot fully see (below).
 - **KLD** (lower is closer): how far the next-token probabilities are from the official model's, measured on the
   tokens a model generates. **512 samples:** 2,048-token samples of 11 kinds of text, each read as the engine serves
-  it (a short prompt, then one token at a time). **Long context:** 32 samples of 32,768 tokens, mostly read as a
-  prompt, the last part generated. **Prompts:** the rows of 1,024-token prompts that hold generated-style text, read
-  the way the engine reads prompts. See [Measuring KLD](#measuring-kld).
+  it (a short prompt, then one token at a time). **Long context:** 32 samples of 32,768 tokens, read as a prompt
+  up to their last 2,048-4,096 tokens, which are generated. **Prompts:** the generated-text rows inside those long
+  prompts, as the prompt path reads them (KLD on prefill). A short prompt read cold, before the tiers have adapted to
+  the text, scores higher: 1,024-token prompts on the 32-sample screen read 0.0942 (`default`) and TBD (`nortx`). See
+  [Measuring KLD](#measuring-kld).
 
 ## What you need
 
