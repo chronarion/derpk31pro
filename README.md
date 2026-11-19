@@ -32,7 +32,7 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 | profile | decode, 1 conversation | reading a prompt (32K / 128K tokens) | KLD: 512 samples / long context / prompts |
 |---|---|---|---|
 | `default` (GB300 + RTX PRO 6000) | TBD tokens/s | TBD / TBD tokens/s | TBD / TBD / TBD |
-| `nortx` (GB300 alone) | TBD tokens/s | TBD / TBD tokens/s | TBD / TBD / TBD |
+| `nortx` (GB300 alone) | TBD tokens/s | TBD / TBD tokens/s | 0.0756 / TBD / TBD |
 
 Both profiles serve one conversation of up to 262,144 tokens (a 260,000-token prompt reads at about 2,000 tokens/s).
 
@@ -194,7 +194,8 @@ Two settings change what every policy stages. A record staged for a token's stro
 weaker picks and its picks in the other rows of the verify block (`K31_STAGE_ALL`, on in both profiles: the same
 copies, more picks served). And `K31_STAGE_ROWS` caps the staged ranks per row of the verify block, because a later
 draft row only counts when the drafts before it were accepted (about 69%, 43%, 24% and 14% of the time for rows 1-4):
-`K31_STAGE_ROWS=4,4,2,1,1` measured +2.8% steps per second without the RTX, KLD screen 0.1006 against 0.0892.
+`K31_STAGE_ROWS=4,4,2,1,1` measured +2.8% steps per second without the RTX, KLD screen 0.1006 against 0.0892; it is
+the `nortx` profile's default (512-sample KLD 0.0756).
 
 ## What made it fast, and what kept it close
 
@@ -335,7 +336,7 @@ overridden when starting (`K31_X=... engine/k31.sh up`).
 | `K31_BAND_N`, `K31_BAND_MAP` | 118, `band-map.json` | experts on the RTX per layer (10,856 in all); 0 turns the RTX off |
 | `K31_BANK_MAP` | `bank-map-256k.json` | 2-bit copies in CPU memory per layer (41,661; `bank-map-nortx.json`: 45,000 without the RTX; `bank-map.json`: 36,800 for hosts with less free memory) |
 | `K31_POLICY` | `policy-joint15.json` | staged ranks and resident caps per layer (see [Policies](#policies)) |
-| `K31_STAGE_ALL`, `K31_STAGE_ROWS` | on, none | a staged expert serves all of its picks; optional per-row staging caps |
+| `K31_STAGE_ALL`, `K31_STAGE_ROWS` | on, none (`nortx`: 4,4,2,1,1) | a staged expert serves all of its picks; per-row staging caps |
 | `K31_BAND_PRIOR` | 1,0.69,0.43,0.24,0.14 | the band's slots by each verify row's chance of being accepted |
 | `K31_PROMOTE`, `K31_BANK_PROMOTE` | 0.1, 0.08 | how fast GPU memory and the CPU-memory copies follow the conversation (per layer per token) |
 | `K31_HAND_FEED`, `K31_CREDIT_WEIGHTS` | 1, `credit-weights.json` | band slots refilled from CPU memory; adaptation speed weighted per layer |
