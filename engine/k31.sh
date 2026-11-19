@@ -11,7 +11,7 @@ D=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$D/.." && pwd)
 # Settings passed in the environment win over config.env and the profile (every variable can be overridden from the
 # environment): snapshot them before sourcing, re-apply after
-_caller=$(export -p | grep -E '^declare -x (K31_[A-Z0-9_]*|DRAFT|DRAFT_FINAL|DRAFTS|DRAFT_REJECT|SPEC_EXTRA|KV_BYTES|MAXLEN|MAX_SEQS|MAX_BATCHED|GPU_UTIL|CPUS|BAND_CPUS|MEM_LIMIT|MEGAMOE_FORK|GEN_DEFAULTS|PREFIX_UNIT|ALLOC_CONF)=' || true)
+_caller=$(export -p | grep -E '^declare -x (K31_[A-Z0-9_]*|DRAFT|DRAFT_FINAL|DRAFTS|DRAFT_REJECT|SPEC_EXTRA|KV_BYTES|MAXLEN|MAX_SEQS|MAX_BATCHED|GPU_UTIL|CPUS|BAND_CPUS|MEM_LIMIT|MEGAMOE_FORK|GEN_DEFAULTS|PREFIX_UNIT|ALLOC_CONF|HI2_DIR)=' || true)
 [ -f "$REPO/config.env" ] && . "$REPO/config.env"
 PROFILE=${2:-default}
 [ -f "$D/profiles/$PROFILE.env" ] && . "$D/profiles/$PROFILE.env"

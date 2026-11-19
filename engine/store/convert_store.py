@@ -2,12 +2,14 @@
 """A hi2-k2 record store from a hi2-k1 store (k31_engine/recfmt.py: the same code bytes, the scale bytes as row bases
 and 2-bit offsets; 8,527,872 B per record instead of 9,289,728). CPU only, the source is never written.
 
-    convert_store.py SRC_DIR DST_DIR [--layers 1-92] [--workers 8] [--copy] [--lo2 reflink|link|skip]
+    convert_store.py SRC_DIR DST_DIR [--layers 1-92] [--workers 8] [--copy | --require-reflink]
+                     [--lo2 reflink|link|skip]
 
 Per layer, L{L}.hi2 of DST gets every record's code bytes and its packed scales. The code bytes are the source's,
 byte for byte, and both stores keep records on 4 KiB blocks, so on a filesystem with reflinks (XFS, Btrfs) they are
 shared with the source file (FICLONERANGE): only the 270,336 B after each record's codes are new data, ~22 GB for
-Kimi K3.1 Pro's 82,432 experts instead of 703 GB. Without reflinks (or with --copy) the code bytes are copied.
+Kimi K3.1 Pro's 82,432 experts instead of 703 GB. Without reflinks (or with --copy) the code bytes are copied;
+--require-reflink stops instead (when the drive has no room for a copy).
 Every record is checked: the scale bytes decoded from what was written must equal the source's, and (copies) the code
 bytes are compared. L{L}.lo2 (the complement that promotions merge with, unchanged by the format) is shared with the
 source as a reflink, else as a hard link. layout.json describes the new store; L{L}.k2.json lists a layer's records
@@ -54,7 +56,7 @@ def pwrite_all(fd: int, data, pos: int) -> None:
 
 
 def convert_layer(args):
-    src_dir, dst_dir, L, copy, lo2 = args
+    src_dir, dst_dir, L, copy, lo2, require = args
     t0 = time.time()
     lay1 = json.load(open(os.path.join(src_dir, "layout.json")))
     lay2 = recfmt.layout_k2(lay1)
@@ -74,6 +76,11 @@ def convert_layer(args):
         except OSError as ex:
             shared = False
             why = str(ex)
+            if require:
+                os.close(dst)
+                os.unlink(part)
+                raise RuntimeError(f"layer {L}: the code bytes cannot be shared with {src_dir} ({why}) and "
+                                   f"--require-reflink is set: nothing written")
     sf = np.empty((BATCH, sbytes), dtype=np.uint8)
     buf = np.empty(codes, dtype=np.uint8) if not shared else None
     back = np.empty(codes, dtype=np.uint8) if not shared else None
@@ -182,6 +189,7 @@ def main():
     a.add_argument("--layers", default="1-92")
     a.add_argument("--workers", type=int, default=8)
     a.add_argument("--copy", action="store_true", help="copy the code bytes instead of sharing them (no reflinks)")
+    a.add_argument("--require-reflink", action="store_true", help="stop if the code bytes cannot be shared")
     a.add_argument("--lo2", default="reflink", choices=["reflink", "link", "skip"])
     args = a.parse_args()
     lay1 = json.load(open(os.path.join(args.src, "layout.json")))
@@ -201,7 +209,7 @@ def main():
     t0, tot = time.time(), [0, 0, 0]
     with ProcessPoolExecutor(args.workers) as ex:
         for L, n, shared, how_lo, nrec, nexc, lo_b, hi_b, dt, why in ex.map(
-                convert_layer, [(args.src, args.dst, L, args.copy, args.lo2) for L in layers]):
+                convert_layer, [(args.src, args.dst, L, args.copy, args.lo2, args.require_reflink) for L in layers]):
             tot[0] += n; tot[1] += nrec; tot[2] += nexc
             print(f"layer {L}: {n} records, code bytes {'shared (reflink)' if shared else 'copied'}"
                   + (f" (no reflink: {why})" if why else "") + f", lo2 {how_lo}; {nrec} records with exception entries "
