@@ -89,6 +89,27 @@ Layers whose output matters more get more GPU memory (`engine/profiles/hbm-map-2
 `bank-map-256k.json`). The GPU's share is sized to fill what the KV cache for 262,144 tokens, the prompt chunks and a
 safety margin leave.
 
+### How experts are chosen for GPU memory
+
+Which experts get the exact MXFP4 treatment is decided in three steps:
+
+1. **How many per layer** is chosen by KLD. A simulation replays the routing of the KLD screen's text through the
+   tiers and fits, for every layer, how much one more expert in GPU memory lowers KLD; the memory goes where that
+   gain is largest (56 to 378 experts per layer instead of the same number everywhere).
+2. **Which ones** is chosen by usage. Every expert is ranked by how strongly the official model picks it (its summed
+   squared routing weight) over 65,536 tokens of varied text, separate from the KLD evaluation text; each layer's
+   most-used experts start in GPU memory, the next ones on the RTX, the next ones in CPU memory.
+3. **Then the choice follows the conversation.** While serving, the engine keeps a decaying score of each expert's
+   recent picks and swaps the strongest experts that are not in GPU memory for the weakest ones that are,
+   reassembling the exact MXFP4 weights from the 2-bit copy and its complement on the drive.
+
+This is basic, and it is the part of the design we would change first. Usage is only a stand-in for what matters:
+how much KLD it costs when a given expert is served from its 2-bit copy (or its average) instead of exactly. Those
+differ a lot between experts. A frequently picked expert whose 2-bit copy is accurate gains little from being exact,
+while a less frequently picked one whose 2-bit copy is poor, or whose output the next layers are sensitive to, can
+cost more. Choosing the experts by measured KLD (each expert's cost in its fallback tier, per layer) rather than by
+usage should buy KLD at no speed cost, or speed at the same KLD.
+
 When decoding, a token's strongest CPU-memory picks are staged and the rest get the average; a table per layer
 (`engine/profiles/policy-default.json`) says which ranks may be staged, and the least sensitive layers stage none.
 When reading a prompt, every CPU-memory pick is staged (each layer's copies stream in once per 4,096-token chunk),
