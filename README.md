@@ -36,7 +36,7 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 
 | benchmark (lil-bench) | derpk31pro (`default`) | for comparison |
 |---|---|---|
-| GPQA Diamond (`--test-profile gpqa-diamond`, all 198 questions) | TBD | 93.97 for the official MXFP4 checkpoint in NVIDIA's evaluation (their own protocol) |
+| GPQA Diamond (`--test-profile gpqa-diamond`, all 198 questions) | TBD | 94.2 in Moonshot's model card (reasoning effort max, temperature 1, top-p 0.95); 93.97 for the official MXFP4 checkpoint in NVIDIA's evaluation (their own protocol) |
 | Tool calling (`--tool-eval`: tool-eval-bench, community leaderboard settings) | TBD | |
 
 - **Speed:** [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) (lil-bench) 1.7.1,
