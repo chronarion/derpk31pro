@@ -1380,6 +1380,10 @@ def _bind(runner) -> None:
         from . import recfmt
         if recfmt.fmt(layout) not in (recfmt.K1, recfmt.K2):
             raise RuntimeError(f"K31: {HI2} is not a hi2-k1 or hi2-k2 record store")
+        want = os.environ.get("K31_REC_FMT", "")              # set by profiles whose maps are sized for one format
+        if want and want != recfmt.fmt(layout):
+            raise RuntimeError(f"K31_REC_FMT={want} (the profile's maps are sized for that record format) but {HI2} is "
+                               f"{recfmt.fmt(layout)}: point HI2_DIR at a {want} store (store/convert_store.py)")
         if recfmt.fmt(layout) != recfmt.K1 and (LATE or os.environ.get("K31_POOL", "0") == "1"):
             raise RuntimeError(f"K31: the Grace pool and the late tier (K31_POOL, K31_LATE) compute hi2-k1 records in "
                                f"place; {HI2} is {recfmt.fmt(layout)}")

@@ -225,6 +225,34 @@ The closer `default` and `nortx` profiles came out of the same work: with four c
 staging more of each token's picks (ranks 0-7 instead of 0-3) and better average outputs paid for themselves in
 GPQA, at about 76 tokens/s for one conversation instead of about 103.
 
+### Packed scale factors (profiles `default-k2` and `nortx-k2`)
+
+Every 32 of an expert's weights share a one-byte scale factor, a power of two. In this model the scale factors of
+one row of a weight matrix almost always take two or three neighbouring values, so they can be stored in far fewer
+bits without changing a single result:
+
+- A 2-bit copy keeps one base byte per row and 2 bits per scale factor; the 46 scale factors of the whole model that
+  do not fit are listed exactly. A copy shrinks from 9.29 MB to 8.53 MB, so the same CPU memory holds 45,382 of them
+  instead of 41,661 (49,020 instead of 45,000 without the RTX), and the RTX holds 11,170 instead of 10,856.
+- An expert in GPU memory keeps 6 bits per scale factor, which the GB300 unpacks by itself while it loads them
+  (the method of our sibling project [Derpseek](https://github.com/chronarion/derpseek)): 9,530 experts fit where
+  9,390 did.
+
+Every expert that is computed gives exactly the bits it gives in the default profiles; about 4,200 experts that
+used to be skipped now have a place. To use it, convert the record store once (minutes, about 22 GB on a drive with
+reflinks, the old store stays usable) and start the profile:
+
+```bash
+docker run --rm --network none -v "$PWD/engine":/engine:ro -v /models/k31-hi2:/src:ro -v /models/k31-hi2-k2:/dst \
+  --user "$(id -u):$(id -g)" --entrypoint python3 derpk31pro-runner /engine/store/convert_store.py /src /dst
+# set HI2_DIR=/models/k31-hi2-k2 in config.env, then
+engine/k31.sh up default-k2          # or nortx-k2
+```
+
+The kernels that read the packed forms are checked byte for byte and bit for bit against the unpacked ones
+(`engine/tests/test_stager2.py`, `sidecar/tests/test_band_k2.py`, `engine/tests/fork/sf6_rows_test.py`). Speed and
+KLD of these two profiles on the full system have not been measured yet.
+
 ## Policies
 
 derpk31pro does not assume which shortcuts are safe: it measures them. A sensitivity study
@@ -588,6 +616,18 @@ Papers behind what ships:
   Novices for Structured Pruning of MoE](https://arxiv.org/abs/2507.00390).
 - Judging a compressed model by how far its token probabilities move, not only by accuracy: Dutta et al., [Accuracy
   is Not All You Need](https://arxiv.org/abs/2407.09141).
+
+Storing the experts' scale factors in fewer bits without loss (profiles `default-k2`, `nortx-k2`) is the idea of
+MXFP4-CSF in Local Inference Lab's
+[b12x](https://github.com/local-inference-lab/b12x/blob/2cc7f66aaef76a9c7cbb660a1efb865cf3f26c88/docs/lossless-scale-compression.md)
+(Luke Alonso and Martin Vit; now part of [FlashInfer](https://github.com/flashinfer-ai/flashinfer/pull/5767)): a
+base per row of scale factors, a small offset per scale factor and exact exceptions. Our 2-bit copies use that code
+with 2-bit offsets instead of CSF's 1 bit, so that exceptions are rare enough (46 in the model) for the kernels to
+read the packed form in place; the 6-bit codes of the experts in GPU memory are Derpseek's. Related work on lossless
+coding of exponents and block scales: Heilper and Singer,
+[Lossless Compression of Neural Network Components](https://arxiv.org/abs/2508.19263) (2025); Fan et al.,
+[ZipServ](https://arxiv.org/abs/2603.17435) (2026); Zhang et al., [DFloat11](https://arxiv.org/abs/2504.11651) (2025);
+Yang et al., [ECF8](https://arxiv.org/abs/2510.02676) (2025).
 
 ## License
 
