@@ -143,9 +143,10 @@ about 2.6 tokens on average.
 
 ## Policies
 
-derpk31pro does not assume which shortcuts are safe: it measures them. A sensitivity study replays real routing,
-degrades one layer's picks at a time and records what that does to KLD; profiles of the decode step record what each
-way of serving a pick costs in time. A policy turns those measurements into a table: for each of the 92 layers and
+derpk31pro does not assume which shortcuts are safe: it measures them. A sensitivity study
+([docs/sensitivity](docs/sensitivity/README.md): 31 passes, 748 variants of the model) priced every way of treating a
+pick, by rank, by layer and by lateness: left out, served from a 2-bit copy, given the expert's average, or computed
+exactly but one or more layers late. Profiles of the decode step record what each treatment costs in time. A policy turns those measurements into a table: for each of the 92 layers and
 each of a token's 16 picks (strongest first), how a pick of an expert that is not in GPU memory is served.
 
 | treatment | what happens | what it costs |
@@ -209,7 +210,7 @@ compared only within one protocol.
 |---|---|---|
 | **2-bit experts instead of skipping** | A pick that is not in GPU memory is computed from a 2-bit copy on the RTX or staged from CPU memory, instead of dropped. | In the reference runner, a band of 155 experts per layer instead of 35 took KLD from 0.0544 to 0.0390 (-28%); a 2-bit pick on time costs 7-15% of what skipping it costs. |
 | **Staging a token's strongest misses** | The GB300 copies the 2-bit record of a strong pick it does not hold into a staging row for that step. | Staging ranks 0-2 instead of only rank 0: KLD 0.1203 to 0.0982 (early engine, same run otherwise). |
-| **The average substitute** | A skipped pick adds its expert's average output times the pick's weight, instead of nothing. | Halved the cost of skipping in the sensitivity study (0.53 on held-out text); in the engine only measured inside a bundle. |
+| **The average substitute** | A skipped pick adds its expert's average output times the pick's weight, instead of nothing. | Halved the cost of skipping in the [sensitivity study](docs/sensitivity/README.md) (0.53 on held-out text); in the engine only measured inside a bundle. |
 | **Experts that follow the conversation** | Every token, experts that recent tokens needed move into GPU memory from the drive (0.1 per layer per token) and the CPU-memory copies are refreshed (0.08); an expert leaving GPU memory moves down to 2 bits. | The adaptive CPU-memory tier: 0.1317 to 0.1217 (paired -0.0100); copying the leaving expert down instead of re-reading it: 0.1018 to 0.0790 (paired -0.0228). |
 | **Rows per layer** | GPU memory split between layers by how much one more resident expert lowers KLD (56 to 378 per layer instead of 105 each). | 0.1158 to 0.0973 (paired -0.0117, the largest single KLD step). |
 | **No hand-offs, weighted credit** | A band expert promoted to GPU memory frees its slot for the best expert in CPU memory, instead of handing it to the expert it replaced; each layer's adaptation speed weighted by its sensitivity. | 0.0973 to 0.0854 (paired -0.0045). |
