@@ -86,6 +86,19 @@ k2, okr = recfmt.k1_to_k2(rec, LAYOUT_K2)
 check("a zero scale byte: one exception, exact", bool(okr[0]) and torch.equal(recfmt.k2_to_k1(k2, LAYOUT_K2), rec)
       and recfmt.exceptions(k2, LAYOUT_K2)[0] == [("w13", 77, 13, 0)])
 
+# the numpy codec (store conversion) writes the same bytes as the torch reference
+rec = tl.synth_records(3, seed=7, wide_rows=6)
+sf13 = rec[1, g["codes"]:g["codes"] + g["s13"]].view(28, 6144, 4)
+for r in range(6):                                   # six exceptions in one tile of record 1: two do not fit
+    sf13[2, 4096 + 9 * r, 3] = sf13[:, 4096 + 9 * r, :].max() + 9
+k2, okr = recfmt.k1_to_k2(rec, LAYOUT_K2)
+sfn = rec[:, g["codes"]:g["codes"] + g["s13"] + g["s2"]].numpy()
+tails, over = recfmt.tails_np(sfn, LAYOUT_K2)
+check("numpy codec: the same record tails as the torch reference (wide rows, a tile over its entries), and it decodes "
+      "the fitting records exactly",
+      torch.equal(torch.from_numpy(tails), k2[:, g["codes"]:]) and over.sum(1).tolist() == [0, 2, 0]
+      and bool((recfmt.untails_np(tails, LAYOUT_K2)[[0, 2]] == sfn[[0, 2]]).all()))
+
 # 3. real k1 records
 d = os.environ.get("HI2_K1", "")
 if d and os.path.exists(os.path.join(d, "L01.hi2")):

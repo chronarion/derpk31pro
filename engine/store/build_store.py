@@ -3,7 +3,7 @@
 by one (the 2^-1 gain of the depth-2 code map: a staged nibble is (pair << 2) | 3 -> 0.75 / 3.0 times the block
 scale; runner recon "trick", weight MSE 0.148 vs the centroids' 0.135).
 
-    build_store.py NATIVE_DIR OUT_DIR [--layers 1-92] [--check]
+    build_store.py NATIVE_DIR OUT_DIR [--layers 1-92] [--check] [--format hi2-k1|hi2-k2]
 
 Layout (`hi2-k1`): record e of layer L at byte e * REC in `L{L:02d}.hi2`:
   [0, CODES)          pairs of the four kernel tensors' code bytes in memory order, w13 then w2: native byte 2j and
@@ -15,6 +15,11 @@ Layout (`hi2-k1`): record e of layer L at byte e * REC in `L{L:02d}.hi2`:
 The kernel layout comes from vLLM's own loader (`DeepGemmMegaMoEExperts._load_weight`, image vllm-openai:kimi-k31),
 run on the GPU. `layout.json` in OUT_DIR records shapes, strides and offsets. --check rebuilds a few experts' native
 rows from their records with the stager's expansion and compares with the runner's "trick" reconstruction.
+
+--format hi2-k2 writes the hi2 records with packed scales (k31_engine/recfmt.py: a base byte per scale row, a 2-bit
+offset per scale, exact exceptions; 8,527,872 B per record instead of 9,289,728, the same code bytes; decoding gives
+the hi2-k1 record byte for byte). The lo2 records are the same in both formats. An existing hi2-k1 store converts
+without the checkpoint or a GPU: convert_store.py.
 """
 import argparse
 import json
@@ -25,6 +30,7 @@ import time
 import torch
 
 sys.path.insert(0, os.environ.get("K31_ENGINE_DIR", "/engine"))
+from k31_engine import recfmt  # noqa: E402
 from k31_engine.ckpt import Experts  # noqa: E402
 
 E, LATENT, INTER = 896, 3584, 3072
@@ -74,6 +80,8 @@ def main():
     a.add_argument("--batch", type=int, default=64)
     a.add_argument("--parts", default="hi2", help="hi2, lo2 or hi2,lo2 (lo2: the bottom two bit planes and the "
                    "unlowered scale bytes; with a hi2 record it rebuilds the native row exactly: residency.py)")
+    a.add_argument("--format", default="hi2-k1", choices=[recfmt.K1, recfmt.K2],
+                   help="hi2 record format (hi2-k2: packed scales, recfmt.py)")
     args = a.parse_args()
     parts = args.parts.split(",")
     from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe import DeepGemmMegaMoEExperts as M
@@ -91,13 +99,18 @@ def main():
             "native_bytes": sizes, "order": ["w13", "w2", "w13s", "w2s"],
             "shapes": {k: [list(v.shape[1:]), list(v.stride()[1:]), str(v.dtype)] for k, v in probe.items()},
             "code_map": "nibble = (pair << 2) | 3, scale byte - 1 (gain 1/2)", "source": args.native}
+    k2 = args.format == recfmt.K2
+    if k2:                               # the hi2 file's record; lo2 keeps the k1 layout (meta["lo2_record_bytes"])
+        meta = recfmt.layout_k2(meta)
     json.dump(meta, open(os.path.join(args.out, "layout.json"), "w"), indent=1)
+    size = {p: (meta["record_bytes"] if p == "hi2" else rec_b) for p in parts}
     ck = Experts(args.native)
     pin = torch.empty((args.batch, rec_b), dtype=torch.uint8, pin_memory=True)
     t0 = time.time()
     for L in layers:
         paths = {p: os.path.join(args.out, f"L{L:02d}.{p}") for p in parts}
         fds = {p: os.open(paths[p] + ".part", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644) for p in parts}
+        exc_records, n_exc, lo_b, hi_b = [], 0, 255, 0
         for b0 in range(0, E, args.batch):
             es = list(range(b0, min(E, b0 + args.batch)))
             tens = ck.read_layer(L, es)
@@ -118,15 +131,35 @@ def main():
                 rec[:, codes_b:codes_b + sf_b] = torch.where(sf > 0, sf - 1, sf) if p == "hi2" else sf
                 if args.check and b0 == 0 and p == "hi2":
                     check(rows, fl, rec, sizes, codes_b, sf_b, tens, es, dev)
-                pin[:len(es)].copy_(rec)
-                os.pwrite(fds[p], memoryview(pin[:len(es)].numpy()).cast("B"), b0 * rec_b)
+                if p == "hi2":
+                    st = rec[:, codes_b:codes_b + sf_b]
+                    lo_b, hi_b = min(lo_b, int(st.min())), max(hi_b, int(st.max()))
+                if p == "hi2" and k2:
+                    rec2, fits = recfmt.k1_to_k2(rec, meta)
+                    if not bool(fits.all()):
+                        raise SystemExit(f"layer {L}: experts {[es[i] for i in (~fits).nonzero().flatten().tolist()]} do "
+                                         f"not fit hi2-k2 (a tile of 128 scale rows with more than {recfmt.EXC_TILE} "
+                                         f"exceptions): build this store with --format hi2-k1")
+                    if not torch.equal(recfmt.k2_to_k1(rec2, meta), rec):
+                        raise SystemExit(f"layer {L}: hi2-k2 records of experts {es[0]}..{es[-1]} do not decode exactly")
+                    for i, x in enumerate(recfmt.exceptions(rec2, meta)):
+                        if x:
+                            exc_records.append(es[i]); n_exc += len(x)
+                    rec = rec2
+                pin[:len(es), :size[p]].copy_(rec)
+                os.pwrite(fds[p], memoryview(pin[:len(es), :size[p]].contiguous().numpy()).cast("B"), b0 * size[p])
                 del rec
             del rows, fl
         for p in parts:
             os.fsync(fds[p]); os.close(fds[p])
             os.replace(paths[p] + ".part", paths[p])
-        print(f"layer {L}: {E} records each of {', '.join(parts)}, {E * rec_b / 1e9:.2f} GB each, "
-              f"{time.time() - t0:.0f} s", flush=True)
+        if k2 and "hi2" in parts:
+            json.dump({"layer": L, "records": E, "exception_records": exc_records, "exception_entries": n_exc,
+                       "scale_range": [lo_b, hi_b], "code_bytes": "written"},
+                      open(os.path.join(args.out, f"L{L:02d}.k2.json"), "w"))
+        print(f"layer {L}: {E} records each of {', '.join(parts)}, "
+              + ", ".join(f"{p} {E * size[p] / 1e9:.2f} GB" for p in parts) + f", {time.time() - t0:.0f} s"
+              + (f"; {len(exc_records)} records with exception entries" if k2 and "hi2" in parts else ""), flush=True)
     ck.close()
 
 

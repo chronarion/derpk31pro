@@ -222,3 +222,89 @@ def scale_view(rec: torch.Tensor, layout: dict) -> torch.Tensor:
     if fmt(layout) == K2:
         rec = k2_to_k1(rec, layout)
     return rec[:, g["codes"]:g["codes"] + g["s13"] + g["s2"]]
+
+
+# ------------------------------------------------------------------------------------ numpy codec (store conversion)
+def pack_scales_np(sf, n_rows: int, kq: int):
+    """pack_scales on numpy arrays, for whole files of records on the CPU: sf uint8 [n, kq * n_rows * 4] -> (packed
+    uint8 [n, units * unit_bytes], overflow int32 [n, tiles]). The same bytes as pack_scales (tests/test_recfmt.py)."""
+    import numpy as np
+    n = sf.shape[0]
+    units, tiles = n_rows // UNIT_ROWS, n_rows // TILE_ROWS
+    v = sf.reshape(n, kq, n_rows, 4)
+    lo = v.min(axis=(1, 3))                                          # [n, row]
+    hi = v.max(axis=(1, 3))
+    base = lo.copy()
+    wide = np.argwhere(hi.astype(np.int16) - lo > 3)                 # rare: rows of more than four values
+    for i, r in wide:
+        row = v[i, :, r, :].reshape(-1).astype(np.int16)
+        best, b = -1, int(lo[i, r])
+        for s in range(int(lo[i, r]), int(hi[i, r]) - 2):
+            c = int(((row >= s) & (row <= s + 3)).sum())
+            if c > best:
+                best, b = c, s
+        base[i, r] = b
+    off = v - base[:, None, :, None]                                 # uint8; wide rows may wrap
+    exc = np.full((n, tiles, EXC_TILE), EMPTY, dtype=np.uint32)
+    over = np.zeros((n, tiles), dtype=np.int32)
+    for i, r in wide:
+        row = v[i, :, r, :].reshape(-1).astype(np.int16)             # K block order
+        d = row - int(base[i, r])
+        t, j = r // TILE_ROWS, int((exc[i, r // TILE_ROWS] != EMPTY).sum()) + int(over[i, r // TILE_ROWS])
+        for k in np.nonzero((d < 0) | (d > 3))[0]:
+            if j < EXC_TILE:
+                exc[i, t, j] = (r % UNIT_ROWS) | (int(k) << 9) | (int(row[k]) << 16)
+            else:
+                over[i, t] += 1
+            j += 1
+            off[i, k // 4, r, k % 4] = 0
+    code = off[..., 0] | (off[..., 1] << 2) | (off[..., 2] << 4) | (off[..., 3] << 6)        # [n, kq, row]
+    ub = UNIT_ROWS + 4 * EXC + kq * UNIT_ROWS
+    out = np.empty((n, units, ub), dtype=np.uint8)
+    out[:, :, :UNIT_ROWS] = base.reshape(n, units, UNIT_ROWS)
+    out[:, :, UNIT_ROWS:UNIT_ROWS + 4 * EXC] = exc.reshape(n, units, EXC).astype("<u4").view(np.uint8).reshape(n, units, 4 * EXC)
+    out[:, :, UNIT_ROWS + 4 * EXC:] = code.reshape(n, kq, units, UNIT_ROWS).transpose(0, 2, 1, 3).reshape(n, units, kq * UNIT_ROWS)
+    return out.reshape(n, units * ub), over
+
+
+def unpack_scales_np(p, n_rows: int, kq: int):
+    """unpack_scales on numpy arrays: packed uint8 [n, units * unit_bytes] -> k1 bytes uint8 [n, kq * n_rows * 4]."""
+    import numpy as np
+    n = p.shape[0]
+    units = n_rows // UNIT_ROWS
+    ub = UNIT_ROWS + 4 * EXC + kq * UNIT_ROWS
+    q = p.reshape(n, units, ub)
+    base = q[:, :, :UNIT_ROWS].reshape(n, 1, n_rows)
+    cb = q[:, :, UNIT_ROWS + 4 * EXC:].reshape(n, units, kq, UNIT_ROWS).transpose(0, 2, 1, 3).reshape(n, kq, n_rows)
+    v = np.empty((n, kq, n_rows, 4), dtype=np.uint8)
+    for j in range(4):
+        v[..., j] = base + ((cb >> (2 * j)) & 3)
+    e = np.ascontiguousarray(q[:, :, UNIT_ROWS:UNIT_ROWS + 4 * EXC]).view("<u4").reshape(n, units, EXC)
+    for i, u, j in np.argwhere(e != EMPTY):
+        w = int(e[i, u, j])
+        v[i, ((w >> 9) & 127) // 4, u * UNIT_ROWS + (w & 511), ((w >> 9) & 127) % 4] = (w >> 16) & 255
+    return v.reshape(n, kq * n_rows * 4)
+
+
+def tails_np(sf, layout: dict):
+    """The bytes after the code bytes of hi2-k2 records, from the k1 scale bytes of n records: sf uint8 [n, s13 + s2]
+    -> (uint8 [n, k2 record bytes - code bytes], overflow int32 [n, tiles of both tensors])."""
+    import numpy as np
+    g = geom(layout)
+    p13, o13 = pack_scales_np(sf[:, :g["s13"]], g["n13"], g["kq13"])
+    p2, o2 = pack_scales_np(sf[:, g["s13"]:g["s13"] + g["s2"]], g["n2"], g["kq2"])
+    over = np.concatenate((o13, o2), axis=1)
+    out = np.zeros((sf.shape[0], g["k2_bytes"] - g["codes"]), dtype=np.uint8)
+    out[:, :g["p13"]] = p13
+    out[:, g["p13"]:g["p13"] + g["p2"]] = p2
+    a = g["status"] - g["codes"]
+    out[:, a:a + 4 * g["status_words"]] = over.astype("<u4").view(np.uint8).reshape(sf.shape[0], -1)
+    return out, over
+
+
+def untails_np(tail, layout: dict):
+    """The inverse of tails_np: uint8 [n, >= packed scales] -> the k1 scale bytes uint8 [n, s13 + s2]."""
+    import numpy as np
+    g = geom(layout)
+    return np.concatenate((unpack_scales_np(tail[:, :g["p13"]], g["n13"], g["kq13"]),
+                           unpack_scales_np(tail[:, g["p13"]:g["p13"] + g["p2"]], g["n2"], g["kq2"])), axis=1)

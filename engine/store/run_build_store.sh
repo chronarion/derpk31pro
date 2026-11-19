@@ -2,6 +2,8 @@
 # Build the record store HI2_DIR from the official checkpoint NATIVE (config.env): each expert's 2-bit hi2 record and
 # its lo2 complement, per MoE layer, in MegaMoE's kernel layout (build_store.py). Runs in the vLLM image on the GB300
 # (vLLM's own loader lays the weights out). ~1.4 TB written; hours, bound by the drive.
+# Arguments go to build_store.py: e.g. `--format hi2-k2` for records with packed scales (8.2% smaller hi2 records, the
+# bank maps *-k2.json; an existing hi2-k1 store converts in minutes with store/convert_store.py instead).
 set -eu
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 [ -f "$REPO/config.env" ] && . "$REPO/config.env"
