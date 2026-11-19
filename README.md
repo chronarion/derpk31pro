@@ -76,18 +76,24 @@ picks then add nothing, which raises KLD. They can be rebuilt with the reference
 ## How it works
 
 Each of the model's 92 expert layers picks 16 of its 896 experts for every token, ranked by weight. Where each pick
-is computed depends on where that expert currently is:
+is computed depends on where that expert currently is. The default profile places the 82,432 experts like this:
 
-1. **In GPU memory** (about 9,700 experts, between 56 and 378 per layer): computed exactly as Moonshot ships it, in
-   one MegaMoE launch with the layer's other picks. Layers whose output matters more get more room.
-2. **On the RTX PRO 6000** (about 11,000 experts as 2-bit copies): the GB300 sends the token's activations to the RTX
-   at the start of the layer; the RTX computes its experts while the GB300 runs MegaMoE, and the GB300 adds the
-   results back in the same kernel that finishes the layer.
-3. **In the CPU's memory** (about 42,000 experts as 2-bit copies): for a token's strongest picks, the GB300 copies the
-   expert into one of 128 shared staging rows and computes it in the same MegaMoE launch. A table per layer
-   (`engine/profiles/policy-default.json`) says which ranks may be staged; the least sensitive layers stage none.
-4. **Anywhere else**: the pick is skipped, and the expert's average output (scaled by the pick's weight) stands in
-   for it.
+| Where | Experts | Per layer | Form | How a pick of it is computed |
+|---|---:|---:|---|---|
+| GPU memory | 9,980 (12%) | 56 to 378 | Moonshot's own MXFP4 | exactly as shipped, in one MegaMoE launch with the layer's other picks |
+| RTX PRO 6000 | 10,856 (13%) | 48 to 216 | 2-bit copies | on the RTX, while the GB300 runs MegaMoE; the GB300 adds the results in the kernel that finishes the layer |
+| CPU memory | 41,661 (51%) | 200 to 640 | 2-bit copies (387 GB) | copied into one of 128 shared staging rows on the GB300 and computed in the same MegaMoE launch |
+| Nowhere in memory | 19,935 (24%) | 0 to 592 | | skipped: the expert's average output, scaled by the pick's weight, stands in for it |
+
+Layers whose output matters more get more GPU memory (`engine/profiles/hbm-map-256k.json`, `band-map.json`,
+`bank-map-256k.json`). The GPU's share is sized to fill what the KV cache for 262,144 tokens, the prompt chunks and a
+safety margin leave.
+
+When decoding, a token's strongest CPU-memory picks are staged and the rest get the average; a table per layer
+(`engine/profiles/policy-default.json`) says which ranks may be staged, and the least sensitive layers stage none.
+When reading a prompt, every CPU-memory pick is staged (each layer's copies stream in once per 4,096-token chunk),
+the RTX gets each layer's band picks in one bulk request instead of one per eight tokens, and the tiers keep adapting
+while the prompt is read, so the prompt's own rows are computed about as well as decoded ones.
 
 The tiers follow the conversation. Every token, the engine scores which experts the recent tokens needed; the
 strongest ones not yet in GPU memory are read from the drive and swap in for the weakest, the CPU-memory copies are
@@ -191,9 +197,9 @@ overridden when starting (`K31_X=... engine/k31.sh up`).
 
 | setting | default | what it does |
 |---|---|---|
-| `K31_HBM_MAP` | `hbm-map.json` | experts kept in GPU memory per layer (9,660 in all) |
+| `K31_HBM_MAP` | `hbm-map-256k.json` | experts kept in GPU memory per layer (9,980 in all; `hbm-map.json`: 9,660, for a 65,536-token context) |
 | `K31_BAND_N`, `K31_BAND_MAP` | 118, `band-map.json` | experts on the RTX per layer (10,856 in all); 0 turns the RTX off |
-| `K31_BANK_MAP` | `bank-map-large.json` | 2-bit copies in CPU memory per layer (41,800; `bank-map.json`: 36,800 for hosts with less free memory) |
+| `K31_BANK_MAP` | `bank-map-256k.json` | 2-bit copies in CPU memory per layer (41,661; `bank-map-large.json`: 41,800 beside `hbm-map.json`; `bank-map.json`: 36,800 for hosts with less free memory) |
 | `K31_POLICY` | `policy-default.json` | which ranks may be staged in each layer; `policy-fast.json`, `policy-balanced.json`, `policy-quality.json` trade speed and KLD |
 | `K31_PROMOTE`, `K31_BANK_PROMOTE` | 0.1, 0.08 | how fast GPU memory and the CPU-memory copies follow the conversation (per layer per token) |
 | `K31_HAND_FEED`, `K31_CREDIT_WEIGHTS` | 1, `credit-weights.json` | band slots refilled from CPU memory; adaptation speed weighted per layer |
