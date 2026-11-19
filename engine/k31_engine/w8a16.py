@@ -19,6 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
+from . import flags
+
 GK = 128                                         # scale group along K
 # programmatic dependent launch (K31_PDL=1, opt-in): the grid may start while the previous kernel in the stream ends
 # (vLLM runs DeepGEMM with PDL on SM90+, so a non-PDL kernel between two DeepGEMM calls would break their overlap);
@@ -265,12 +267,30 @@ def config(M: int, N: int, K: int, sms: int = 152):
     return BN, per * GK, split
 
 
+def _big_m(M: int, K: int) -> str:
+    """K31_W8A16_BIG_M (runtime flag, read per eager call; default 0 = today's tiles): the bigm.py implementation for
+    a call of M rows ("1" / "triton", "hilo", "cublas"), or "" for today's path. Only calls of at least
+    K31_W8A16_BIG_M_ROWS rows (default 1,024) with K >= K31_W8A16_BIG_M_MIN_K (default 1,024: f_b_proj's K = 128
+    stays), never under CUDA-graph capture."""
+    if M <= 16:
+        return ""
+    impl = flags.get("K31_W8A16_BIG_M", "0")
+    if impl in ("", "0", "off") or M < flags.num("K31_W8A16_BIG_M_ROWS", 1024) or \
+            K < flags.num("K31_W8A16_BIG_M_MIN_K", 1024) or torch.cuda.is_current_stream_capturing():
+        return ""
+    return impl
+
+
 def linear(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor, out: torch.Tensor = None, cfg=None) -> torch.Tensor:
     """y = x @ dequant(q, s)^T for x [M, K] bf16. M <= 16: split over K (decode); larger M (prompt chunks): 64-row tiles,
     no split."""
     if not isinstance(q, torch.Tensor) and not isinstance(q, MarlinW):   # another kernel's weight (w8i.I8W)
         return q(x, out)
     if isinstance(q, MarlinW):                       # K31_W8_MARLIN: this weight lives in Marlin's layout
+        impl = _big_m(x.shape[0], x.shape[1])
+        if impl:                                     # prompt chunks: Marlin's layout read by bigm.py's GEMM
+            from . import bigm
+            return bigm.marlin_linear(x, q, out, impl=impl)
         y = q(x)
         if out is not None:
             out.copy_(y)
@@ -281,6 +301,10 @@ def linear(x: torch.Tensor, q: torch.Tensor, s: torch.Tensor, out: torch.Tensor 
     assert q.shape[1] == K and s.shape == (N, K // GK) and x.stride(1) == 1 and (M == 1 or x.stride(0) >= K)
     sxm = x.stride(0) if M > 1 else K    # rows may be strided (a column slice of a wider output): no copy
     if M > 16:
+        impl = _big_m(M, K) if A8 == 0 else ""      # K31_W8A16_BIG_M: prompt chunks through bigm.py
+        if impl:
+            from . import bigm
+            return bigm.w8_linear(x, q, s, out, impl=impl)
         if out is None:
             out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
         nt = triton.cdiv(N, 128)

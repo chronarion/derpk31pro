@@ -9,9 +9,13 @@
 set -u
 D=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$D/.." && pwd)
+# Settings passed in the environment win over config.env and the profile (every variable can be overridden from the
+# environment): snapshot them before sourcing, re-apply after
+_caller=$(export -p | grep -E '^declare -x (K31_[A-Z0-9_]*|DRAFT|DRAFT_FINAL|DRAFTS|DRAFT_REJECT|SPEC_EXTRA|KV_BYTES|MAXLEN|MAX_SEQS|MAX_BATCHED|GPU_UTIL|CPUS|BAND_CPUS|MEM_LIMIT|MEGAMOE_FORK|GEN_DEFAULTS|PREFIX_UNIT)=' || true)
 [ -f "$REPO/config.env" ] && . "$REPO/config.env"
 PROFILE=${2:-default}
 [ -f "$D/profiles/$PROFILE.env" ] && . "$D/profiles/$PROFILE.env"
+eval "$_caller"
 # K31_POLICY (a container path, /engine/...; from the environment or the profile): its optional "env" object sets global
 # knobs that are not set yet (the environment and the profile win)
 if [ -n "${K31_POLICY:-}" ] && [ "${1:-}" = up ]; then
@@ -23,6 +27,17 @@ for k, v in cfg.get("env", {}).items():
     if k not in os.environ:
         print(f"export {k}={shlex.quote(str(v))}")' "$_pf") || { echo "K31_POLICY $_pf: unreadable"; exit 1; }
   eval "$_pe"
+fi
+# K31_LATE=1 (the late tier, k31_engine/latetier.py; off by default) posts its jobs to the Grace pool: it implies
+# K31_POOL=1 and the pool's core layout below
+case "${K31_LATE:-0}" in ""|0) ;; *) export K31_POOL=1 ;; esac
+# K31_POOL=1 (the Grace pool, k31_engine/cpupool.py; off by default): the engine container also holds the pool's
+# cores (POOL_CPUS, default 0-71; the pool takes K31_POOL_CORE0.. = 24-71), the engine's own threads move to
+# K31_POOL_HOST_CPUS (0-21) and the band sidecar to BAND_CPUS (22-23)
+if [ "${K31_POOL:-0}" = 1 ]; then
+  CPUS=${POOL_CPUS:-0-71}
+  BAND_CPUS=${BAND_CPUS:-22-23}
+  export K31_POOL_HOST_CPUS=${K31_POOL_HOST_CPUS:-0-21}
 fi
 IMG=${IMG:-vllm/vllm-openai:kimi-k31}
 MODEL=${MODEL:?set MODEL (the stripped checkpoint, store/run_kstrip.sh) in config.env}
@@ -89,7 +104,11 @@ up() {
   [ -n "${SPEC:-}" ] && SPEC_ARGS=(--speculative-config "$SPEC")
   # DRAFT_REJECT=block: the drafter card's rejection sampler (vLLM rejection_sample_method; default standard)
   # DRAFTS=n: the DSpark drafter (DRAFT dir, mounted at /draft) with n draft tokens per step, as tomcupr's recipe
-  [ -n "${DRAFTS:-}" ] && SPEC_ARGS=(--speculative-config "{\"model\":\"/draft\",\"num_speculative_tokens\":$DRAFTS,\"method\":\"dspark\",\"draft_sample_method\":\"probabilistic\"${DRAFT_REJECT:+,\"rejection_sample_method\":\"$DRAFT_REJECT\"}}")
+  # DRAFT_SAMPLE=greedy: vLLM's argmax drafts, verified against a one-hot q (default probabilistic: drafts sampled at
+  # the request's temperature, their logits cached for the verifier)
+  # SPEC_EXTRA: more fields for the speculative config, e.g. '"enable_adaptive_verification":true' (vLLM sizes each
+  # step's verify block from the drafter's confidence and a measured cost curve)
+  [ -n "${DRAFTS:-}" ] && SPEC_ARGS=(--speculative-config "{\"model\":\"/draft\",\"num_speculative_tokens\":$DRAFTS,\"method\":\"dspark\",\"draft_sample_method\":\"${DRAFT_SAMPLE:-probabilistic}\"${DRAFT_REJECT:+,\"rejection_sample_method\":\"$DRAFT_REJECT\"}${SPEC_EXTRA:+,$SPEC_EXTRA}}")
   # HARNESS=1 (harness/sweep.sh): the KLD harness's forced-token logits processor and 64 log-probs per token; serving
   # runs leave both out
   HARNESS_ARGS=()

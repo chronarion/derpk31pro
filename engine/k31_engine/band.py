@@ -33,6 +33,36 @@ FLAGS_MEGAMOE, SF_MIN_MEGAMOE = FLAG_OUT_BF16, 105       # DeepGEMM MegaMoE's ar
 # 16-23, stripped before the call header reaches the RTX).
 BAND_MAXE = int(os.environ.get("K31_BAND_MAXE", "16"))
 SITU_ALPHA, SITU_BETA = 4.0, 25.0
+
+
+def parse_prior(spec: str) -> tuple:
+    """K31_BAND_PRIOR "1,0.64,0.36,0.19,0.09" -> (1.0, 0.64, ...): the prior chance that row i of a request's verify
+    block is accepted (row 0 = the last sampled token, always; row i = draft i, kept when drafts 1..i are accepted).
+    Empty -> () (off)."""
+    vals = []
+    for part in str(spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        v = float(part)
+        if not (v >= 0.0 and v < float("inf")):
+            raise ValueError(f"K31_BAND_PRIOR: {part!r} is not a finite value >= 0")
+        vals.append(v)
+    return tuple(vals)
+
+
+def prior_rows(table: tuple, period: int, n: int = 8) -> list:
+    """The prior of rows 0..n-1 of a band call whose requests' verify blocks of `period` rows lie back to back: row t
+    takes table[t % period] (the table's last value past its end)."""
+    period = max(1, int(period))
+    return [float(table[min(t % period, len(table) - 1)]) for t in range(n)]
+
+
+# K31_BAND_PRIOR=p0,p1,... (B1, fused send only): a call with more distinct band experts than its cap keeps those with
+# the largest weight x their row's prior chance of being accepted, instead of the largest weight. The kept experts keep
+# today's order in the work list, so calls under the cap send the same bytes. Calls recorded into CUDA graphs only
+# (decode verify blocks); eager calls keep today's plan. Unset: today's plan.
+BAND_PRIOR = parse_prior(os.environ.get("K31_BAND_PRIOR", ""))
 STATE_WORDS = ("seq", "tag", "idx", "hint_seq", "status", "late_tag", "late_idx", "late_status", "n_added",
                "n_timeout", "n_error", "n_empty", "n_down", "n_late_added", "n_lost", "t_pub", "t_hint")
 
@@ -313,8 +343,12 @@ class _Fused(ctypes.Structure):
                 ("out", ctypes.c_void_p), ("stats", ctypes.c_void_p), ("T", ctypes.c_int), ("layer", ctypes.c_int),
                 ("flags", ctypes.c_int), ("sf_min", ctypes.c_int), ("alpha", ctypes.c_float), ("beta", ctypes.c_float),
                 ("timeout_ns", ctypes.c_ulonglong), ("served", ctypes.c_void_p),   # served: v3+, msum / rstd / eps:
-                ("msum", ctypes.c_void_p), ("rstd", ctypes.c_void_p), ("eps", ctypes.c_float)]   # v4 (older builds
-                                                                                     # read the fields before them)
+                ("msum", ctypes.c_void_p), ("rstd", ctypes.c_void_p), ("eps", ctypes.c_float),   # v4 (older builds
+                ("prior", ctypes.c_float * MAXT), ("prior_on", ctypes.c_int)]    # read the fields before them)
+    # prior / prior_on (B1): builds that export rtxband_fused_prior read them; older builds stop at eps
+
+
+assert ctypes.sizeof(_Fused) == 168, "rtxband_fused.cu FusedArgs is 168 bytes"
 
 
 class Fused:
@@ -331,6 +365,33 @@ class Fused:
             self.lib.rtxband_fused_hint.argtypes = [ctypes.POINTER(_Fused), ctypes.c_void_p]
         self.lib.rtxband_fused_pdl(1 if os.environ.get("K31_PDL", "0") == "1" else 0)   # opt-in, as w8a16 / unitk
         self.gb = gb
+        self.has_prior = hasattr(self.lib, "rtxband_fused_prior")     # B1: builds that read prior / prior_on
+        self.lib_path = lib
+        self.prior = None                                             # (c_float * 8) per row of a call, or None
+        self.prior_graphs_only = True
+
+    def set_prior(self, rows, graphs_only: bool = True) -> None:
+        """B1 (K31_BAND_PRIOR): later qsend / hint launches order the cap by weight x rows[t] (row t of the call; at
+        most 8 values, the last repeated); None = today's order. graphs_only: only launches recorded into a CUDA
+        graph (decode verify calls) take the prior; eager calls, such as a prompt's last chunk of <= 8 rows whose rows
+        are all real tokens, keep today's order."""
+        self.prior_graphs_only = bool(graphs_only)
+        if rows is None:
+            self.prior = None
+            return
+        if not self.has_prior:
+            raise RuntimeError(f"K31_BAND_PRIOR: {self.lib_path} does not read a prior (rebuild it: ./build.sh)")
+        vals = [float(v) for v in rows][:MAXT]
+        if not vals or not all(0.0 <= v < float("inf") for v in vals):
+            raise ValueError(f"K31_BAND_PRIOR: row priors {rows} must be finite values >= 0")
+        vals += [vals[-1]] * (MAXT - len(vals))
+        self.prior = (ctypes.c_float * MAXT)(*vals)
+
+    def _prior(self, a: _Fused) -> _Fused:
+        if self.prior is not None and (not self.prior_graphs_only or torch.cuda.is_current_stream_capturing()):
+            a.prior = self.prior
+            a.prior_on = 1
+        return a
 
     def qsend(self, ids: torch.Tensor, w: torch.Tensor, row_map: torch.Tensor, band_map: torch.Tensor, x: torch.Tensor,
               stats: torch.Tensor, layer: int = 0, flags: int = FLAGS_MEGAMOE, sf_min: int = SF_MIN_MEGAMOE,
@@ -339,10 +400,11 @@ class Fused:
         cap = BAND_MAXE if cap is None else int(cap)     # distinct band experts per call (K31_BAND_MAXE / the policy)
         assert 1 <= T <= MAXT and ids.dtype == torch.int32 and w.dtype == torch.float32 and x.dtype == torch.bfloat16
         assert ids.is_contiguous() and w.is_contiguous() and x.is_contiguous() and x.shape == (T, H)
-        a = _Fused(self.gb.seg, self.gb.st.data_ptr(), ids.data_ptr(), w.data_ptr(), row_map.data_ptr(),
-                   band_map.data_ptr(), x.data_ptr(), None, stats.data_ptr() if stats is not None else None, T,
-                   layer & 0xFF, flags | (((cap & 0xFF) << 16) if 0 < cap < MAXE else 0), sf_min,
-                   SITU_ALPHA, SITU_BETA, 0, served.data_ptr() if served is not None else None)
+        a = self._prior(_Fused(self.gb.seg, self.gb.st.data_ptr(), ids.data_ptr(), w.data_ptr(), row_map.data_ptr(),
+                               band_map.data_ptr(), x.data_ptr(), None,
+                               stats.data_ptr() if stats is not None else None, T, layer & 0xFF,
+                               flags | (((cap & 0xFF) << 16) if 0 < cap < MAXE else 0), sf_min, SITU_ALPHA, SITU_BETA,
+                               0, served.data_ptr() if served is not None else None))
         rc = self.lib.rtxband_fused_qsend(ctypes.byref(a), ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
         if rc != 0:
             raise RuntimeError(f"K31 band: fused send launch failed ({rc})")
@@ -355,10 +417,11 @@ class Fused:
         T = ids.shape[0]
         cap = BAND_MAXE if cap is None else int(cap)
         assert 1 <= T <= MAXT and ids.dtype == torch.int32 and w.dtype == torch.float32
-        a = _Fused(self.gb.seg, self.gb.st.data_ptr(), ids.data_ptr(), w.data_ptr(), row_map.data_ptr(),
-                   band_map.data_ptr(), None, None, stats.data_ptr() if stats is not None else None, T,
-                   layer & 0xFF, FLAGS_MEGAMOE | (((cap & 0xFF) << 16) if 0 < cap < MAXE else 0), SF_MIN_MEGAMOE,
-                   SITU_ALPHA, SITU_BETA, 0, served.data_ptr() if served is not None else None)
+        a = self._prior(_Fused(self.gb.seg, self.gb.st.data_ptr(), ids.data_ptr(), w.data_ptr(), row_map.data_ptr(),
+                               band_map.data_ptr(), None, None, stats.data_ptr() if stats is not None else None, T,
+                               layer & 0xFF, FLAGS_MEGAMOE | (((cap & 0xFF) << 16) if 0 < cap < MAXE else 0),
+                               SF_MIN_MEGAMOE, SITU_ALPHA, SITU_BETA, 0,
+                               served.data_ptr() if served is not None else None))
         rc = self.lib.rtxband_fused_hint(ctypes.byref(a), ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
         if rc != 0:
             raise RuntimeError(f"K31 band: hint launch failed ({rc})")

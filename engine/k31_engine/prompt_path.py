@@ -15,6 +15,8 @@ worse than the same rows decoded, because the chunk used the decode table and th
 A record's place in the staging order is its shared row (place // 128 = round, place % 128 = row): no per-chunk top-k,
 one host sync per layer (the number of rounds). MegaMoE runs in row slices of K31_PROMPT_SUB rows when set (0 = the
 whole chunk). K31_PROMPT_AHEAD=1 stages the next half-round on its own stream while MegaMoE reads the other half.
+K31_PROMPT_CELANE=<share> lands the last share of every round's (half-round's) records through the copy engines and an
+HBM-side expand instead of the stager (celane.py; same rows, same bytes, same MegaMoE calls).
 Reference model of the plan: tests/prompt_plan_model.py; tests/test_prompt_path.py compares plan_rounds with it.
 """
 import math
@@ -26,6 +28,7 @@ E, K = 896, 16
 SLOTS, GROUPS = 16, 8
 STAGE_ROWS = SLOTS * GROUPS
 from . import flags                       # every setting is read per call (runtime flags, flags.py)
+_LANE_ON = [False]                        # the copy-engine lane (K31_PROMPT_CELANE) holds its scratch
 N_MOE = 92
 # the study's pick amplitude by rank (sensitivity/data/model2.json "a"): what a cut pick of that rank costs, relative
 AMP = (0.484, 0.119, 0.097, 0.083, 0.044, 0.040, 0.037, 0.034, 0.023, 0.022, 0.017, 0.017, 0.017, 0.017, 0.017, 0.017)
@@ -169,12 +172,30 @@ def forward_prompt(mod, st, hidden_states, topk_weights, topk_ids, shared_expert
     use_band = st.band_map is not None and getattr(st, "band_ok", True)
     if use_band and band_bulk is not None:                           # the RTX starts on the chunk's band picks now
         band_bulk.send(st, hidden_states, topk_ids, topk_weights)
-    n_kept = int(n_keep)                                             # the layer's one host sync
+    share = min(1.0, flags.num("K31_PROMPT_CELANE", 0.0))            # the copy-engine lane (celane.py); 0 = off
+    lane = None
+    if share > 0:
+        from . import celane
+        lane = celane.get(st, topk_ids.device, share)                # None: its scratch did not fit (logged)
+    if lane is not None:                                             # the lane addresses its copies from the host:
+        kept_h = celane.host_kept(n_keep, kept)                      # the one host sync brings the kept list too
+        n_kept = len(kept_h)
+        _LANE_ON[0] = True
+    else:
+        n_kept = int(n_keep)                                         # the layer's one host sync
+        if _LANE_ON[0]:                                              # the lane was switched off at runtime:
+            from . import celane                                     # its scratch goes back to torch's cache
+            celane.release()
+            _LANE_ON[0] = False
     rounds = max(1, -(-n_kept // STAGE_ROWS))
     rnd = torch.div(place, STAGE_ROWS, rounding_mode="floor")
     pos = place - rnd * STAGE_ROWS
     y = None
-    if flags.on("K31_PROMPT_AHEAD") and rounds > 1:
+    ahead = flags.on("K31_PROMPT_AHEAD") and rounds > 1
+    if lane is not None:
+        y = celane.rounds(orig, mod, st, hidden_states, topk_weights, shared_experts, kept, kept_h, place, nat, n_kept,
+                          topk_ids.dtype, share, ahead=ahead, lane=lane)
+    elif ahead:
         y = _rounds_ahead(orig, mod, st, hidden_states, topk_weights, shared_experts, kept, place, nat, n_kept,
                           topk_ids.dtype)
     else:

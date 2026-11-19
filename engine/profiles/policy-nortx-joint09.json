@@ -1,0 +1,109 @@
+{
+ "note": "Resident caps by layer without the RTX PRO 6000 (joint -0.9 in the plan): picks of rank >= R take the mean even when their expert has a row, so MegaMoE streams fewer experts (about 0.9 ms less chain time than the t92 table in simulation); staged ranks per layer as in the plan, every pick of a staged expert served (K31_STAGE_ALL=1); no band; mean substitute on.",
+ "version": 1,
+ "env": {
+  "K31_BAND_FEED": "0"
+ },
+ "policies": {
+  "s4r8": {
+   "hit": "0-7",
+   "band": "none",
+   "stage": "0-3",
+   "mean": "0-15"
+  },
+  "s1r16": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "0-0",
+   "mean": "0-15"
+  },
+  "s1r8": {
+   "hit": "0-7",
+   "band": "none",
+   "stage": "0-0",
+   "mean": "0-15"
+  },
+  "s2r6": {
+   "hit": "0-5",
+   "band": "none",
+   "stage": "0-1",
+   "mean": "0-15"
+  },
+  "s1r10": {
+   "hit": "0-9",
+   "band": "none",
+   "stage": "0-0",
+   "mean": "0-15"
+  },
+  "s3r10": {
+   "hit": "0-9",
+   "band": "none",
+   "stage": "0-2",
+   "mean": "0-15"
+  },
+  "s0r8": {
+   "hit": "0-7",
+   "band": "none",
+   "stage": "none",
+   "mean": "0-15"
+  },
+  "s0r16": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "none",
+   "mean": "0-15"
+  },
+  "s1r12": {
+   "hit": "0-11",
+   "band": "none",
+   "stage": "0-0",
+   "mean": "0-15"
+  },
+  "s1r6": {
+   "hit": "0-5",
+   "band": "none",
+   "stage": "0-0",
+   "mean": "0-15"
+  },
+  "s0r6": {
+   "hit": "0-5",
+   "band": "none",
+   "stage": "none",
+   "mean": "0-15"
+  },
+  "s2r16": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "0-1",
+   "mean": "0-15"
+  },
+  "s3r16": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "0-2",
+   "mean": "0-15"
+  },
+  "s4r16": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "0-3",
+   "mean": "0-15"
+  }
+ },
+ "default": "s1r16",
+ "layers": {
+  "1": "s4r8",
+  "5,7-8,14,23,25-26,32,34": "s1r8",
+  "6": "s2r6",
+  "9-10,16-19,29": "s1r10",
+  "11": "s3r10",
+  "12,28,30": "s0r8",
+  "13,85": "s0r16",
+  "15": "s1r12",
+  "20,22": "s1r6",
+  "21,24": "s0r6",
+  "41-42,47,51,61,63": "s2r16",
+  "49,81": "s3r16",
+  "52-60,72-73,82,92": "s4r16"
+ }
+}

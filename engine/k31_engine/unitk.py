@@ -7,7 +7,12 @@ slots 0, 1, ...; their picks go to row S + slot, resident picks to their rows, e
 Outputs: the call's row ids [T, 16] (int32) and the stage list [SLOTS] (bank index per slot, or -1).
 Only the candidates of rank < SP (= 4, so strong <= 4) are considered, as per-token columns [T, SP]: the pairwise
 work is [T*SP, T*SP] (64 x 64 at T = 16).
+K31_STAGE_ALL=1 (ALLROWS): every pick of an expert that holds a slot uses the slot's row, at any rank and in any row of
+the call, not only the candidate picks that put it there. The same records are staged and MegaMoE sees the same
+distinct experts; picks that were cut (or given the mean) get the staged 2-bit record instead.
 """
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -15,12 +20,14 @@ import triton.language as tl
 SLOTS = 16
 SP = 4
 PDL = __import__("os").environ.get("K31_PDL", "0") == "1"
+STAGE_ALL = os.environ.get("K31_STAGE_ALL", "0") == "1"
 
 
 @triton.jit
 def _unitk(ids_ptr, w_ptr, row_ptr, bank_ptr, out_ptr, stage_ptr, T, strong, S, score_ptr, decay, stats_ptr,
-           pre_ptr, pid_ptr, pw_ptr, pt_ptr, resmax, TB: tl.constexpr, K: tl.constexpr, SPC: tl.constexpr,
-           SLOTSC: tl.constexpr, NE: tl.constexpr, SCORE: tl.constexpr, PRE: tl.constexpr, ACC: tl.constexpr):
+           pre_ptr, pid_ptr, pw_ptr, pt_ptr, resmax, cap, rcap_ptr, TB: tl.constexpr, K: tl.constexpr,
+           SPC: tl.constexpr, SLOTSC: tl.constexpr, NE: tl.constexpr, SCORE: tl.constexpr, PRE: tl.constexpr,
+           ACC: tl.constexpr, ALLROWS: tl.constexpr = False, FILL: tl.constexpr = False, ROWCAP: tl.constexpr = False):
     tl.extra.cuda.gdc_wait()                 # PDL: the router's ids / weights (and earlier writes) are visible
     tl.extra.cuda.gdc_launch_dependents()
     t = tl.arange(0, TB)
@@ -41,6 +48,9 @@ def _unitk(ids_ptr, w_ptr, row_ptr, bank_ptr, out_ptr, stage_ptr, T, strong, S, 
     beats = (wj > wi) | ((wj == wi) & (kj < ki))
     rank = tl.sum(beats.to(tl.int32), axis=2)                       # [TB, K]
     cand = valid & (native < 0) & (bank >= 0) & (rank < strong)
+    if ROWCAP:                               # K31_STAGE_ROWS: row t of the call stages ranks < rcap[t] at most
+        rc = tl.load(rcap_ptr + t, mask=t < T, other=0)
+        cand = cand & (rank < rc[:, None])
     # per token, the pick of rank r (r < SP) as columns: expert, weight, candidate flag, bank index
     r_ar = tl.arange(0, SPC)
     sel = rank[:, None, :] == r_ar[None, :, None]                   # [TB, SP, K]
@@ -62,6 +72,26 @@ def _unitk(ids_ptr, w_ptr, row_ptr, bank_ptr, out_ptr, stage_ptr, T, strong, S, 
         ps = tl.load(pre_ptr + s_ar)
         match = fc[:, None] & (fb[:, None] == ps[None, :]) & (ps[None, :] >= 0)              # [N, SLOTS]
         full = tl.max(tl.where(match, s_ar[None, :], -1), axis=1)
+        if FILL:
+            # K31_PRESTAGE: candidates whose record was not staged ahead take the free slots (pre == -1), in order of
+            # their expert's largest weight (ties: lower expert id), and are staged now: `stage` = the late list
+            miss = fc & (full < 0)
+            msame = miss[:, None] & miss[None, :] & (fe[:, None] == fe[None, :])           # [N, N]
+            mfirst = miss & (tl.sum((msame & (n_ar[None, :] < n_ar[:, None])).to(tl.int32), axis=1) == 0)
+            mscore = tl.max(tl.where(msame, fw[None, :], float("-inf")), axis=1)
+            mbetter = mfirst[None, :] & ((mscore[None, :] > mscore[:, None]) |
+                                         ((mscore[None, :] == mscore[:, None]) & (fe[None, :] < fe[:, None])))
+            j = tl.sum(mbetter.to(tl.int32), axis=1)                           # place among the missed experts
+            free = ps < 0                                                      # [SLOTS]
+            fpos = tl.sum((free[None, :] & (s_ar[None, :] < s_ar[:, None])).to(tl.int32), axis=1)   # free slots before s
+            nfree = tl.sum(free.to(tl.int32), axis=0)
+            okm = mfirst & (j < nfree)
+            jslot = tl.max(tl.where(free[None, :] & (fpos[None, :] == j[:, None]), s_ar[None, :], -1), axis=1)
+            fill = tl.where(okm, jslot, -1)                                    # [N]: the slot of a missed expert
+            fm = tl.sum(tl.where(msame & okm[None, :], fill[None, :] + 1, 0), axis=1) - 1
+            full = tl.where(full >= 0, full, fm)
+            late = tl.sum(tl.where(okm[None, :] & (fill[None, :] == s_ar[:, None]), fb[None, :] + 1, 0), axis=1) - 1
+            tl.store(stage_ptr + s_ar, late)
     else:
         same = fc[:, None] & fc[None, :] & (fe[:, None] == fe[None, :])       # [N, N]
         first = fc & (tl.sum((same & (n_ar[None, :] < n_ar[:, None])).to(tl.int32), axis=1) == 0)
@@ -69,7 +99,7 @@ def _unitk(ids_ptr, w_ptr, row_ptr, bank_ptr, out_ptr, stage_ptr, T, strong, S, 
         better = first[None, :] & ((score[None, :] > score[:, None]) |
                                    ((score[None, :] == score[:, None]) & (fe[None, :] < fe[:, None])))
         slot = tl.sum(better.to(tl.int32), axis=1)                            # place among distinct experts
-        ok = first & (slot < SLOTSC)
+        ok = first & (slot < cap)
         # every entry's slot = its expert's first occurrence's slot
         full = tl.sum(tl.where(same & ok[None, :], slot[None, :] + 1, 0), axis=1) - 1
         stage = tl.sum(tl.where(ok[None, :] & (slot[None, :] == s_ar[:, None]), fb[None, :] + 1, 0), axis=1) - 1
@@ -78,10 +108,25 @@ def _unitk(ids_ptr, w_ptr, row_ptr, bank_ptr, out_ptr, stage_ptr, T, strong, S, 
     full2 = tl.reshape(full, (TB, SPC))
     served = valid & (native >= 0) & (rank < resmax)          # K31_RES_MAXRANK: a token's weakest picks cut even resident
     out = tl.where(served, native, -1)
-    for r in tl.static_range(SPC):
-        col = tl.sum(tl.where(r_ar[None, :] == r, full2, 0), axis=1)        # [TB]: slot of the token's rank-r pick
-        hit = cand & (rank == r) & (col[:, None] >= 0)
-        out = tl.where(hit, S + col[:, None], out)
+    if ALLROWS:
+        # K31_STAGE_ALL: what each slot holds (PRE: the bank index staged ahead; else the expert of the slot's first
+        # candidate), matched against every pick of the call: a non-resident pick of that expert uses the slot's row
+        if PRE:
+            hold = ps                                                         # [SLOTS] bank index, -1 = empty
+            if FILL:
+                hold = tl.where(ps >= 0, ps, late)
+            key = bank                                                        # [TB, K] (-1: no record or no pick)
+        else:
+            hold = tl.sum(tl.where(ok[None, :] & (slot[None, :] == s_ar[:, None]), fe[None, :] + 1, 0), axis=1) - 1
+            key = e                                                           # [TB, K] (invalid picks: masked below)
+        match = (key[:, :, None] == hold[None, None, :]) & (hold[None, None, :] >= 0)     # [TB, K, SLOTS]
+        sidx = tl.max(tl.where(match, s_ar[None, None, :], -1), axis=2)                   # [TB, K]: the pick's slot
+        out = tl.where(valid & (native < 0) & (sidx >= 0), S + sidx, out)
+    else:
+        for r in tl.static_range(SPC):
+            col = tl.sum(tl.where(r_ar[None, :] == r, full2, 0), axis=1)        # [TB]: slot of the token's rank-r pick
+            hit = cand & (rank == r) & (col[:, None] >= 0)
+            out = tl.where(hit, S + col[:, None], out)
     tl.store(out_ptr + off, out, mask=m2)
     if SCORE:
         # residency.py's inputs: the layer's decayed scores (decay^T, then + w^2 per pick) and pick counts
@@ -110,10 +155,17 @@ def _unitk(ids_ptr, w_ptr, row_ptr, bank_ptr, out_ptr, stage_ptr, T, strong, S, 
 
 def plan(ids: torch.Tensor, w: torch.Tensor, row_map: torch.Tensor, bank_map: torch.Tensor, strong: int, S: int,
          out: torch.Tensor = None, stage: torch.Tensor = None, score: torch.Tensor = None, lam: float = 1.0,
-         stats: torch.Tensor = None, pre: torch.Tensor = None, pend=None, resmax: int = 16):
+         stats: torch.Tensor = None, pre: torch.Tensor = None, pend=None, resmax: int = 16, allrows: bool = None,
+         fill: bool = False, cap: int = None, rowcap: torch.Tensor = None):
     """S: the first row of the call's staging slots. score (float32 [896]) and stats (int32 [4]): residency inputs,
     updated in place when given (decay lam per token). pre (int32 [SLOTS], bank index per slot): the slots were
-    staged ahead; candidates map onto them or are cut, and `stage` is left untouched."""
+    staged ahead; candidates map onto them or are cut, and `stage` is left untouched; with fill=True (K31_PRESTAGE)
+    the candidates without a staged-ahead record take the free slots instead (pre == -1, by weight) and `stage` is
+    written with those slots' bank indices only (the late list; -1 elsewhere). cap (default SLOTS, without pre): the
+    plain planner uses at most `cap` slots. allrows (default K31_STAGE_ALL): every non-resident pick of an expert in a
+    slot uses the slot, at any rank (PRE: by bank index). rowcap (int32 [16], K31_STAGE_ROWS): row t's candidates are
+    its picks of rank < min(strong, rowcap[t])."""
+    allrows = STAGE_ALL if allrows is None else bool(allrows)
     T, K = ids.shape
     assert K == 16 and T <= 16 and strong <= SP
     if out is None:
@@ -126,8 +178,10 @@ def plan(ids: torch.Tensor, w: torch.Tensor, row_map: torch.Tensor, bank_map: to
     pid, pw, pt = pend if acc else (out, out, out)
     _unitk[(1,)](ids.int() if ids.dtype != torch.int32 else ids, w.contiguous(), row_map, bank_map, out, stage, T,
                  strong, S, score if sc else out, float(lam ** T), stats if sc else out, pre if pre is not None else stage,
-                 pid, pw, pt, int(resmax), TB=TB, K=K, SPC=SP, SLOTSC=SLOTS, NE=1024, SCORE=sc, PRE=pre is not None, ACC=acc,
-                 num_warps=4 if TB <= 4 else 8, launch_pdl=PDL)
+                 pid, pw, pt, int(resmax), int(SLOTS if cap is None else cap), rowcap if rowcap is not None else out,
+                 TB=TB, K=K, SPC=SP, SLOTSC=SLOTS, NE=1024, SCORE=sc, PRE=pre is not None, ACC=acc, ALLROWS=allrows,
+                 FILL=bool(fill) and pre is not None, ROWCAP=rowcap is not None, num_warps=4 if TB <= 4 else 8,
+                 launch_pdl=PDL)
     return out, stage
 
 

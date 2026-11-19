@@ -7,7 +7,7 @@ residency's slow drift falls on all of them alike.
 
 usage: python3 -I prefill_bisect.py URL FLAGS_FILE CORPUS.pt CONFIGS.json [--len 16384] [--rounds 2] [--out OUT.json]
   FLAGS_FILE  the control file as the host sees it (the server reads the same file at K31_FLAGS_FILE)
-  CORPUS.pt   a torch.save'd dict with "windows" [N, W] token ids (read without torch: pure-Python zip reader)
+  CORPUS.pt   a torch.save'd dict with "windows" (or "tokens") [N, W] token ids (read without torch: pure-Python zip reader)
   CONFIGS     {"name": {"K31_...": value, ...}, ...}; the first is the baseline
 """
 import argparse
@@ -42,7 +42,7 @@ def _windows(path):
             return (pid[1], pid[2])                         # (storage kind, key)
 
     d = U(z.open(f"{prefix}/data.pkl")).load()
-    _, (kind, key), off, shape = d["windows"]
+    _, (kind, key), off, shape = d["windows"] if "windows" in d else d["tokens"]
     size = {"IntStorage": 4, "LongStorage": 8}[kind]
     fmt = {"IntStorage": "i", "LongStorage": "q"}[kind]
     raw = z.read(f"{prefix}/data/{key}")
@@ -81,16 +81,22 @@ def main():
             while len(toks) < a.len:
                 toks += wins[w % len(wins)]
                 w += 1
-            n, dt = cold_prompt(a.url.rstrip("/"), toks[:a.len])
+            try:
+                n, dt = cold_prompt(a.url.rstrip("/"), toks[:a.len])
+            except Exception as ex:                     # noqa: BLE001  (a configuration that fails: record, go on)
+                print(f"round {r} {name}: FAILED ({ex})", flush=True)
+                res[name].append(float("nan"))
+                continue
             res[name].append(n / dt)
             print(f"round {r} {name}: {n} tokens in {dt:.2f} s = {n / dt:.0f} tok/s", flush=True)
     if os.path.exists(a.flags_file):
         os.remove(a.flags_file)
     base = list(configs)[0]
-    b = sum(res[base]) / len(res[base])
+    ok = lambda v: [x for x in v if x == x]             # drop failed rounds (NaN)
+    b = sum(ok(res[base])) / max(1, len(ok(res[base])))
     for name, v in res.items():
-        m = sum(v) / len(v)
-        print(f"{name:24s} {m:7.0f} tok/s  ({m / b:.3f} x {base})")
+        m = sum(ok(v)) / len(ok(v)) if ok(v) else float("nan")
+        print(f"{name:24s} {m:7.0f} tok/s  ({m / b:.3f} x {base}){'' if len(ok(v)) == len(v) else '  (failed rounds)'}")
     if a.out:
         json.dump(res, open(a.out, "w"), indent=1)
 

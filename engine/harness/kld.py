@@ -13,6 +13,9 @@ Per position t (the distribution after token t, predicting t + 1; the last posit
   data-processing inequality this is a lower bound on the full-vocabulary KL, tight when the shared tokens hold most
   of both distributions' mass (`cover` reports the reference mass they hold; the runner's own universe KLDs are full
   vocabulary). Also: top-1 agreement (exact) and the engine's NLL of the next token where it is in its top-k.
+
+Sequences longer than 2,048 tokens (the L32 set) or --long: kld_long.py's protocol (prompt and forced rows both scored
+exactly in the server, per-sequence prompt lengths, row ranges); the 2,048-token protocol above is unchanged.
 """
 import argparse
 import json
@@ -40,12 +43,14 @@ def ask(url, ids, k, timeout=900):
     return pl
 
 
-def ask_decode(url, ids, P, k, timeout=7200, kl=None, lp_k=0):
+def ask_decode(url, ids, P, k, timeout=7200, kl=None, lp_k=0, prompt_k=None):
     """Forced decoding (k31_engine/force.py on the server): the first P tokens as the prompt, the rest generated one
     decode step at a time with each step's token forced to the reference; returns the per-position table `ask` gives
-    (index t = the distribution after token t - 1), from prompt_logprobs (t < P) and the raw generated log-probs."""
-    body = {"model": "derpk31pro", "prompt": ids[:P], "max_tokens": len(ids) - P, "temperature": 0, "logprobs": lp_k or k,
-            "prompt_logprobs": k, "return_tokens_as_token_ids": True, "ignore_eos": True,
+    (index t = the distribution after token t - 1), from prompt_logprobs (t < P) and the raw generated log-probs.
+    prompt_k: top log-probs per prompt row (None = k; long sequences ask 1: the engine's top-1 and the prompt token)."""
+    body = {"model": "derpk31pro", "prompt": ids[:P], "max_tokens": len(ids) - P, "temperature": 0,
+            "logprobs": lp_k or k, "prompt_logprobs": k if prompt_k is None else prompt_k,
+            "return_tokens_as_token_ids": True, "ignore_eos": True,
             "vllm_xargs": {"k31_force": ids[P:], "k31_start": P, **(kl or {})}}
     req = urllib.request.Request(url.rstrip("/") + "/v1/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
@@ -71,7 +76,9 @@ def main():
     p.add_argument("--mode", default="prefill", choices=("prefill", "decode"),
                    help="prefill: each cut teacher-forced in one prompt (brandonmusic's protocol); decode: a short "
                         "prompt (--prompt tokens), the rest forced one decode step at a time")
-    p.add_argument("--prompt", type=int, default=64)
+    p.add_argument("--prompt", type=lambda s: s if s == "tail" else int(s), default=64,
+                   help="decode mode: prompt tokens per sequence; 'tail' (--long): the corpus's per-sequence `tail` "
+                        "rows are forced, the rest is the prompt (L32: 28,672 for agentic and SWE, 30,720 otherwise)")
     p.add_argument("--decode-logprobs", type=int, default=0, help="decode mode: top-k log-probs per generated row "
                    "(0 = --k); with --kl-ref the generated rows' KL is the server's exact one, so 1 keeps top-1 and NLL "
                    "and drops only the top-k estimate and `cover` there (the 64-wide response was most "
@@ -99,9 +106,28 @@ def main():
     p.add_argument("--dump-ref", action="store_true",
                    help="write this engine's own top-k as a reference file at REF_KLD.pt instead of scoring (to compare "
                         "two engines, or to check the harness: an engine scored against itself gives KLD 0)")
+    # long sequences (kld_long.py; on by itself for sequences longer than 2,048 tokens, e.g. corpus/k31-l32.pt)
+    p.add_argument("--long", action="store_true", help="the long-sequence protocol (kld_long.py): per-sequence prompt "
+                   "lengths, exact KL on prompt rows too, row ranges, corpus labels, a bootstrap over sequences, "
+                   "buckets by position and by distance from the prompt's end")
+    p.add_argument("--prompt-logprobs", type=int, default=None, help="--long: top log-probs per prompt row (default 1 "
+                   "with an exact reference: the engine's top-1 and the prompt token, for top-1 and NLL; else --k)")
+    p.add_argument("--prompt-rows", default="exact", choices=("exact", "estimate"), help="--long: prompt rows scored "
+                   "with the server's exact KL (default) or kld.py's top-k estimate (the 2,048-token protocol's rule)")
+    p.add_argument("--kl-rows", default="", help="--long: the rows the server scores exactly, as Python slice bounds "
+                   "(--kl-rows=-4097: for the last 4,097; default all); other rows are not scored")
+    p.add_argument("--block", type=int, default=0, help="--long: sequences per bootstrap block (0 = 1)")
+    p.add_argument("--cuts", default="", help="--long: the same arm's 2,048-token-cut result JSON (kld.py on "
+                   "k31-bm-eval.pt with --roles): ratio of this set's headline to the cuts' generated-row KLD on the "
+                   "same kinds")
     a = p.parse_args()
     c = torch.load(a.corpus, weights_only=False)
     tokens = c["tokens"] if isinstance(c, dict) else c
+    if (a.long or tokens.shape[1] > 2048) and not a.dump_ref:
+        import kld_long
+        return kld_long.run(a, c, ask_decode)
+    if a.prompt == "tail":
+        raise SystemExit("--prompt tail needs --long")
     if a.dump_ref:
         N, T = tokens.shape
         n_use = a.windows or N

@@ -1,0 +1,108 @@
+{
+ "note": "Resident caps by layer (joint -2.0 in the plan): picks of rank >= R take the mean even when their expert has a row, so MegaMoE streams fewer experts (about 2.0 ms less chain time than the default table in simulation); staged ranks per layer as in the plan; band on every rank (cap 8), mean substitute on.",
+ "version": 1,
+ "env": {
+  "K31_BAND_FEED": "0.25",
+  "BAND_READAHEAD": "8"
+ },
+ "policies": {
+  "s1r6": {
+   "hit": "0-5",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-0",
+   "mean": "0-15"
+  },
+  "s0r6": {
+   "hit": "0-5",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "none",
+   "mean": "0-15"
+  },
+  "s1r8": {
+   "hit": "0-7",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-0",
+   "mean": "0-15"
+  },
+  "s0r8": {
+   "hit": "0-7",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "none",
+   "mean": "0-15"
+  },
+  "s1r10": {
+   "hit": "0-9",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-0",
+   "mean": "0-15"
+  },
+  "s3r10": {
+   "hit": "0-9",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-2",
+   "mean": "0-15"
+  },
+  "s2r12": {
+   "hit": "0-11",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-1",
+   "mean": "0-15"
+  },
+  "s2r10": {
+   "hit": "0-9",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-1",
+   "mean": "0-15"
+  },
+  "s1r16": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-0",
+   "mean": "0-15"
+  },
+  "s1r12": {
+   "hit": "0-11",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-0",
+   "mean": "0-15"
+  },
+  "s0r16": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "none",
+   "mean": "0-15"
+  },
+  "s4r8": {
+   "hit": "0-7",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-3",
+   "mean": "0-15"
+  }
+ },
+ "default": "s0r6",
+ "layers": {
+  "1-11,63-65,67-68,79": "s1r6",
+  "35,38-47,49-50,60-62,73-74,76-77,80,82,86-88": "s1r8",
+  "48,75,78,84-85": "s0r8",
+  "51,55,81,89": "s1r10",
+  "52": "s3r10",
+  "53": "s2r12",
+  "54,56-59": "s2r10",
+  "72": "s1r16",
+  "83": "s1r12",
+  "90-91": "s0r16",
+  "92": "s4r8"
+ }
+}

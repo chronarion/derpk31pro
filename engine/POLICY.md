@@ -17,12 +17,22 @@ by the first treatment of this fixed menu that its policy allows **and** that is
 | `hit` | the expert has a native HBM row | exact; 2.6 us per expert inside MegaMoE |
 | `band` | the expert has a record in the RTX band | 2-bit on time: 0.07-0.15 of a skip in KL; ~0 GB300 time while the RTX keeps up |
 | `stage` | the expert has a Grace bank record | 2-bit on time; ~33 us per record on the critical path (C2C) |
+| `late` | the expert has a bank record and the late tier is on (`K31_LATE=1`) | 2-bit, computed by the Grace pool, half a layer late on top of the mean it got on time: ~0.14 of a skip for rank 0, 0.2-0.3 for ranks 4-15 [model]; no GB300 time per record, one up GEMV per layer beside the next attention; `late_slots` = records per call (0-8) |
 | `defer` | the expert has a bank record and deferral is on | exact one layer late: 0.16-0.37 of a skip; completion kernels every layer |
 | `mean` | the layer has a mean table (`K31_CUT_MEAN`) | cut, plus weight x the expert's mean output: ~0.5 of a skip for weak picks, nothing for strong |
 | skip | always | cut |
 
 The order is fixed: band experts never have bank records (the band and the bank are disjoint), and an on-time
 treatment always beats a late one. A policy only decides which ranks may use each treatment.
+
+Two switches change what a treatment covers, not which ranks may use it:
+- `K31_STAGE_ALL=1`: the `stage` ranks decide which experts a call stages; once staged, every pick of that expert in
+  the call uses its record, at any rank and in any row (off: only the picks of the `stage` ranks). No extra records,
+  no extra MegaMoE experts. Not with `K31_DEFER=1`.
+- `K31_BAND_PRIOR=p0,p1,...`: a call with more band experts than `band_cap` keeps those with the largest weight x
+  their row's prior chance of being accepted (`p_i` for row i of a request's verify block: row 0 always, draft row i
+  when drafts 1..i are accepted; e.g. the measured acceptance `1,0.64,0.36,0.19,0.09` at 4 drafts) instead of the
+  largest weight. Decode calls in CUDA graphs only; calls under the cap are unchanged.
 
 ## The file
 
@@ -42,9 +52,10 @@ treatment always beats a late one. A policy only decides which ranks may use eac
 }
 ```
 
-- **Fields of a policy**: `hit`, `band`, `stage`, `defer`, `mean` take rank sets (`"0-15"`, `"0-2,5"`, `"none"`,
-  `"all"`, `[0, 1]`, an int); `band_cap` is the most distinct band experts per call (1-16; default `K31_BAND_MAXE`).
-  Defaults: `hit` and `band` all ranks, `stage`, `defer` and `mean` none.
+- **Fields of a policy**: `hit`, `band`, `stage`, `late`, `defer`, `mean` take rank sets (`"0-15"`, `"0-2,5"`,
+  `"none"`, `"all"`, `[0, 1]`, an int); `band_cap` is the most distinct band experts per call (1-16; default
+  `K31_BAND_MAXE`); `late_slots` the records per late job (0-8; default `K31_LATE_SLOTS`). Defaults: `hit` and `band`
+  all ranks, `stage`, `late`, `defer` and `mean` none.
 - **`layers`** assigns policies to model layers (`"1-11"`, `"12"`, `"1-11,48-59"`, `"*"`); unnamed layers take
   `default`.
 - **`overrides`** change single fields of the assigned policy for some layers.
@@ -52,7 +63,8 @@ treatment always beats a late one. A policy only decides which ranks may use eac
 - **`env`** holds global knobs; `k31.sh up` exports each one unless it is already set (an arm's own variables win;
   the profile's defaults fill what neither gives). Knobs that belong here: `K31_HBM`, `K31_BAND_N`, `K31_BANK`,
   `K31_PROMOTE`, `K31_BANK_PROMOTE`, `K31_BAND_FEED`, `K31_HALFLIFE`, `K31_ACCEPTED`, `K31_CUT_MEAN`,
-  `K31_BAND_MAXE`, `BAND_READAHEAD`. Speed plumbing (dense formats, side streams, the MegaMoE fork, PDL) stays outside.
+  `K31_BAND_MAXE`, `K31_STAGE_ALL`, `K31_BAND_PRIOR`, `BAND_READAHEAD`. Speed plumbing (dense formats, side streams,
+  the MegaMoE fork, PDL) stays outside.
 
 `K31_POLICY` takes precedence over `K31_STRONG`, `K31_LAYER_BANDS`, `K31_RES_MAXRANK(_MAP)` and `K31_DEFER_TO` for the
 values it sets. A policy that needs a switch that is off (a `defer` range without `K31_DEFER=1`, `mean` without
@@ -68,6 +80,7 @@ layer's 16 masks into what the kernels take today:
 | resident cap `resmax` (unitk) | ranks allowed `hit` | a prefix 0..n-1 |
 | `band_ok`, `band_cap` (band send, residency feed) | ranks allowed `band` | all or none |
 | `strong` (unitk staging) | ranks allowed `stage` | a prefix, at most ranks 0-3 |
+| `late`, `late_n` (late plan, `latetier.py`) | ranks allowed `late`, `late_slots` | one contiguous range; not with `defer` |
 | `defer_from`, `defer_to` (deferral plan) | ranks allowed `defer` | one contiguous range; staged ranks never also defer |
 | `cut_mean` (mean tables loaded or not) | ranks allowed `mean` | all or none |
 

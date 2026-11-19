@@ -8,6 +8,10 @@ It carries modified copies of, or builds on, these components; each modified fil
   engine/overlay/megamoe_k31/LICENSE.DeepGEMM) with Derpseek's MegaMoE changes (https://github.com/chronarion/derpseek,
   MIT), which build on the MegaMoE fork in Garner McCloud's dgx-station-recipes (MIT,
   engine/overlay/megamoe_k31/LICENSE.ds41).
+- engine/k31_engine/csrc/noprep_plan.cu: the scoring and routing-weight steps of vLLM's grouped top-k kernel
+  (csrc/moe/grouped_topk_kernels.cu at commit 266e88c05, https://github.com/vllm-project/vllm, Apache-2.0, there adapted
+  from TensorRT-LLM and FlashInfer; engine/k31_engine/csrc/LICENSE.vllm), copied so that the plan kernel's routing
+  weights are vLLM's to the bit.
 - engine/csrc/k31i8/: the int8 decode GEMV of the Hecate overlay (chronarion, MIT) with ExLlamaV3's graph and utility
   headers (https://github.com/turboderp-org/exllamav3, MIT, turboderp).
 - third_party/tomcupr/: kstream.py, kstrip.py and the Kimi K3.1 Pro recipe from Tomas Cupr's dgx-station-recipes

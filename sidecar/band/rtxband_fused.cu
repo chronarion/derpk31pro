@@ -10,6 +10,8 @@
 //                     and the float32 -> bfloat16 add.
 //
 // Same state block (bandgb::GbState) and mailbox protocol as rtxband_gb300.cu; the two can be mixed call by call.
+// K31_BAND_PRIOR (B1, band_prior.cuh): with prior_on, a call past its cap keeps the experts with the largest
+// weight x the row's prior chance of being accepted (plan / hint kernel and send alike); prior_on = 0 is today's plan.
 // Build: nvcc -O3 -std=c++17 -gencode arch=compute_103a,code=sm_103a -shared -Xcompiler -fPIC -o librtxband_fused.so
 //        rtxband_fused.cu
 #include <cuda_bf16.h>
@@ -17,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include "band_gb300.cuh"
+#include "band_prior.cuh"
 
 namespace {
 using namespace bandgb;
@@ -49,7 +52,32 @@ struct FusedArgs {
   const float* msum;                   // [T][3584] float32 or null (v4): the cut picks' mean sum, added with the rows
   float* rstd;                         // [T] or null (v4): rsqrt(mean(out^2) + eps) of the finished BF16 rows, for the
   float eps;                           //   routed up-projection's RMSNorm (w8a16 NORM 2: no statistic prologue)
+  float prior[MT];                     // B1: row t's prior chance of being accepted (used when prior_on != 0)
+  int prior_on;                        //   0: the cap keeps the largest weights (today's plan)
 };
+
+// B1: the kept set by weight x the row's prior, then today's work-list order among the kept experts, written into p_s
+// (past the cap: NPMAX). Called by every thread of the CTA after p_s and n_first are final (it has its own barriers);
+// the code after it reads p_s exactly as without a prior.
+__device__ __forceinline__ void prior_places(const FusedArgs& a, int NP, const int* e_s, const int* b_s,
+                                             const float* w_s, const int* f_s, const float* sc_s, int* p_s) {
+  __shared__ float k_s[NPMAX], pr_s[MT];
+  __shared__ int kp_s[NPMAX];
+  const int tid = threadIdx.x;
+  const int cap = (a.flags >> 16) & 0xFF;
+  const int ne = (cap > 0 && cap < NE) ? cap : NE;
+  if (tid == 0) {
+#pragma unroll
+    for (int r = 0; r < MT; r++) pr_s[r] = a.prior[r];    // constant offsets into the argument block
+  }
+  __syncthreads();
+  if (tid < NPMAX) k_s[tid] = bandprior::key(tid, NP, e_s, b_s, w_s, pr_s);
+  __syncthreads();
+  if (tid < NPMAX) kp_s[tid] = bandprior::kept(tid, NP, e_s, b_s, f_s, k_s, ne);
+  __syncthreads();
+  if (tid < NPMAX && b_s[tid] >= 0) p_s[tid] = bandprior::place(tid, NP, e_s, f_s, kp_s, sc_s, NPMAX);
+  __syncthreads();
+}
 
 // The plan / hint kernel (K31_BAND_HINT): the send's planning half, launched right after top-k on the
 // band's stream, writes the served flags and stats and publishes the call's band slots as a hint, so the RTX pulls
@@ -104,6 +132,7 @@ __global__ void __launch_bounds__(THREADS) band_plan_hint(const FusedArgs a) {
     n_first = n;
   }
   __syncthreads();
+  if (a.prior_on) prior_places(a, NP, e_s, b_s, w_s, f_s, sc_s, p_s);    // B1 (a uniform branch: a kernel argument)
   // a runtime cap on the call's experts (K31_BAND_MAXE: flags bits 16-23, 0 = the full NE): the RTX's time per call
   // grows with its experts; picks past the cap count as past-16 (cut), as past NE always did
   const int cap = (a.flags >> 16) & 0xFF;
@@ -178,6 +207,7 @@ __global__ void __launch_bounds__(THREADS) band_qsend(const FusedArgs a) {
     n_first = n;
   }
   __syncthreads();
+  if (a.prior_on) prior_places(a, NP, e_s, b_s, w_s, f_s, sc_s, p_s);    // B1 (a uniform branch: a kernel argument)
   // a runtime cap on the call's experts (K31_BAND_MAXE: flags bits 16-23, 0 = the full NE): the RTX's time per call
   // grows with its experts; picks past the cap count as past-16 (cut), as past NE always did
   const int cap = (a.flags >> 16) & 0xFF;
@@ -428,10 +458,15 @@ struct RtxBandFused {
   unsigned long long timeout_ns;
   void* served;
   const void* msum; void* rstd; float eps;
+  float prior[MT]; int prior_on;
 };
 static_assert(sizeof(RtxBandFused) == sizeof(FusedArgs), "argument block");
+static_assert(sizeof(FusedArgs) == 168, "argument block: k31_engine/band.py _Fused has the same 168 bytes");
 
 void rtxband_fused_pdl(int on) { g_pdl = on; }
+
+// B1 (K31_BAND_PRIOR): this build reads prior / prior_on (older builds ignore the fields past eps)
+int rtxband_fused_prior(void) { return 1; }
 
 int rtxband_fused_hint(const RtxBandFused* a, void* stream) {
   return launch_pdl(band_plan_hint, *reinterpret_cast<const FusedArgs*>(a), (cudaStream_t)stream);

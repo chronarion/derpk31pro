@@ -15,8 +15,14 @@ log-probabilities (runner `--dump-logits`: bf16 bits [N, T, V]) to the GPU when 
 KL(reference || engine) over the full vocabulary from the raw logits at every forced row (row at input position p =
 reference row p, which predicts token p + 1), and saves the per-position values (float32 [T], NaN where not computed)
 to k31_kl_out near the request's end (rewritten on each of its last steps).
+
+Long sequences: a request that also carries `"k31_kl_rows": [A, B]` takes the row-range path at the end of this file
+(only rows [A, B) are read and scored; the reference block stays in pinned host memory, the forced rows sit on the GPU).
 """
 from __future__ import annotations
+
+import json
+import os
 
 import numpy as np
 import torch
@@ -95,12 +101,19 @@ class ForceTokens(LogitsProcessor):
             return
         if not isinstance(x, list) or "k31_start" not in sampling_params.extra_args:
             raise ValueError("k31_force needs a list of token ids and k31_start (the prompt length)")
+        rows = sampling_params.extra_args.get("k31_kl_rows")
+        if rows is not None and (not isinstance(rows, (list, tuple)) or len(rows) != 2 or
+                                 not all(isinstance(v, int) for v in rows) or rows[0] < 0 or rows[1] <= rows[0]):
+            raise ValueError("k31_kl_rows must be [A, B] with 0 <= A < B (absolute rows to score)")
 
     def add_request(self, req_idx: int, sampling_params) -> bool:
         xa = sampling_params.extra_args or {}
         x = xa.get("k31_force")
         self.pending[req_idx] = None if x is None else (int(xa["k31_start"]), x)
         self.kl.pop(req_idx, None)
+        if x is not None and xa.get("k31_kl_rows") is not None and (xa.get("k31_kl_ref") or xa.get("k31_kl_hidden")):
+            self.kl[req_idx] = _rows_entry(xa, len(x), self.dev)        # long sequences: the row-range path (below)
+            return True
         if x is not None and (xa.get("k31_kl_ref") or xa.get("k31_kl_hidden")):
             hidden = bool(xa.get("k31_kl_hidden"))
             path = xa["k31_kl_hidden"] if hidden else xa["k31_kl_ref"]
@@ -133,6 +146,9 @@ class ForceTokens(LogitsProcessor):
         if self.kl:                                  # exact KL from the raw logits, before the forcing below
             lp = torch.log_softmax(logits.float(), dim=-1)
             for slot, k in self.kl.items():
+                if "lo" in k:                            # the row-range path: its forced rows [lo, hi) on the GPU
+                    _rows_apply(k, slot, slots, pos, lp)
+                    continue
                 ref = k["ref"]
                 T = ref.shape[0]
                 if not k["hidden"] and ref.shape[1] != lp.shape[1]:
@@ -177,6 +193,9 @@ def _prompt_kl(logits_fn, hidden_states, input_batch, prompt_lens) -> None:
         k = ft.kl.get(slot)
         if k is None:
             continue
+        if "lo" in k:                                    # the row-range path: prompt rows from pinned host memory
+            _rows_prompt(k, logits_fn, hidden_states, input_batch, i, int(prompt_lens[slot]), ft.dev)
+            continue
         prompt_len = int(prompt_lens[slot])
         chunk_start = int(input_batch.num_computed_prefill_tokens_np[i])
         chunk_end = chunk_start + int(input_batch.num_scheduled_tokens[i])
@@ -212,3 +231,159 @@ def patch_prompt_kl(module) -> None:
         return orig(self, logits_fn, hidden_states, input_batch, all_token_ids, num_computed_tokens, prompt_lens)
     cls.compute_prompt_logprobs = compute_prompt_logprobs
     cls._k31_prompt_kl = True
+
+
+# ------------------------------------------------------------------------------------ long sequences (row ranges)
+# A request whose extra args carry "k31_kl_rows": [A, B] (absolute rows to score; harness/kld_long.py sends it) takes
+# this path instead of the one above, which holds the whole [T, 7168] reference block on the GPU (0.47 GB at 32K rows,
+# 1.9 GB at 128K, 15 GB at 1M) and indexes it by absolute position:
+# - only rows [A, B) of the block are read, into pinned host memory (`k31_kl_next` reads the next block's rows the same
+#   way on a thread while this request runs);
+# - the rows the decode steps score (from the prompt's last row on) are copied to the GPU when the request arrives;
+#   prompt rows go to the GPU per prompt chunk, PROMPT_KL_CHUNK rows at a time, and the host block is released after
+#   the prompt's last chunk;
+# - the reference may hold a row range of every sequence (runner --dump-rows: FILE.json's row_start / row_end) and may
+#   be several files in order (comma-separated: k31_kl_index counts across them, e.g. the runner's two halves);
+# - rows outside [A, B) (or outside what the reference holds) are not scored: NaN in the output, which has one entry
+#   per sequence position (end = k31_start + len(k31_force)).
+# The KL arithmetic and every call's shape are the path above's (a prompt sub-chunk the range cuts is computed whole,
+# see _rows_prompt; `apply` gathers one reference row per logits row either way), so the same rows give bit-equal
+# values on the GPU too (engine/tests/test_force_rows.py).
+_PARTS: dict = {}                # (reference spec, mtimes) -> [(path, sequences, row_start, row_end)]
+_RF: dict = {"pool": None, "fut": None, "key": None}      # the prefetched block: future of _rows_read, its key
+
+
+def _ref_parts(spec: str):
+    stamp = tuple(os.stat(p).st_mtime_ns for p in spec.split(","))     # a rewritten reference is read again
+    parts = _PARTS.get((spec, stamp))
+    if parts is None:
+        parts = []
+        for path in spec.split(","):
+            mm = np.load(path, mmap_mode="r")
+            r0, r1 = 0, int(mm.shape[1])
+            if os.path.exists(path + ".json"):
+                with open(path + ".json") as f:
+                    d = json.load(f)
+                r0, r1 = int(d.get("row_start", 0)), int(d.get("row_end", mm.shape[1]))
+                if r1 - r0 != mm.shape[1]:
+                    raise RuntimeError(f"{path}.json: rows [{r0}, {r1}), the file holds {mm.shape[1]} per sequence")
+            parts.append((path, int(mm.shape[0]), r0, r1))
+        _PARTS[(spec, stamp)] = parts
+    return parts
+
+
+def _rows_read(spec: str, i: int, A: int, B: int):
+    """Rows [A, B) of reference block i (absolute rows; clipped to the rows the file holds) as an int16 tensor (the
+    bf16 bits) in pinned host memory when CUDA is up; returns (rows, lo, hi) with rows[j] = absolute row lo + j."""
+    j = i
+    for path, n, r0, r1 in _ref_parts(spec):
+        if j < n:
+            break
+        j -= n
+    else:
+        raise IndexError(f"reference block {i}: {spec} holds {sum(p[1] for p in _ref_parts(spec))}")
+    lo, hi = max(A, r0), min(B, r1)
+    if hi <= lo:
+        return None, lo, lo
+    src = np.load(path, mmap_mode="r")[j, lo - r0:hi - r0]
+    if src.dtype.itemsize != 2:
+        raise RuntimeError(f"{path}: {src.dtype}, expected bf16 bits (uint16 / int16)")
+    host = torch.empty(src.shape, dtype=torch.int16, pin_memory=torch.cuda.is_available())
+    np.copyto(host.numpy(), src.view(np.int16))
+    return host, lo, hi
+
+
+def _rows_take(spec: str, i: int, A: int, B: int):
+    key = (spec, int(i), int(A), int(B))
+    if _RF["fut"] is not None and _RF["key"] == key:
+        got = _RF["fut"].result()
+        _RF["fut"] = _RF["key"] = None
+        return got
+    return _rows_read(spec, int(i), int(A), int(B))
+
+
+def _rows_start(spec: str, i: int, A: int, B: int) -> None:
+    if _RF["pool"] is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _RF["pool"] = ThreadPoolExecutor(1)
+    _RF["key"] = (spec, int(i), int(A), int(B))
+    _RF["fut"] = _RF["pool"].submit(_rows_read, spec, int(i), int(A), int(B))
+
+
+def _rows_entry(xa: dict, n_force: int, dev) -> dict:
+    hidden = bool(xa.get("k31_kl_hidden"))
+    spec = xa["k31_kl_hidden"] if hidden else xa["k31_kl_ref"]
+    start = int(xa["k31_start"])
+    end = start + n_force
+    A, B = (int(v) for v in xa["k31_kl_rows"])
+    A, B = max(A, 0), min(B, end)
+    host, lo, hi = _rows_take(spec, int(xa["k31_kl_index"]), A, B)
+    if int(xa.get("k31_kl_next", -1)) >= 0:
+        _rows_start(spec, int(xa["k31_kl_next"]), A, B)
+    dlo = max(lo, start - 1)                     # forced rows: the prompt's last row is the first sampled one
+    ref = host[dlo - lo:hi - lo].to(dev).view(torch.bfloat16) if hi > dlo else None
+    pend = min(hi, start - 1)                    # prompt rows [lo, pend) stay in host memory until the prompt is done
+    return {"ref": ref, "lo": dlo, "hi": max(hi, dlo), "host": host if pend > lo else None, "host_lo": lo,
+            "host_hi": pend, "hidden": hidden, "out": torch.full((end + 1,), float("nan"), device=dev),
+            "path": xa["k31_kl_out"], "end": end}
+
+
+def _rows_apply(k: dict, slot: int, slots: torch.Tensor, pos: torch.Tensor, lp: torch.Tensor) -> None:
+    """`apply`'s exact KL for a row-range request: rows at input positions [lo, hi) of this slot."""
+    ref = k["ref"]
+    if ref is None:
+        return
+    lo, R, T = k["lo"], ref.shape[0], k["out"].shape[0] - 1       # out[T]: the dummy entry other rows land in
+    if not k["hidden"] and ref.shape[1] != lp.shape[1]:
+        raise RuntimeError(f"k31_kl_ref has {ref.shape[1]} columns, the logits {lp.shape[1]}")
+    mine = (slots == slot) & (pos >= lo) & (pos < k["hi"])
+    at = (pos - lo).clamp(0, R - 1)
+    if k["hidden"]:
+        r = _ref_logits(ref[at], lp.shape[1])
+    else:
+        r = ref[at].float()
+    r = r - torch.logsumexp(r, -1, keepdim=True)
+    p0 = r.exp()
+    v = torch.where(p0 > 0, p0 * (r - lp), 0.0).sum(-1)
+    k["out"].index_put_((torch.where(mine, pos, T),), v)
+
+
+def _rows_prompt(k: dict, logits_fn, hidden_states, input_batch, i: int, prompt_len: int, dev) -> None:
+    """`_prompt_kl` for a row-range request: this chunk's prompt rows in [host_lo, host_hi), reference rows copied from
+    pinned host memory. The sub-chunks are always the path above's (PROMPT_KL_CHUNK rows from the chunk's start, up to
+    the prompt's last row), wherever the range starts or ends: on the GPU a row's logits, log-softmax and KL sum depend
+    on the row count of the call that computes them (cuBLAS and the reduction kernels choose kernels by shape), so a
+    row computed in a sub-chunk cut at the range's edge would round differently. A sub-chunk the range cuts is computed
+    whole (reference rows outside the range zero) and only its rows inside the range are kept."""
+    chunk_start = int(input_batch.num_computed_prefill_tokens_np[i])
+    chunk_end = chunk_start + int(input_batch.num_scheduled_tokens[i])
+    if chunk_start >= prompt_len:
+        return                                       # a decode step: `apply` scores its rows
+    host = k["host"]
+    if host is not None:
+        hlo, hhi = k["host_lo"], k["host_hi"]
+        end = min(chunk_end, prompt_len - 1)
+        base = int(input_batch.query_start_loc_np[i]) - chunk_start
+        for a in range(chunk_start, end, PROMPT_KL_CHUNK):
+            b = min(a + PROMPT_KL_CHUNK, end)
+            r0, r1 = max(a, hlo), min(b, hhi)        # this sub-chunk's rows inside the range
+            if r1 <= r0:
+                continue
+            if r0 == a and r1 == b:
+                rows = host[a - hlo:b - hlo].to(dev, non_blocking=True)
+            else:
+                rows = torch.zeros((b - a,) + tuple(host.shape[1:]), dtype=host.dtype, device=dev)
+                rows[r0 - a:r1 - a].copy_(host[r0 - hlo:r1 - hlo], non_blocking=True)
+            rows = rows.view(torch.bfloat16)
+            lp = torch.log_softmax(logits_fn(hidden_states[base + a:base + b]).float(), dim=-1)
+            if k["hidden"]:
+                r = _ref_logits(rows, lp.shape[1])
+            else:
+                r = rows.float()
+            r = r - torch.logsumexp(r, -1, keepdim=True)
+            p0 = r.exp()
+            v = torch.where(p0 > 0, p0 * (r - lp), 0.0).sum(-1)
+            k["out"][r0:r1] = v[r0 - a:r1 - a]
+            del lp, r, p0, rows, v
+    if chunk_end >= prompt_len:
+        k["host"] = None                             # the prompt is done: release the pinned block

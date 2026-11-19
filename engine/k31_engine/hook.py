@@ -150,11 +150,30 @@ LAYER_BANDS = os.environ.get("K31_LAYER_BANDS", "")
 # K31_RES_MAXRANK_MAP: JSON {"caps": {"<layer>": R}} per MoE layer (others: K31_RES_MAXRANK). Default 16 = off.
 RES_MAXRANK = int(os.environ.get("K31_RES_MAXRANK", "16"))
 RES_MAXRANK_MAP = os.environ.get("K31_RES_MAXRANK_MAP", "")
+# K31_STAGE_ALL=1: every pick of an expert staged for the call uses its staging row, at any rank and in any row (unitk
+# ALLROWS; the same in the torch rounds of calls past 16 rows), not only the candidate picks of rank < strong that
+# staged it: the same records, the same distinct experts in MegaMoE. Not with K31_DEFER=1 (a deferred pick of a staged
+# expert would be served twice). Default 0: candidate picks only.
+STAGE_ALL = os.environ.get("K31_STAGE_ALL", "0") == "1"
 # K31_POLICY=FILE (policy.py): per-layer, per-rank expert-miss policies (hit / band / stage / defer / mean / skip),
 # compiled at bind into each layer's resident cap, staging ranks, deferral range, band on/off + cap and mean on/off;
 # it takes precedence over K31_STRONG, K31_LAYER_BANDS, K31_RES_MAXRANK(_MAP) and K31_DEFER_TO for those values
 POLICY = os.environ.get("K31_POLICY", "")
 BAND_SERVED = os.environ.get("K31_BAND_SERVED", "0") == "1"
+# K31_LATE=1: the late tier on the Grace pool (latetier.py): a decode call's bank picks that nothing serves
+# on time are computed by the pool's cores and land half a layer late (one up GEMV per layer beside the next attention)
+LATE = os.environ.get("K31_LATE", "0") not in ("", "0")
+_LT: list = [None]                  # latetier.Tier once bound
+# K31_PRESTAGE=1 (prestage.py): decode pre-staging -- a side stream predicts each MoE layer's picks from its inputs
+# (the MoE input without the layer's attention output) at the end of _pre_attn_norm and stages their records while
+# the attention runs; the MoE call maps its real picks onto them and stages only the misses (unitk PRE + FILL)
+PRESTAGE = os.environ.get("K31_PRESTAGE", "0") == "1"
+# K31_STAGE_ROWS=c0,c1,... (decode, mode staged): row p of a request's verify block (p = 0 the bonus row, then the
+# drafts) stages its picks of rank < min(strong, c_p) only; later rows take the last value. A draft row is used only
+# when the drafts before it were accepted (per-position acceptance ~0.69 / 0.43 / 0.24 / 0.14 at 4 drafts), so its
+# strong misses buy less KLD per staged record; with K31_STAGE_ALL a staged expert still serves its picks in every row
+STAGE_ROWCAPS = [int(x) for x in os.environ.get("K31_STAGE_ROWS", "").split(",") if x.strip()]
+_RCAP: list = [None]                # int32 [16] per row of a decode call (bind)
 # K31_W8I_DRAFT=1: the drafter's linears and the FP8 head copy on the int8 GEMV (w8i.py) instead of W8A16 / Marlin
 W8I_DRAFT = os.environ.get("K31_W8I_DRAFT", "0") == "1"
 # K31_FORCE_DRAFTS=1: in forced decoding (force.py, the KLD harness) the
@@ -280,6 +299,14 @@ SHARED_EARLY = os.environ.get("K31_SHARED_EARLY", "0") == "1"
 # (its own branch) and prep / MegaMoE. unitk and the stager read top-k's outputs only, so they no longer wait for it.
 _LD = {"ev": None}
 _LD_SEEN = {"nojoin": 0, "vllm": 0}
+# K31_MEGAMOE_NOPREP=1 (noprep.py, needs K31_SHARED_SIDE=3): decode-size calls feed MegaMoE without vLLM's prep kernel:
+# the latent down's epilogue writes the MXFP8 rows, the plan kernel (top-k + unitk) the row ids and weights
+NOPREP = os.environ.get("K31_MEGAMOE_NOPREP", "0") == "1"
+
+
+def _nop():
+    from . import noprep
+    return noprep
 
 
 def _breakable_capture() -> bool:
@@ -337,6 +364,21 @@ DRAFT_W8_HEAD = os.environ.get("K31_DRAFT_W8_HEAD", "0") == "1"
 # K31_HEAD_W8=1: the target's logits too from the FP8 copy (415 us BF16 per step; changes the served logits, so the
 # KLD harness sees it: its references are rebuilt with the BF16 weight, LM_HEAD, which stays)
 HEAD_W8 = os.environ.get("K31_HEAD_W8", "0") == "1"
+# K31_DSA_FUSED=1: the DSA layers' small decode kernels (index key insert, index query quant + weight fold + BF16 copy,
+# MLA cache insert; q_pe copy + FP8 query quant + head pad; sigmoid gate) in three launches, bit-exact against vLLM's
+# path (dsa_fused.py; parts K31_DSA_FUSED_PARTS, rows K31_DSA_FUSED_ROWS, in-engine check K31_DSA_FUSED_CHECK)
+DSA_FUSED = os.environ.get("K31_DSA_FUSED", "0") == "1"
+# K31_DRAFT_TOPP=1 (drafttopp.py): each request's own top-k / top-p also truncate the DSpark drafter's proposal (the
+# drafts and the cached draft logits the verifier reads; exact: the verifier reads the q the drafts came from).
+# K31_DRAFT_ARGMAX=1: the drafts of sampled requests are the drafter's argmax (a point-mass q). One of the two.
+DRAFT_TOPP = os.environ.get("K31_DRAFT_TOPP", "0") == "1"
+# K31_DRAFT_FULL_KV=1: the drafter's sliding-window attention layers are given to vLLM's KV manager as full attention.
+# A sliding-window group turns off vLLM's fine-grained (64-token) prefix-cache hits, so every request re-reads its
+# whole prompt (the chat template's shared prefix included) and prompts over 40 tokens leave the CUDA graphs for the
+# eager prompt path: ~1 s added to every first token with the final DSpark drafter. Attention still applies the
+# layer's window; the drafter's KV is kept for the whole context (~2.5 GiB more at 262,144 tokens).
+DRAFT_FULL_KV = os.environ.get("K31_DRAFT_FULL_KV", "0") == "1"
+DRAFT_ARGMAX = os.environ.get("K31_DRAFT_ARGMAX", "0") == "1"
 _DRAFT_HEAD = [False]
 _SIDE: dict = {"stream": None}
 _BAND: dict = {"gb": None, "stats": None, "eager_call": None, "eager_args": None}
@@ -451,6 +493,8 @@ def _init(self, vllm_config, *, num_experts, num_local_experts, experts_start_id
     # staged: a 1-row stand-in now; _bind replaces the four kernel tensors by shared-slot virtual ranges (vmm.py)
     rows = 1 if MODE == "staged" else st.S
     kw["num_logical_experts"] = E
+    from . import rowslice                       # K31_MEGAMOE_ROWS: the symmetric buffer sized for that many rows
+    kw = rowslice.megamoe_kw(vllm_config, kw)
     _orig["init"](self, vllm_config, num_experts=rows, num_local_experts=rows, experts_start_idx=0, **kw)
     self._k31 = st
     st.mod = self
@@ -650,9 +694,21 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
         elif band_on:                                    # the RTX starts on the band's picks now
             _ld_join()
             _band_send(st, hidden_states, topk_ids, topk_weights)
-        ids, stage = unitk.plan(topk_ids, topk_weights, st.row_map, st.bank_map, st.strong, st.slot_base,
-                                score=st.score, lam=LAM, stats=st.stats, pend=getattr(st, "pend", None),
-                                resmax=st.resmax)
+        nop = _nop().take(st, T) if NOPREP else None     # K31_MEGAMOE_NOPREP: this call began at its router
+        pre = None
+        if PRESTAGE:                                     # K31_PRESTAGE: this layer's records staged ahead (side stream)
+            from . import prestage
+            pre = prestage.take(st, T)
+        if nop is not None:                              # the plan kernel's rows (it wrote MegaMoE's routing inputs)
+            ids, stage = _nop().plan(st, nop, topk_ids, topk_weights, LAM)
+        else:
+            ids, stage = unitk.plan(topk_ids, topk_weights, st.row_map, st.bank_map, st.strong, st.slot_base,
+                                    score=st.score, lam=LAM, stats=st.stats, pend=getattr(st, "pend", None),
+                                    resmax=st.resmax, pre=pre["pre"] if pre is not None else None,
+                                    fill=pre is not None,   # with pre: `stage` = the misses (the late list)
+                                    rowcap=_RCAP[0])
+        if _LT[0] is not None:                           # K31_LATE: this call's late job, on the late stream
+            _LT[0].post(st, hidden_states, topk_ids, topk_weights, ids, main, _LD["ev"], _breakable_capture())
         tail = TAIL1 and BAND_FIN_SIDE and band_on and not DEFER and _BAND.get("fused") is not None and T <= 8 \
             and getattr(st, "msum", None) is not None
         if tail:                                         # the mean sum beside the stager and MegaMoE
@@ -669,12 +725,18 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
                     _dm.cut_mean_pre(st.msum[:T], ids, topk_ids, topk_weights, st.cut_mean,
                                      band=st.band_map if sv is None else None, served=sv)
         st.stager(st.bank_ptr, stage)
+        if pre is not None:
+            main.wait_event(pre["copy"])                 # the records staged ahead are in their rows
+        if PRESTAGE and st.idx == _LAST_MOE[0]:
+            prestage.join_stale()                        # nothing of this forward is left on the side stream
         _ld_join()                                       # prep and MegaMoE read the latent rows
         if DEFER:
             if band_ev is not None:                      # the deferral path finishes the band itself: join first
                 main.wait_event(band_ev)
             return _forward_defer(self, st, hidden_states, topk_weights, topk_ids, ids, shared_experts, main, band_on)
-        out = _orig["forward"](self, hidden_states, topk_weights, ids.to(topk_ids.dtype), shared_experts)
+        out = _nop().megamoe(self, nop, hidden_states, shared_experts) if nop is not None else None   # without prep
+        if out is None:
+            out = _orig["forward"](self, hidden_states, topk_weights, ids.to(topk_ids.dtype), shared_experts)
         if tail and out.dim() == 2 and out.is_contiguous():
             fs = _FIN["stream"]
             fs.wait_stream(main)                         # after MegaMoE
@@ -749,7 +811,8 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
         slot_of.scatter_(0, e, torch.where(ok, st.arange[:SLOTS], -1))
         st.stager(st.bank_ptr, torch.where(ok, st.bank_map[e], -1).to(torch.int32))
         slot = slot_of[picks]
-        ids = torch.where(cand & (slot >= 0), st.slot_base + slot, nat_ids).to(topk_ids.dtype)
+        use = (valid & (native < 0)) if STAGE_ALL else cand       # K31_STAGE_ALL: every pick of a staged expert
+        ids = torch.where(use & (slot >= 0), st.slot_base + slot, nat_ids).to(topk_ids.dtype)
         out = _orig["forward"](self, hidden_states, topk_weights, ids, shared_experts)
         if st.cut_mean is not None:
             from . import defer as _dm
@@ -790,6 +853,7 @@ def _eager_legacy(self, st, hidden_states, topk_weights, topk_ids, shared_expert
     ar = torch.arange(STAGE_ROWS, dtype=torch.long, device=picks.device)
     y = None
     served = valid & (native >= 0)
+    use = (valid & (native < 0)) if STAGE_ALL else cand           # K31_STAGE_ALL: every pick of a staged expert
     for r in range(rounds):
         v, e = top_v[r * STAGE_ROWS:(r + 1) * STAGE_ROWS], top_e[r * STAGE_ROWS:(r + 1) * STAGE_ROWS]
         ok = v > 0
@@ -800,10 +864,10 @@ def _eager_legacy(self, st, hidden_states, topk_weights, topk_ids, shared_expert
         for g in range(min(GROUPS, -(-e.numel() // SLOTS))):
             st.stagers[g](st.bank_ptr, stage[SLOTS * g:SLOTS * (g + 1)].contiguous())
         slot = slot_of[picks]
-        ids = torch.where(cand & (slot >= 0), slot, nat_ids if r == 0 else -1).to(topk_ids.dtype)
+        ids = torch.where(use & (slot >= 0), slot, nat_ids if r == 0 else -1).to(topk_ids.dtype)
         out = _orig["forward"](self, hidden_states, topk_weights, ids, shared_experts if r == 0 else None)
         y = out if y is None else y + out
-        served = served | (cand & (slot >= 0))
+        served = served | (use & (slot >= 0))
     band_eager = st.band_map is not None and getattr(st, "band_ok", True)
     if band_eager:
         _band_eager(st, hidden_states, topk_ids, topk_weights, y)
@@ -917,7 +981,14 @@ def _selfcheck(st: LayerState, tensors: dict, cfg, dev, bank_tensors: dict) -> N
                 gate, up = xin @ w1.T, xin @ w3.T
                 a = beta * torch.tanh(gate / beta) * torch.sigmoid(gate) * (lbeta * torch.tanh(up / lbeta) if lbeta else up)
                 want[name][t] += (w[t, k] * (a @ w2.T)) if name == "exact" else (_mxfp8(w[t, k] * a) @ w2.T)
-    got = mod(x, w.to(dev), ids.to(dev, torch.int32)).float()
+    cap = st.resmax                              # a resident cap (K31_POLICY hit ranks) gives picks past it the mean:
+    st.resmax = TOPK                             # the check compares every pick exactly, so it runs uncapped
+    rcap, _RCAP[0] = _RCAP[0], None              # and without per-row staging caps (K31_STAGE_ROWS)
+    try:
+        got = mod(x, w.to(dev), ids.to(dev, torch.int32)).float()
+    finally:
+        st.resmax = cap
+        _RCAP[0] = rcap
     rel = {k: ((got - v).norm() / v.norm()).item() for k, v in want.items()}
     _LOG(f"selfcheck layer {st.idx}: kernel vs float32 formulas (4 tokens x 16 picks"
          + (f", {ns} per token staged from 2-bit records" if staged_pool is not None else "")
@@ -938,6 +1009,26 @@ def _bind(runner) -> None:
     if (cfg.num_experts, cfg.num_experts_per_token, cfg.routed_expert_hidden_size, cfg.moe_intermediate_size) != \
             (E, TOPK, LATENT, INTER):
         raise RuntimeError("K31: the served config is not Kimi K3.1 Pro's MoE")
+    if STAGE_ALL and DEFER:
+        raise RuntimeError("K31_STAGE_ALL=1 needs K31_DEFER=0 (a deferred pick of a staged expert would count twice)")
+    if STAGE_ROWCAPS and MODE == "staged":
+        P = _rows_per_request(runner)
+        rc = [STAGE_ROWCAPS[min(t % P, len(STAGE_ROWCAPS) - 1)] for t in range(16)]
+        _RCAP[0] = torch.tensor(rc, dtype=torch.int32, device=dev)
+        _LOG(f"K31_STAGE_ROWS: row p of a {P}-row verify block stages ranks < min(strong, {rc[:P]}[p])")
+    if PRESTAGE and (MODE != "staged" or DEFER or NOPREP or LATE):
+        raise RuntimeError("K31_PRESTAGE=1 needs K31_MODE=staged and K31_DEFER=0, K31_MEGAMOE_NOPREP=0, K31_LATE=0")
+    if PRESTAGE:
+        from . import prestage
+        prestage.prepare(dev, int(getattr(cfg, "hidden_size", 7168)))
+        _LOG(f"K31_PRESTAGE: decode pre-staging on a side stream (candidates of predicted rank < strong + "
+             f"{prestage.EXTRA}, at most {SLOTS - prestage.RESERVE} slots ahead, the misses staged at the MoE call)")
+    if STAGE_ALL:
+        _LOG("K31_STAGE_ALL: every pick of a staged expert uses its staging row (any rank, any row of the call)")
+    if os.environ.get("K31_BAND_PRIOR", "").strip():
+        _BAND["rows_per_req"] = _rows_per_request(runner)  # K31_BAND_PRIOR: rows of one request's verify block
+        if not BAND_N:
+            _LOG("K31_BAND_PRIOR: no RTX band in this profile (K31_BAND_N=0): no effect")
     layout = None
     if MODE == "staged":
         from .stager import Stager
@@ -979,6 +1070,11 @@ def _bind(runner) -> None:
         if MODE == "staged":
             bank_bytes += _load_bank(st, layout)
             st.stager = Stager(st.mod, st.slot_base, layout, sms=STAGER_SMS)
+            if PRESTAGE:                                 # the side stream's plan outputs (prestage.fork)
+                st.pre_bufs = (torch.empty((16, TOPK), dtype=torch.int32, device=dev),
+                               torch.full((SLOTS,), -1, dtype=torch.int32, device=dev))
+                if prestage.SMS > 0:                     # K31_PRESTAGE_SMS: a narrower stager for the copies ahead
+                    st.pre_stager = Stager(st.mod, st.slot_base, layout, sms=prestage.SMS)
             # no deferral out of the last MoE layer or a block's last layer (its share would cross a stored block)
             st.defer_ok = DEFER and idx != max(LAYERS) and idx not in DEFER_SKIP and \
                 (DEFER_BLOCKEND or (idx + 1) % ATTN_RES_BLOCK != 0)
@@ -1024,6 +1120,9 @@ def _bind(runner) -> None:
         from vllm.utils.deep_gemm import _import_deep_gemm
         _import_deep_gemm().set_num_sms(DG_SMS)
         _LOG(f"DeepGEMM kernels on {DG_SMS} SMs (side work: merges, staging)")
+    if MODE == "staged" and os.environ.get("K31_POOL", "0") == "1":     # the Grace pool (cpupool.py), off by default
+        from . import cpupool
+        cpupool.from_env([(i, s.bank_cpu, len(s.bank)) for i, s in sorted(LAYERS.items())], log=_LOG)
     if BAND_N:
         _bind_band(dev)
     if MODE == "staged":
@@ -1047,6 +1146,49 @@ def _bind(runner) -> None:
                if DEFER else "")
             if MODE == "staged" else "")
          + f", the rest cut; bound in {time.time() - t0:.0f} s ({nbytes / 1e9:.0f} GB read from {NATIVE})")
+    if LATE:                                     # after the band and the residency (the plan reads their pooled maps)
+        from . import latetier
+        _LT[0] = latetier.bind(LAYERS, dev, cfg, runner.model, max(LAYERS), DEFER, FUSE_UP, MODE)
+    if NOPREP:                                   # eligible layers, and the first one checked against vLLM's kernels
+        if SHARED_SIDE_MODE != 3:
+            _LOG("noprep: K31_MEGAMOE_NOPREP needs K31_SHARED_SIDE=3 (the hook computes the latent down there): off")
+        else:
+            _nop().bind(runner.model, dev, _LOG)
+
+
+def _rows_per_request(runner) -> int:
+    """Rows of one request's verify block in a decode call: 1 + the draft tokens (vLLM's uniform decode query length;
+    1 without speculative decoding)."""
+    vc = getattr(runner, "vllm_config", None)
+    try:
+        sc = getattr(vc, "speculative_config", None)
+        if sc is not None and getattr(sc, "enable_adaptive_verification", False):
+            _LOG("K31_BAND_PRIOR: adaptive verification trims verify blocks; the row priors of calls with more than "
+                 "one request are approximate")
+        n = getattr(vc, "uniform_decode_query_len", None)
+        if n is None:
+            n = 1 + int(getattr(sc, "num_speculative_tokens", 0) or 0) if sc is not None else 1
+        return max(1, int(n))
+    except Exception:                                    # noqa: BLE001
+        return 1
+
+
+def _bind_prior() -> None:
+    """K31_BAND_PRIOR (B1): in calls captured into CUDA graphs (decode verify blocks), the fused send and hint order
+    the cap by weight x each row's prior chance of being accepted; row t of a call is row t % P of a request's verify
+    block (P = 1 + drafts; exact at one request per call, and the band only takes calls of <= 8 rows). Eager calls
+    (a prompt's last chunk of <= 8 rows) keep today's plan."""
+    from . import band
+    fz = _BAND.get("fused")
+    if fz is None:
+        raise RuntimeError("K31_BAND_PRIOR needs the fused band send (K31_BAND_FUSED=1)")
+    P = int(_BAND.get("rows_per_req") or 1)
+    rows = band.prior_rows(band.BAND_PRIOR, P, band.MAXT)
+    fz.set_prior(rows)
+    _BAND["prior_rows"] = rows
+    _LOG(f"band cap order (K31_BAND_PRIOR): largest weight x the row's prior in decode graphs; {P} rows per request, "
+         f"rows 0-7 of a call: {', '.join(f'{v:g}' for v in rows)} (calls under their cap send what they sent "
+         f"without it)")
 
 
 def _bind_band(dev) -> None:
@@ -1068,6 +1210,8 @@ def _bind_band(dev) -> None:
         # band finish loads all of a thread's result rows before it adds them, one host round trip instead of ~5)
         _BAND["fused"] = band.Fused(os.path.join(os.path.dirname(BAND_LIB),
                                                  os.environ.get("K31_BAND_FUSED_LIB", "librtxband_fused.so")), gb)
+    if band.BAND_PRIOR:
+        _bind_prior()
     _BAND["stats"] = torch.zeros((max(LAYERS) + 1, 3), dtype=torch.int32, device=dev)
     if BAND_BULK:
         if not os.path.exists(BAND + ".bulk"):
@@ -1125,6 +1269,8 @@ def _apply_policy(st, idx: int) -> None:
         st.defer_from, st.defer_to = p.defer
     else:
         st.defer_ok = False
+    if getattr(p, "late", None) is not None and not LATE:
+        raise RuntimeError(f"K31 policy: layer {idx} sends ranks {p.late} late but K31_LATE is off")
     if p.mean and st.cut_mean is None:
         raise RuntimeError(f"K31 policy: layer {idx} uses the mean substitute but K31_CUT_MEAN gives no tables")
     if not p.mean:
@@ -1236,6 +1382,8 @@ def _patch_moe(module) -> None:
     if getattr(cls, "_k31", False):
         return
     _orig["init"], _orig["forward"] = cls.__init__, cls.forward
+    from . import rowslice                       # K31_MEGAMOE_ROWS: calls of more rows in row slices (else unchanged)
+    _orig["forward"] = rowslice.megamoe_forward(_orig["forward"])
     cls.__init__, cls.forward = _init, _forward
     if hasattr(cls, "get_symm_buffer"):
         _orig["symm"] = cls.get_symm_buffer
@@ -1244,6 +1392,9 @@ def _patch_moe(module) -> None:
 
 
 MEM_REPORT = os.environ.get("K31_MEM_REPORT", "0") == "1"
+# K31_MEM_PEAK=<rows> at start-up: hooks for the memory peaks of steps of >= <rows> tokens (mempeak.py; the threshold
+# is then a runtime flag)
+MEM_PEAK = os.environ.get("K31_MEM_PEAK", "0") not in ("", "0")
 
 
 def _mem_report(tag: str) -> None:
@@ -1259,11 +1410,30 @@ def _patch_runner(module) -> None:
     cls = module.GPUModelRunner
     if getattr(cls, "_k31", False):
         return
+    if DRAFT_FULL_KV:
+        orig_spec = cls.get_kv_cache_spec
+
+        def get_kv_cache_spec(self):
+            from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec, replace_as
+            specs = orig_spec(self)
+            names = set(getattr(getattr(self, "speculator", None), "draft_attn_layer_names", ()) or ()) & specs.keys()
+            n = 0
+            for name in names:
+                if isinstance(specs[name], SlidingWindowSpec):
+                    specs[name] = replace_as(specs[name], FullAttentionSpec, drop=("extra_retained_tokens",))
+                    n += 1
+            _LOG(f"K31_DRAFT_FULL_KV: {n} of the drafter's {len(names)} attention layers given to the KV manager as "
+                 f"full attention (fine-grained prefix-cache hits stay on)")
+            return specs
+        cls.get_kv_cache_spec = get_kv_cache_spec
     orig = cls.load_model
 
     def load_model(self, *args, **kwargs):
         out = orig(self, *args, **kwargs)
         _bind(self)
+        if DSA_FUSED:                            # per-instance forwards on the target's DSA layers (dsa_fused.py)
+            from . import dsa_fused
+            dsa_fused.bind(self.model, _LOG)
         if FORCE_DRAFTS:                         # the module the live runner class comes from (vLLM's GPU runner v2)
             import importlib
             _patch_combine(importlib.import_module(type(self).__module__))
@@ -1271,6 +1441,11 @@ def _patch_runner(module) -> None:
         if (DRAFT_W8 or DRAFT_W8_HEAD) and spec is not None and isinstance(getattr(spec, "model", None),
                                                                            torch.nn.Module):
             _draft_w8(spec.model)
+        if DRAFT_TOPP or DRAFT_ARGMAX:
+            if DRAFT_TOPP and DRAFT_ARGMAX:
+                raise RuntimeError("K31: K31_DRAFT_TOPP=1 and K31_DRAFT_ARGMAX=1 exclude each other; set one")
+            from . import drafttopp
+            drafttopp.bind(self, argmax=DRAFT_ARGMAX, forced=FORCE_DRAFTS, log=_LOG)
         for name, m in self.model.named_modules():   # the target's BF16 LM head, for force.py's hidden-state references
             if type(m).__name__ == "ParallelLMHead" and "draft" not in name and "mtp" not in name:
                 LM_HEAD[0] = m.weight
@@ -1278,6 +1453,9 @@ def _patch_runner(module) -> None:
                 if HEAD_W8:
                     _head_w8(m)
                 break
+        if MEM_PEAK:                             # K31_MEM_PEAK: per-step memory peaks of prompt chunks (mempeak.py)
+            from . import mempeak
+            mempeak.install(self.model)
         if MEM_REPORT:
             _mem_report("after load_model")
         return out
@@ -1322,12 +1500,19 @@ def _patch_runner(module) -> None:
         _flags.refresh()                                         # runtime flags (flags.py) for this step
         if _BULK[0] is not None:                                 # park the band's service kernel for prompt steps
             _BULK[0].set_mode(ntok > BAND_BULK_MIN and _flags.on("K31_BAND_BULK", "1"))
+        if MEM_PEAK:
+            from . import mempeak
+            mempeak.step_begin(ntok)
         _IN_EXEC[0] = True                                       # the prompt path may tick the residency (serving
         try:                                                     # steps only: never the start-up's profile run,
             out = orig_exec(self, *args, **kwargs)               # whose promotions would land during graph capture)
         finally:
             _IN_EXEC[0] = False
+        if MEM_PEAK:
+            mempeak.step_end()
         _STEPS[0] += 1
+        if _LT[0] is not None:
+            _LT[0].tick()                                        # K31_LATE: its counters every K31_LATE_LOG_S
         if _RES:
             pend[0] += ntok                                              # promotion credit is per token
             if _STEPS[0] % every == 0:
@@ -1389,6 +1574,8 @@ def _patch_dsa(module) -> None:
         _join_window(module.KimiK3DSAIndexer, "score")
     if GATE_SIDE and not getattr(module.KimiK3DSAAttention, "_k31_gate", False):
         _gate_side(module)
+    from . import rowslice          # K31_DSA_ROW_SLICE (runtime flag): a prompt chunk's sparse attention in row slices
+    rowslice.install_dsa()
 
 
 def _gate_join() -> None:
@@ -1505,15 +1692,53 @@ def _fin_join() -> None:
         _FIN["keep"] = None
 
 
+def _fin_take() -> None:
+    """K31_LATE's routed output transform: join the finish branch and drop the statistic (it runs vLLM's own steps)."""
+    _FIN.pop("rstd", None)
+    _fin_join()
+
+
 def _patch_model(module) -> None:
     """KimiMoE.forward: register the module by layer; after it, complete the previous layer's late share exactly,
     delta = up_L(norm_L(u_now + u_late) - norm_L(u_now)) (difference in fp32, then layer L's up-projection), and add
     it to this layer's MoE output (it lands one layer late)."""
-    if (FUSE_UP or BAND_FIN_SIDE) and not getattr(module.KimiRoutedOutputTransform, "_k31", False):
+    if PRESTAGE and not getattr(module.KimiDecoderLayer, "_k31_prestage", False):
+        from . import prestage
+        dlp = module.KimiDecoderLayer
+        orig_pre = dlp._pre_attn_norm
+        orig_post_ps = dlp._post_attn_norm
+        ar_fn, fgt_fn = module.attn_res, module.fused_grouped_topk
+
+        def _pre_attn_norm_ps(self, hidden_states, residual, prefix_sum):
+            """K31_PRESTAGE: the layer's inputs are final here; fork the side stream's prediction and staging."""
+            out = orig_pre(self, hidden_states, residual, prefix_sum)
+            mlp = getattr(self, "mlp", None)
+            st = getattr(getattr(mlp, "experts", None), "_k31", None)
+            if st is not None and getattr(self, "use_attn_res", False) and getattr(mlp, "gate", None) is not None \
+                    and not _breakable_capture():        # a fork and its join must stay in one graph segment
+                hs, ps, res = out
+                prestage.fork(self, st, mlp, ps, res, hs.shape[0], ar_fn, fgt_fn, SLOTS, rowcap=_RCAP[0])
+            return out
+
+        def _post_attn_norm_ps(self, hidden_states, residual, prefix_sum):
+            """K31_PRESTAGE: the side stream has read the prefix sum this call adds the attention output to in place."""
+            st = getattr(getattr(getattr(self, "mlp", None), "experts", None), "_k31", None)
+            if st is not None:
+                prestage.wait_read(st.idx)
+            return orig_post_ps(self, hidden_states, residual, prefix_sum)
+        dlp._pre_attn_norm = _pre_attn_norm_ps
+        dlp._post_attn_norm = _post_attn_norm_ps
+        dlp._k31_prestage = True
+        _LOG("K31_PRESTAGE: decoder layers fork the pre-gate after _pre_attn_norm")
+    if (FUSE_UP or BAND_FIN_SIDE or LATE) and not getattr(module.KimiRoutedOutputTransform, "_k31", False):
         rot = module.KimiRoutedOutputTransform
         orig_rot = rot.forward
 
         def rot_forward(self, hidden_states, residual=None):
+            if _LT[0] is not None:                       # K31_LATE: a call whose layer sent a late job keeps u and y
+                out = _LT[0].rot(self, hidden_states, residual, _fin_take)
+                if out is not None:
+                    return out
             rstd = _FIN.pop("rstd", None)                # K31_TAIL1: the finish wrote the statistic of these rows
             _fin_join()
             w8 = getattr(self.up_proj, "_k31_w8", None) if (FUSE_UP or rstd is not None) else None
@@ -1530,7 +1755,21 @@ def _patch_model(module) -> None:
             return orig_rot(self, hidden_states, residual)
         rot.forward = rot_forward
         rot._k31 = True
-        _LOG("routed output transform: RMSNorm + W8A16 up-projection + residual add fused (K31_FUSE_UP)")
+        if FUSE_UP or BAND_FIN_SIDE:
+            _LOG("routed output transform: RMSNorm + W8A16 up-projection + residual add fused (K31_FUSE_UP)")
+    if LATE and not getattr(module.KimiDecoderLayer, "_k31_late", False):
+        dlate = module.KimiDecoderLayer
+        orig_pan = dlate._post_attn_norm
+
+        def _post_attn_norm_late(self, hidden_states, residual, prefix_sum):
+            """K31_LATE: the previous layer's late share (landed beside this layer's attention) goes into the attention
+            output, or into the stored block state the previous layer ended, before this layer's MoE input mix."""
+            lt = _LT[0]
+            if lt is not None and lt.pend is not None:
+                hidden_states = lt.join(self.layer_idx, hidden_states, residual)
+            return orig_pan(self, hidden_states, residual, prefix_sum)
+        dlate._post_attn_norm = _post_attn_norm_late
+        dlate._k31_late = True
     if not DEFER and not SHARED_SIDE:
         return
     cls = module.KimiMoE
@@ -1551,13 +1790,20 @@ def _patch_model(module) -> None:
         logits, _ = moe.gate(h)
         if fork_shared is not None:                  # K31_SHARED_EARLY: the shared experts start here, before top-k
             fork_shared()
-        w, ids = fgt(hidden_states=h, gating_output=logits, topk=moe.experts.top_k, renormalize=moe.moe_renormalize,
-                     e_score_correction_bias=moe.gate.e_score_correction_bias.data,
-                     num_expert_group=moe.num_expert_group, topk_group=moe.topk_group,
-                     scoring_func=moe.moe_router_activation_func, routed_scaling_factor=moe.routed_scaling_factor)
+        nop = NOPREP and _nop().begin(moe, h, MODE == "staged" and not DEFER, SLOTS)
+        r = _nop().route(moe, h, logits, LAM) if nop else None     # top-k + unitk + MegaMoE's routing inputs
+        if r is not None:
+            w, ids = r
+        else:
+            w, ids = fgt(hidden_states=h, gating_output=logits, topk=moe.experts.top_k,
+                         renormalize=moe.moe_renormalize, e_score_correction_bias=moe.gate.e_score_correction_bias.data,
+                         num_expert_group=moe.num_expert_group, topk_group=moe.topk_group,
+                         scoring_func=moe.moe_router_activation_func, routed_scaling_factor=moe.routed_scaling_factor)
         with torch.cuda.stream(moe._down_proj_stream):
             moe._down_proj_stream.wait_event(ev0)
-            routed_h, _ = moe.routed_expert_down_proj(h)
+            routed_h = _nop().latent_down(moe, h) if nop else None   # the same rows + MegaMoE's MXFP8 copy
+            if routed_h is None:
+                routed_h, _ = moe.routed_expert_down_proj(h)
             ev1.record(moe._down_proj_stream)
         _LD["ev"] = ev1
         return routed_h, w, ids
@@ -1806,6 +2052,8 @@ PATCHES = {TARGET: _patch_moe, "vllm.third_party.deep_gemm.utils.mlopart": _patc
            "vllm.models.kimi_k3.nvidia.dsa": _patch_dsa,
            "vllm.v1.worker.gpu.sample.prompt_logprob": lambda m: __import__(
                "k31_engine.force", fromlist=["patch_prompt_kl"]).patch_prompt_kl(m),
+           **({"vllm.v1.worker.gpu.spec_decode.dspark.speculator": lambda m: __import__(
+               "k31_engine.drafttopp", fromlist=["patch"]).patch(m)} if DRAFT_TOPP or DRAFT_ARGMAX else {}),
            **{r: _patch_runner for r in RUNNERS}}
 
 

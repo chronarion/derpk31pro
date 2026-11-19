@@ -133,6 +133,12 @@ class I8W:
         M = x.shape[0]
         big = flags.num("K31_I8_BIG_M", 16) or 1 << 30         # runtime flag; prompt chunks: one GEMM (big_m)
         if M > big and not torch.cuda.is_current_stream_capturing():
+            # K31_I8_BIG_M_KERNEL (runtime flag, default 0 = big_m below): "1" / "triton" = one Triton GEMM on the
+            # packed codes, "unpack" = a Triton unpack + cuBLAS (bigm.py)
+            impl = flags.get("K31_I8_BIG_M_KERNEL", "0")
+            if impl not in ("", "0", "off"):
+                from . import bigm
+                return bigm.i8_linear(x, self, out, impl=impl)
             y = big_m(x, self)
             if out is None:
                 return y.to(torch.bfloat16)

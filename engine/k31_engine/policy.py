@@ -7,6 +7,8 @@ fixed menu that its policy allows and that is available for its expert:
   band   the expert has a record in the RTX band: 2-bit, computed on the RTX, on time
   stage  the expert has a Grace bank record: copied into an HBM staging row, 2-bit, on time (~33 us per record on
          the critical path)
+  late   the expert has a bank record: computed by the Grace pool, half a layer late, on top of the mean it gets on
+         time (latetier.py; needs K31_LATE=1); `late_slots` = records per call (0-8)
   defer  the expert has a bank record: computed one layer late (the deferral window; needs K31_DEFER=1)
   mean   cut, replaced by weight x the expert's mean output (K31_CUT_MEAN tables)
   (skip) cut: always the last resort
@@ -22,6 +24,7 @@ File (JSON):
       "standard": {"hit": "0-15",                       ranks that may use a native row (default all)
                    "band": "0-15", "band_cap": 16,      ranks the RTX may serve (default all) / experts per call
                    "stage": "0-2",                      ranks staged from the bank when missing (default none)
+                   "late": "0-15", "late_slots": 5,     ranks the Grace pool may serve late / records per call
                    "defer": "3-11",                     ranks deferred one layer (default none)
                    "mean": "0-15"}                      ranks given the mean substitute when cut (default none)
     },
@@ -46,13 +49,14 @@ import os
 import re
 from dataclasses import dataclass, field
 
-HIT, BAND, STAGE, DEFER, MEAN = 1, 2, 4, 8, 16
-NAMES = {"hit": HIT, "band": BAND, "stage": STAGE, "defer": DEFER, "mean": MEAN}
-ORDER = ("hit", "band", "stage", "defer", "mean")
+HIT, BAND, STAGE, DEFER, MEAN, LATE = 1, 2, 4, 8, 16, 32
+NAMES = {"hit": HIT, "band": BAND, "stage": STAGE, "defer": DEFER, "mean": MEAN, "late": LATE}
+ORDER = ("hit", "band", "stage", "late", "defer", "mean")
+LATE_MAX = 8                # records per late job (cpustage_seg2.h CPUSEG2_PMAX)
 K = 16                      # picks per token
 LAYERS = range(1, 93)       # MoE layers of K3.1 (model layer numbers)
 STAGE_MAX = 4               # unitk considers ranks < 4 for staging (SP)
-DEFAULTS = {"hit": "0-15", "band": "0-15", "stage": "none", "defer": "none", "mean": "none"}
+DEFAULTS = {"hit": "0-15", "band": "0-15", "stage": "none", "defer": "none", "mean": "none", "late": "none"}
 
 
 class PolicyError(ValueError):
@@ -117,9 +121,9 @@ def parse_layers(spec: str) -> list:
 
 def masks_of(fields: dict) -> list:
     """A policy's fields -> 16 bitmasks (rank 0 first)."""
-    unknown = set(fields) - set(NAMES) - {"band_cap", "note"}
+    unknown = set(fields) - set(NAMES) - {"band_cap", "note", "late_slots"}
     if unknown:
-        raise PolicyError(f"unknown policy fields {sorted(unknown)} (menu: {', '.join(ORDER)}, band_cap)")
+        raise PolicyError(f"unknown policy fields {sorted(unknown)} (menu: {', '.join(ORDER)}, band_cap, late_slots)")
     m = [0] * K
     for name in ORDER:
         for r in parse_ranks(fields.get(name, DEFAULTS[name])):
@@ -136,6 +140,8 @@ class LayerParams:
     strong: int = 0             # misses of rank < strong with a bank record are staged
     defer: tuple | None = None  # (from, to): misses of these ranks with a bank record are deferred
     mean: bool = False          # cut picks get the mean substitute
+    late: tuple | None = None   # (from, to): bank misses of these ranks may be computed late by the Grace pool
+    late_n: int = 0             # records per late job (the pool's job size for this layer)
     policy: str = ""
     masks: list = field(default_factory=lambda: [0] * K)
 
@@ -147,7 +153,7 @@ def _prefix(ranks: set, what: str, layer: int) -> int:
     return n
 
 
-def compile_layer(layer: int, masks: list, band_cap: int = 16, name: str = "") -> LayerParams:
+def compile_layer(layer: int, masks: list, band_cap: int = 16, name: str = "", late_slots=None) -> LayerParams:
     """16 bitmasks -> LayerParams, or PolicyError if the v1 kernels cannot express them."""
     sets = {n: {r for r in range(K) if masks[r] & bit} for n, bit in NAMES.items()}
     p = LayerParams(policy=name, masks=list(masks), band_cap=int(band_cap))
@@ -169,6 +175,16 @@ def compile_layer(layer: int, masks: list, band_cap: int = 16, name: str = "") -
     if sets["mean"] and sets["mean"] != set(range(K)):
         raise PolicyError(f"layer {layer}: 'mean' must be all ranks or none on the v1 kernels, got {sorted(sets['mean'])}")
     p.mean = bool(sets["mean"])
+    lr = sorted(sets["late"])
+    if lr:
+        if lr != list(range(lr[0], lr[-1] + 1)):
+            raise PolicyError(f"layer {layer}: 'late' must be one contiguous rank range, got {lr}")
+        if p.defer is not None:
+            raise PolicyError(f"layer {layer}: 'late' and 'defer' exclude each other (K31_LATE / K31_DEFER)")
+        n = int(late_slots if late_slots is not None else os.environ.get("K31_LATE_SLOTS", "5") or 5)
+        if not 0 <= n <= LATE_MAX:
+            raise PolicyError(f"layer {layer}: late_slots {n} outside 0..{LATE_MAX}")
+        p.late, p.late_n = (lr[0], lr[-1] + 1), n
     return p
 
 
@@ -217,9 +233,10 @@ def load(path: str) -> dict:
         fields = dict(pols[nm]) if nm is not None else {}
         fields.update(over.get(L, {}))
         cap = int(fields.get("band_cap", os.environ.get("K31_BAND_MAXE", "16") or 16))
-        masks = table.get(L) if L in table else masks_of({k: v for k, v in fields.items() if k != "band_cap"})
+        masks = table.get(L) if L in table else masks_of({k: v for k, v in fields.items()
+                                                          if k not in ("band_cap", "late_slots")})
         label = ("table" if L in table else (nm or "(defaults)")) + ("+override" if L in over else "")
-        out[L] = compile_layer(L, masks, cap, label)
+        out[L] = compile_layer(L, masks, cap, label, fields.get("late_slots"))
     return out
 
 
@@ -233,7 +250,7 @@ def env_section(path: str) -> dict:
 def describe(params: dict) -> str:
     """One line per run of consecutive layers with the same compiled parameters."""
     def key(p):
-        return (p.policy, p.resmax, p.band, p.band_cap, p.strong, p.defer, p.mean)
+        return (p.policy, p.resmax, p.band, p.band_cap, p.strong, p.defer, p.mean, p.late, p.late_n)
     lines, run = [], None
     for L in LAYERS:
         p = params[L]
@@ -248,7 +265,8 @@ def describe(params: dict) -> str:
     for a, b in lines:
         p = params[a]
         out.append(f"layers {a}-{b} [{p.policy}]: hit < {p.resmax}, band {'on' if p.band else 'off'} (cap {p.band_cap}), "
-                   f"stage < {p.strong}, defer {p.defer or '-'}, mean {'on' if p.mean else 'off'}")
+                   f"stage < {p.strong}, defer {p.defer or '-'}, mean {'on' if p.mean else 'off'}"
+                   + (f", late {p.late[0]}..{p.late[1] - 1} x{p.late_n}" if p.late else ""))
     return "\n".join(out)
 
 
