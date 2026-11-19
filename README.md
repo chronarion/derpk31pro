@@ -34,16 +34,17 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 | `default` (GB300 + RTX PRO 6000) | TBD tokens/s | TBD tokens/s | TBD |
 | `nortx` (GB300 alone) | TBD tokens/s | TBD tokens/s | TBD |
 
-| benchmark | derpk31pro (`default`) | the official model |
+| benchmark (lil-bench) | derpk31pro (`default`) | for comparison |
 |---|---|---|
-| GPQA Diamond | TBD | 93.97 (NVIDIA's evaluation of the official MXFP4 checkpoint) |
-| Tool calling (Kimi Vendor Verifier, ToolCall) | TBD | 97.2 (Moonshot's own API) |
+| GPQA Diamond (`--test-profile gpqa-diamond`, all 198 questions) | TBD | 93.97 for the official MXFP4 checkpoint in NVIDIA's evaluation (their own protocol) |
+| Tool calling (`--tool-eval`: tool-eval-bench, community leaderboard settings) | TBD | |
 
 - **Speed:** [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) (lil-bench) 1.7.1,
   standard profile. Decode is its single-conversation cell (a chat prompt, 2,048 generated tokens); reading a prompt
   is the prompt's length divided by the time to the first token. Sampling is the model card's: temperature 1, top-p
   0.95, which is also the engine's default. The DSpark drafter proposes 4 tokens per step.
-- **Benchmarks:** the same sampling, thinking on. They check what KLD cannot fully see (below).
+- **Benchmarks:** lil-bench's own GPQA Diamond and tool-calling runs, with their default settings, against the
+  same server. They check what KLD cannot fully see (below).
 - **KLD** (lower is closer): how far the next-token probabilities are from the official model's, measured on the
   tokens a model generates, over 512 text samples of 11 kinds of text, each read as the engine serves it (a short
   prompt, then one token at a time). See [Measuring KLD](#measuring-kld).
