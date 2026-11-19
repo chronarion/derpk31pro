@@ -80,16 +80,18 @@ STAGER_SMS = int(os.environ.get("K31_STAGER_SMS", "24"))
 STAGER_SMS_EAGER = int(os.environ.get("K31_STAGER_SMS_EAGER", "0")) or STAGER_SMS
 # K31_PROMPT_PATH=1: prompt chunks through prompt_path.py (every bank pick on prompt rows, the residency
 # ticking inside the forward, one host sync per layer); 0 (default until its checks pass) = the eager branch below
-PROMPT_PATH = os.environ.get("K31_PROMPT_PATH", "0") == "1"
+from . import flags as _flags        # runtime flags (flags.py): the prompt path's settings may change between steps
 # K31_PROMPT_SELFCHECK=1: the first two prompt chunks of each layer also go through the older branch on the same
 # inputs (mode t1 and K31_PROMPT_TICK_LAYERS=0 serve the same picks: the outputs must agree to the order of additions)
-PROMPT_SELFCHECK = os.environ.get("K31_PROMPT_SELFCHECK", "0") == "1"
 _SELFCHECK: dict = {}
 # K31_BAND_HINT=1 (librtxband_fused_v5.so): the call's band plan right after top-k on the band's stream,
 # with the served flags and a hint that sends the RTX for the call's records while the latent down still runs
 BAND_HINT = os.environ.get("K31_BAND_HINT", "0") == "1"
 _IN_EXEC: list = [False]          # inside the runner's execute_model (a serving step), set by its wrapper
-_PROMPT_TICKS = PROMPT_PATH and int(os.environ.get("K31_PROMPT_TICK_LAYERS", "4")) > 0
+
+
+def _prompt_ticks() -> bool:
+    return _flags.on("K31_PROMPT_PATH") and _flags.num("K31_PROMPT_TICK_LAYERS", 4) > 0
 PROMOTE = float(os.environ.get("K31_PROMOTE", "0"))        # residency.py: swaps per layer per token (0 = static)
 HALFLIFE = float(os.environ.get("K31_HALFLIFE", "32"))     # tokens, for the residency scores
 LAM = 2.0 ** (-1.0 / HALFLIFE)
@@ -347,6 +349,7 @@ WINDOW = WINDOW_TEST or DEFER
 _DEF = {"pending": None, "late": None, "stager": None, "count": None}
 _MOE: dict = {}             # layer idx -> vLLM KimiMoE module (completion of late shares)
 _LOG = lambda m: sys.stderr.write(f"K31 {m}\n")      # noqa: E731
+_flags._log[0] = _LOG
 _orig: dict = {}
 LAYERS: dict = {}           # layer idx -> LayerState
 _rowmap_cache: dict = {}
@@ -736,7 +739,7 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
     if st.score is not None:                                   # residency scores, as unitk keeps them
         st.score.mul_(LAM ** T)
         st.score.index_add_(0, picks.reshape(-1), torch.where(valid, topk_weights.float() ** 2, 0.0).reshape(-1))
-        if _RES and _RES[0].accepted and not capturing and st.idx == min(LAYERS) and not _PROMPT_TICKS:
+        if _RES and _RES[0].accepted and not capturing and st.idx == min(LAYERS) and not _prompt_ticks():
             _RES[0].eager_tokens += T        # prompt rows (all real tokens) earn promotion credit like accepted ones
     nat_ids = torch.where(valid & (native >= 0), native, -1)
     if capturing:                     # a graph-sized call past T > 16: one round in the layer's slot group
@@ -752,7 +755,7 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
             from . import defer as _dm
             _dm.cut_mean(out, ids, topk_ids, topk_weights, st.cut_mean)
         return out
-    if PROMPT_PATH:                   # a prompt chunk: prompt_path.py (every bank pick, ticks inside the forward)
+    if _flags.on("K31_PROMPT_PATH"):  # a prompt chunk: prompt_path.py (every bank pick, ticks inside the forward)
         from . import prompt_path
         from . import defer as _dm
         bulk = _BULK[0]
@@ -761,7 +764,7 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
                                        orig=_orig["forward"], res=_RES if _IN_EXEC[0] else None,
                                        band_eager=_band_eager,
                                        cut_mean=_dm.cut_mean, band_bulk=bulk, first_layer=min(LAYERS))
-        if PROMPT_SELFCHECK and _SELFCHECK.get(st.idx, 0) < 2:   # the same inputs through the older branch
+        if _flags.on("K31_PROMPT_SELFCHECK") and _SELFCHECK.get(st.idx, 0) < 2:   # the same inputs, older branch
             _SELFCHECK[st.idx] = _SELFCHECK.get(st.idx, 0) + 1
             y_old = _eager_legacy(self, st, hidden_states, topk_weights, topk_ids, shared_experts, picks, native,
                                   cand, score, valid, nat_ids)
@@ -1314,8 +1317,9 @@ def _patch_runner(module) -> None:
                 _LOG(f"re-warm {_RES[0].n_rewarm}: {n} ring records fetched ({1e3 * (time.time() - t0):.0f} ms host)")
         if ntok > 16:
             eager[0] = True
+        _flags.refresh()                                         # runtime flags (flags.py) for this step
         if _BULK[0] is not None:                                 # park the band's service kernel for prompt steps
-            _BULK[0].set_mode(ntok > BAND_BULK_MIN)
+            _BULK[0].set_mode(ntok > BAND_BULK_MIN and _flags.on("K31_BAND_BULK", "1"))
         _IN_EXEC[0] = True                                       # the prompt path may tick the residency (serving
         try:                                                     # steps only: never the start-up's profile run,
             out = orig_exec(self, *args, **kwargs)               # whose promotions would land during graph capture)

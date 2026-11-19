@@ -25,12 +25,7 @@ import torch
 E, K = 896, 16
 SLOTS, GROUPS = 16, 8
 STAGE_ROWS = SLOTS * GROUPS
-MODE = os.environ.get("K31_PROMPT_BANK", "all")              # t1 | all | valve
-VALVE = float(os.environ.get("K31_PROMPT_VALVE", "0.5"))
-RANKS = int(os.environ.get("K31_PROMPT_RANKS", "16"))
-SUB = int(os.environ.get("K31_PROMPT_SUB", "0"))
-TICK_LAYERS = int(os.environ.get("K31_PROMPT_TICK_LAYERS", "4"))
-AHEAD = os.environ.get("K31_PROMPT_AHEAD", "0") == "1"
+from . import flags                       # every setting is read per call (runtime flags, flags.py)
 N_MOE = 92
 # the study's pick amplitude by rank (sensitivity/data/model2.json "a"): what a cut pick of that rank costs, relative
 AMP = (0.484, 0.119, 0.097, 0.083, 0.044, 0.040, 0.037, 0.034, 0.023, 0.022, 0.017, 0.017, 0.017, 0.017, 0.017, 0.017)
@@ -44,11 +39,14 @@ def _consts(dev):
 
 
 def plan_rounds(topk_ids, topk_weights, row_map, bank_map, band_map, n_bank: int, strong: int,
-                mode: str = MODE, valve: float = VALVE, ranks: int = RANKS, shared: int = STAGE_ROWS):
+                mode: str = None, valve: float = None, ranks: int = None, shared: int = STAGE_ROWS):
     """-> (kept [n_bank] long: bank slots in staging order, -1 past the kept ones; n_keep device scalar;
            place [T, K] long: the pick's place in the staging order or -1; nat_ids [T, K] long: native row or -1;
            band [T, K] bool: picks the band serves; cut [T, K] bool: picks nobody computes)
     Fixed shapes, no host sync. Matches prompt_plan_model.plan() (mode "t1" = ranks=strong + mode "all" there)."""
+    mode = flags.get("K31_PROMPT_BANK", "all") if mode is None else mode       # t1 | all | valve
+    valve = flags.num("K31_PROMPT_VALVE", 0.5) if valve is None else valve
+    ranks = flags.num("K31_PROMPT_RANKS", 16) if ranks is None else ranks
     T, Kk = topk_ids.shape
     dev = topk_ids.device
     amp, ar = _consts(dev)
@@ -115,6 +113,7 @@ class _PaddingSlice:
 def _megamoe(orig, mod, x, w, ids, shared_experts, dtype):
     """One round's MegaMoE over the chunk, in row slices of SUB (the slices' outputs are disjoint rows)."""
     T = x.shape[0]
+    SUB = flags.num("K31_PROMPT_SUB", 0)
     if SUB <= 0 or T <= SUB:
         return orig(mod, x, w, ids.to(dtype), shared_experts)
     outs = []
@@ -139,6 +138,7 @@ def _stage_round(st, kept, r, shared=STAGE_ROWS):
 def _tick(st, T, res, first_layer: int):
     """The residency's tick inside a prompt forward: every TICK_LAYERS MoE layers, each with its share of the chunk's
     promotion credit (residency.py caps a tick's credit by that tick's tokens, so the credit must come in shares)."""
+    TICK_LAYERS = flags.num("K31_PROMPT_TICK_LAYERS", 4)
     if not res or TICK_LAYERS <= 0 or not res[0].accepted:
         return
     if (st.idx - first_layer) % TICK_LAYERS:
@@ -174,7 +174,7 @@ def forward_prompt(mod, st, hidden_states, topk_weights, topk_ids, shared_expert
     rnd = torch.div(place, STAGE_ROWS, rounding_mode="floor")
     pos = place - rnd * STAGE_ROWS
     y = None
-    if AHEAD and rounds > 1:
+    if flags.on("K31_PROMPT_AHEAD") and rounds > 1:
         y = _rounds_ahead(orig, mod, st, hidden_states, topk_weights, shared_experts, kept, place, nat, n_kept,
                           topk_ids.dtype)
     else:

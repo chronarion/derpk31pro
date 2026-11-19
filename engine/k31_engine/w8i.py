@@ -13,6 +13,8 @@ import os
 
 import torch
 
+from . import flags
+
 _LIB: dict = {}
 CLIPS = (1.0, 0.95, 0.9, 0.85, 0.8)
 
@@ -129,7 +131,8 @@ class I8W:
         if not x.is_contiguous():
             x = x.contiguous()
         M = x.shape[0]
-        if M > BIG_M and not torch.cuda.is_current_stream_capturing():   # prompt chunks: one GEMM (big_m)
+        big = flags.num("K31_I8_BIG_M", 16) or 1 << 30         # runtime flag; prompt chunks: one GEMM (big_m)
+        if M > big and not torch.cuda.is_current_stream_capturing():
             y = big_m(x, self)
             if out is None:
                 return y.to(torch.bfloat16)
