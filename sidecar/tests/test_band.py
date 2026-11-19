@@ -25,6 +25,25 @@ from band.rtxband import (BREC, CODES13, CODES2, FLAG_ACT_BF16, FLAG_NO_BF16, FL
 
 
 def synthetic_records(n, gen, device):
+    from band.rtxband import K2
+    if K2:              # hi2-k2 (K31_REC_FMT): random codes, a base per scale row and offsets 0..2 like K3.1's, a few
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "engine"))    # rows with
+        from k31_engine import recfmt                                                           # an exception entry
+        lay = {"native_bytes": {"w13": 2 * CODES13, "w2": 2 * CODES2, "w13s": SF13, "w2s": SF2}}
+        k1 = torch.randint(0, 256, (n, 9289728), generator=gen, dtype=torch.uint8)
+        o, parts = CODES13 + CODES2, []
+        for rows, kq in ((6144, 28), (3584, 24)):
+            base = torch.randint(110, 119, (n, 1, rows, 1), generator=gen)
+            u = torch.rand((n, kq, rows, 4), generator=gen)
+            sf = base + (u < 0.24).long() + (u < 0.03).long()
+            for i in range(n):
+                for r in torch.randint(0, rows, (3,), generator=gen).tolist():
+                    sf[i, int(torch.randint(0, kq, (1,), generator=gen)), r, 1] = int(base[i, 0, r, 0]) + 4
+            parts.append(sf.to(torch.uint8).reshape(n, -1))
+        k1[:, o:o + SF13 + SF2] = torch.cat(parts, dim=1)
+        rec, fits = recfmt.k1_to_k2(k1, recfmt.layout_k2(dict(lay, record_bytes=9289728)))
+        assert bool(fits.all()) and rec.shape[1] == HI2_REC
+        return rec.to(device)
     rec = torch.randint(0, 256, (n, HI2_REC), generator=gen, dtype=torch.uint8).to(device)
     o = CODES13 + CODES2
     # scale codes like K3.1's (mostly 120 and 119) with a tail over the whole 16-code span 107..122
@@ -99,31 +118,66 @@ def main():
     assert bool(((b[..., 0] | (b[..., 1] << 4)) == recs[:2, :CODES13]).all()) and bool(((nat & 0x33) == 0x33).all())
     print("1. stager expansion round-trips, low bits set: ok")
 
-    # 2. the repack is lossless: same multiset of 2-bit pairs; scale codes = 4-bit code + base; and a record whose
-    #    scale codes do not fit (a zero code, or a span over 16) is refused
-    rp, base0 = band.store[0], int(band.sbase[0])
-    def pair_counts(t):
-        return torch.stack([(((t >> (2 * j)) & 3).view(-1, 1) == torch.arange(4, device=dev)).sum(0) for j in range(4)]).sum(0)
-    src_pairs = pair_counts(recs[0, :CODES13 + CODES2])
-    dst_pairs = pair_counts(rp[:W13C]) + pair_counts(rp[W13C + W13S:W13C + W13S + W2C])
-    sc = torch.cat((rp[W13C:W13C + W13S], rp[W13C + W13S + W2C:]))
-    dst_sf = torch.bincount(torch.cat((sc & 15, sc >> 4)).long() + base0, minlength=256)
-    src_sf = torch.bincount(recs[0, CODES13 + CODES2:].long(), minlength=256)
-    assert bool((src_pairs == dst_pairs).all()) and bool((src_sf == dst_sf).all())
-    bad = recs[:2].clone()
-    bad[0, CODES13 + CODES2 + 5] = 0
-    bad[1, CODES13 + CODES2 + 7] = bad[1, CODES13 + CODES2:].amin() + 16
-    assert not bool(repack(bad)[2].any())
-    # the device repack kernels write the same bytes as the torch repack
-    spare = Band(args.lib, 1, dev)
-    for j in (0, recs.shape[0] - 1):
-        assert spare.load_device(0, recs[j].contiguous())
-        assert bool((spare.store[0] == band.store[j]).all()) and int(spare.sbase[0]) == int(band.sbase[j])
-    assert not spare.load_device(0, bad[0].contiguous()) and not spare.load_device(0, bad[1].contiguous())
-    assert int(spare._range.abs().sum()) == 0
-    del spare
-    print("2. repack keeps the multiset of pairs and the scale codes; out-of-range records are refused; the device "
-          "repack equals the torch repack: ok")
+    from band import rtxband as rb
+    if rb.K2:
+        # 2. (hi2-k2) the repack is lossless: same multiset of 2-bit pairs; the band record's bases, 2-bit codes and
+        #    exception entries decode to the record's scale bytes; the device repack equals the torch repack
+        #    (what does not fit the band: tests/test_band_k2.py)
+        def pair_counts(t):
+            return torch.stack([(((t >> (2 * j)) & 3).view(-1, 1) == torch.arange(4, device=dev)).sum(0) for j in range(4)]).sum(0)
+        sh = torch.tensor([0, 2, 4, 6], dtype=torch.uint8, device=dev)
+        for j in (0, 1, recs.shape[0] - 1):
+            rp = band.store[j]
+            assert bool((pair_counts(recs[j, :CODES13 + CODES2]) ==
+                         pair_counts(rp[:W13C]) + pair_counts(rp[W13C + W13S:W13C + W13S + W2C])).all())
+            want = rb.scales_of(recs[j:j + 1])
+            x = rp[rb.XOFF:].view(-1, 4).to(torch.int64)
+            x = (x[:, 0] | (x[:, 1] << 8) | (x[:, 2] << 16) | (x[:, 3] << 24)).view(rb.XTILES, rb.XENT)
+            off = W13C
+            for ti, (nrows, kq, first) in enumerate(((6144, 28, 0), (3584, 24, 48))):
+                t = rp[off:off + (nrows // 16) * (16 + kq * 16)].view(nrows // 16, 16 + kq * 16)
+                v = t[:, :16].reshape(1, nrows, 1) + ((t[:, 16:].reshape(nrows // 16, kq, 16).permute(1, 0, 2)
+                                                         .reshape(kq, nrows, 1) >> sh) & 3)
+                for blk, e in (x[first:first + nrows // 128] != rb.EMPTY).nonzero().tolist():
+                    w = int(x[first + blk, e])
+                    v[((w >> 7) & 127) // 4, 128 * blk + (w & 127), ((w >> 7) & 127) % 4] = (w >> 14) & 255
+                assert bool((v == want[ti][0][:, rb.scale_row(nrows, dev), :]).all()), "band scales"
+                off += (nrows // 16) * (16 + kq * 16) + W2C
+            assert int(band.sbase[j]) == int((x != rb.EMPTY).any())
+        spare = Band(args.lib, 1, dev)
+        for j in (0, recs.shape[0] - 1):
+            assert spare.load_device(0, recs[j].contiguous())
+            assert bool((spare.store[0] == band.store[j]).all()) and int(spare.sbase[0]) == int(band.sbase[j])
+        assert int(spare._range.abs().sum()) == 0
+        del spare
+        print("2. repack keeps the multiset of pairs; the band record decodes to the record's scale bytes (bases, "
+              "2-bit codes, exception entries); the device repack equals the torch repack: ok")
+    else:
+        # 2. the repack is lossless: same multiset of 2-bit pairs; scale codes = 4-bit code + base; and a record whose
+        #    scale codes do not fit (a zero code, or a span over 16) is refused
+        rp, base0 = band.store[0], int(band.sbase[0])
+        def pair_counts(t):
+            return torch.stack([(((t >> (2 * j)) & 3).view(-1, 1) == torch.arange(4, device=dev)).sum(0) for j in range(4)]).sum(0)
+        src_pairs = pair_counts(recs[0, :CODES13 + CODES2])
+        dst_pairs = pair_counts(rp[:W13C]) + pair_counts(rp[W13C + W13S:W13C + W13S + W2C])
+        sc = torch.cat((rp[W13C:W13C + W13S], rp[W13C + W13S + W2C:]))
+        dst_sf = torch.bincount(torch.cat((sc & 15, sc >> 4)).long() + base0, minlength=256)
+        src_sf = torch.bincount(recs[0, CODES13 + CODES2:].long(), minlength=256)
+        assert bool((src_pairs == dst_pairs).all()) and bool((src_sf == dst_sf).all())
+        bad = recs[:2].clone()
+        bad[0, CODES13 + CODES2 + 5] = 0
+        bad[1, CODES13 + CODES2 + 7] = bad[1, CODES13 + CODES2:].amin() + 16
+        assert not bool(repack(bad)[2].any())
+        # the device repack kernels write the same bytes as the torch repack
+        spare = Band(args.lib, 1, dev)
+        for j in (0, recs.shape[0] - 1):
+            assert spare.load_device(0, recs[j].contiguous())
+            assert bool((spare.store[0] == band.store[j]).all()) and int(spare.sbase[0]) == int(band.sbase[j])
+        assert not spare.load_device(0, bad[0].contiguous()) and not spare.load_device(0, bad[1].contiguous())
+        assert int(spare._range.abs().sum()) == 0
+        del spare
+        print("2. repack keeps the multiset of pairs and the scale codes; out-of-range records are refused; the device "
+              "repack equals the torch repack: ok")
 
     cache = {}
     rows = []

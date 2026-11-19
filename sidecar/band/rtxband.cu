@@ -175,6 +175,33 @@ __global__ void band_prefetch(const BandCall* __restrict__ call, const uint8_t* 
 //                     (range must be zero before; the pack kernel leaves it zero again)
 //   band_repack:      permutes the 2-bit codes into fragment order and writes the scale codes as 4-bit offsets from
 //                     the lowest one; meta[0] = that base, meta[1] = 1 if the record fits (no zero code, span <= 16)
+#if BAND_K2
+// BAND_K2 (hi2-k2 records): range[0] = 1 if the record does not fit (a status word set, or a row with more than two
+// exception entries), range[1] = 1 if it has exception entries; band_repack copies the rows' bases and 2-bit codes
+// and the exception entries; meta[0] = range[1] (for sbase[slot]), meta[1] = 1 if the record fits.
+__global__ void band_scale_range(const uint8_t* __restrict__ hi2, int* __restrict__ range) {
+  uint32_t unfit = 0, hasx = 0;
+  scan_share<false>(hi2, blockIdx.x * blockDim.x + threadIdx.x, gridDim.x * blockDim.x, unfit, hasx);
+  if (unfit) atomicMax(&range[0], 1);
+  if (hasx) atomicMax(&range[1], 1);
+}
+
+__global__ void band_repack(const uint8_t* __restrict__ hi2, uint8_t* __restrict__ rec, int* __restrict__ range,
+                            uint8_t* __restrict__ meta) {
+  const int unfit = range[0], hasx = range[1];
+  repack_share<false>(hi2, rec, (blockIdx.x * blockDim.x + threadIdx.x) >> 5, (gridDim.x * blockDim.x) >> 5, 0u);
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < XTILES * XENT; i += gridDim.x * blockDim.x)
+    xent_part<false>(hi2, rec, i);
+  if (blockIdx.x == 0) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      meta[0] = (uint8_t)hasx;
+      meta[1] = (uint8_t)(unfit == 0);
+      range[0] = 0; range[1] = 0;
+    }
+  }
+}
+#else
 __global__ void band_scale_range(const uint8_t* __restrict__ hi2, int* __restrict__ range) {
   uint32_t lo = 0xFFFFFFFFu, hi = 0;                       // bytewise min / max over this thread's words
   scale_range_share<false>(hi2, blockIdx.x * blockDim.x + threadIdx.x, gridDim.x * blockDim.x, lo, hi);
@@ -203,6 +230,7 @@ __global__ void band_repack(const uint8_t* __restrict__ hi2, uint8_t* __restrict
     }
   }
 }
+#endif
 
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -222,6 +250,9 @@ void rtxband_sizes(long long* out) {
   out[4] = (long long)(MAXE - 1) * MAXT * H * 4; out[5] = (long long)MAXT * H * 4; out[6] = SYNC_WORDS * 4;
   out[7] = CTAS1 * MAXE; out[8] = CTAS2 * MAXE; out[9] = THREADS; out[10] = BAND_PF; out[11] = SMEM_BYTES;
 }
+
+// the record formats this library was built for: [hi2 record bytes, 1 = hi2-k2 records and 2-bit band scale codes]
+void rtxband_format(long long* out) { out[0] = HI2_BYTES; out[1] = BAND_K2; }
 
 static Bufs bufs(const RtxBand* r) {
   return Bufs{(const uint8_t*)r->store, (const uint8_t*)r->sbase, (uint8_t*)r->aq, (float*)r->ypart, (float*)r->y,

@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from band.rtxband import HI2_REC, Band                                         # noqa: E402
+from band.rtxband import HI2_REC, Band, LIB_SUFFIX  # noqa: E402
 from band.service import Mailbox, Service, make_trace                         # noqa: E402
 
 
@@ -46,7 +46,7 @@ def main():
     a = ap.parse_args()
     mm = np.memmap(a.hi2, dtype=np.uint8, mode="r").reshape(-1, HI2_REC)
     n = min(a.records, mm.shape[0])
-    band = Band(os.path.join(a.build, "librtxband.so"), n, torch.device("cuda"))
+    band = Band(os.path.join(a.build, f"librtxband{LIB_SUFFIX}.so"), n, torch.device("cuda"))
     for i in range(0, n, 16):
         band.load(i, torch.from_numpy(np.ascontiguousarray(mm[i:i + 16])))
     calls = a.steps * 92
@@ -55,7 +55,7 @@ def main():
     feed = np.ascontiguousarray(mm[:m]).copy()           # anonymous memory: pinned for the copy engine
     before = band.store[:m].clone()
     mb = Mailbox(os.path.join(a.build, "libbandhost.so"), a.seg, create=True)
-    svc = Service(band, os.path.join(a.build, "librtxband_svc.so"), mb)
+    svc = Service(band, os.path.join(a.build, f"librtxband_svc{LIB_SUFFIX}.so"), mb)
     torch.cuda.synchronize()
     svc.start(repack_after_us=a.repack_after_us, repack_idle_us=a.repack_idle_us)
     res = dict(config=vars(a), runs={})

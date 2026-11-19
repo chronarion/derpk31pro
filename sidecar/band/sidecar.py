@@ -20,8 +20,21 @@ import time
 import numpy as np
 import torch
 
-from .rtxband import HI2_REC, Band
-from .service import Mailbox, Service
+
+def _store_format() -> None:
+    """The record store's format decides the band's record sizes and libraries: rtxband.py reads K31_REC_FMT when it is
+    imported, so it is set here from --hi2's layout.json (hi2-k1, or hi2-k2: packed scales)."""
+    for i, arg in enumerate(sys.argv):
+        if arg == "--hi2" and i + 1 < len(sys.argv):
+            try:
+                os.environ["K31_REC_FMT"] = json.load(open(os.path.join(sys.argv[i + 1], "layout.json"))).get("format", "hi2-k1")
+            except OSError:
+                pass
+
+
+_store_format()
+from .rtxband import HI2_REC, LIB_SUFFIX, REC, Band  # noqa: E402
+from .service import Mailbox, Service  # noqa: E402
 
 
 def log(msg: str) -> None:
@@ -74,7 +87,9 @@ def main() -> int:
         if os.path.exists(f):
             os.remove(f)
     layout = json.load(open(os.path.join(a.hi2, "layout.json")))
-    assert layout.get("format") == "hi2-k1" and layout["record_bytes"] == HI2_REC
+    assert layout.get("format") in ("hi2-k1", "hi2-k2") and layout["record_bytes"] == HI2_REC, \
+        f"{a.hi2}: {layout.get('format')} records of {layout.get('record_bytes')} B, this sidecar reads {HI2_REC} B"
+    log(f"record store {a.hi2}: {layout.get('format')}, {HI2_REC:,} B per record; band records {REC:,} B")
     rank = json.load(open(a.rank))["layers"]
     hmap = {}
     if a.hbm_map:
@@ -106,10 +121,10 @@ def main() -> int:
     t0 = time.time()
     torch.zeros(1, device="cuda")
     free, total_mem = torch.cuda.mem_get_info()
-    need = total * 8773632
+    need = total * REC
     log(f"{torch.cuda.get_device_name()}: {free / 2**30:.1f} of {total_mem / 2**30:.1f} GiB free; store {total} "
         f"records over {len(layers)} layers = {need / 2**30:.1f} GiB")
-    band = Band(os.path.join(a.build, "librtxband.so"), total)
+    band = Band(os.path.join(a.build, f"librtxband{LIB_SUFFIX}.so"), total)
     m = np.full((93, 896), -1, dtype=np.int32)
     buf = torch.empty((nmax, HI2_REC), dtype=torch.uint8).pin_memory()
     bnp = buf.numpy()
@@ -156,7 +171,7 @@ def main() -> int:
         log(f"record ring: {RING} rows ({ring.nbytes / 2**20:.0f} MiB) in {a.seg}.rec, pinned")
     n_ring = 0
     staging = bnp[0]                                   # pinned: the copy engine's source
-    svc = Service(band, os.path.join(a.build, "librtxband_svc.so"), mb)
+    svc = Service(band, os.path.join(a.build, f"librtxband_svc{LIB_SUFFIX}.so"), mb)
     svc.start(idle_limit_s=a.idle_limit_s)
     # K31_BAND_BULK=1: prompt chunks send their band picks in one request per layer (band/bulk.py); the service
     # kernel is parked while the engine reads a prompt, and records that enter the band meanwhile take the launched

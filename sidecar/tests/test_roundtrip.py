@@ -24,7 +24,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from band.gbproc import GbProcess                                              # noqa: E402
-from band.rtxband import HI2_REC, Band                                         # noqa: E402
+from band.rtxband import HI2_REC, Band, LIB_SUFFIX  # noqa: E402
 from band.service import Mailbox, Service, make_trace                         # noqa: E402
 
 
@@ -36,7 +36,7 @@ def main():
     a = ap.parse_args()
     mm = np.memmap(a.hi2, dtype=np.uint8, mode="r").reshape(-1, HI2_REC)
     n = a.records
-    band = Band(os.path.join(a.build, "librtxband.so"), n, torch.device("cuda"))
+    band = Band(os.path.join(a.build, f"librtxband{LIB_SUFFIX}.so"), n, torch.device("cuda"))
     for i in range(0, n, 16):
         band.load(i, torch.from_numpy(np.ascontiguousarray(mm[i:i + 16])))
     tr = make_trace(band, n, a.calls, T=3, e_lo=7, e_hi=10, seed=21)
@@ -47,7 +47,7 @@ def main():
     np.savez(trace0, calls=tr0["calls"], xq=tr0["xq"], xs=tr0["xs"], hints=tr0["hints"], ref=tr0["ref"])
     n_empty = int((tr0["n_exp"] == 0).sum())
     mb = Mailbox(os.path.join(a.build, "libbandhost.so"), a.seg, create=True)
-    svc = Service(band, os.path.join(a.build, "librtxband_svc.so"), mb)
+    svc = Service(band, os.path.join(a.build, f"librtxband_svc{LIB_SUFFIX}.so"), mb)
     torch.cuda.synchronize()
     svc.start()
     gb = GbProcess(a.build, a.seg, trace_file, a.gb300)

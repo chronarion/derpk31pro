@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from band.rtxband import H, HI2_REC, MAXT, Band                               # noqa: E402
+from band.rtxband import H, HI2_REC, MAXT, Band, LIB_SUFFIX  # noqa: E402
 from band.service import Mailbox, Service, make_trace                         # noqa: E402
 
 
@@ -37,11 +37,11 @@ def main():
     dev = torch.device("cuda")
     mm = np.memmap(a.hi2, dtype=np.uint8, mode="r").reshape(-1, HI2_REC)
     n = a.records
-    band = Band(os.path.join(a.build, "librtxband.so"), n, dev)
+    band = Band(os.path.join(a.build, f"librtxband{LIB_SUFFIX}.so"), n, dev)
     for i in range(0, n, 16):
         band.load(i, torch.from_numpy(np.ascontiguousarray(mm[i:i + 16])))
     mb = Mailbox(os.path.join(a.build, "libbandhost.so"), a.seg, create=True)
-    svc = Service(band, os.path.join(a.build, "librtxband_svc.so"), mb)
+    svc = Service(band, os.path.join(a.build, f"librtxband_svc{LIB_SUFFIX}.so"), mb)
     print(f"service kernel: {svc.regs} registers per thread, {svc.per_sm} CTAs per SM, {svc.sms} SMs -> grid "
           f"{a.grid or svc.per_sm * svc.sms}; mailbox {mb.bytes} B at {a.seg}", flush=True)
     ok = True

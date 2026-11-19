@@ -12,7 +12,7 @@
 import torch
 
 from .rtxband import (CODES13, CODES2, FLAG_ACT_BF16, FLAG_NO_BF16, FLAG_OUT_BF16, FLAG_WEIGHT_AFTER, H, I, KQ1, KQ2,
-                      MAXT, SF13, SF2, SITU_ALPHA, SITU_BETA, mxfp8_encode, scale_row)
+                      MAXT, SITU_ALPHA, SITU_BETA, mxfp8_encode, scale_row, scales_of)
 
 FP4 = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6])
 
@@ -37,9 +37,7 @@ def decode_hi2(rec: torch.Tensor):
     """One hi2 record uint8 [HI2_REC] -> (w1 [3072, 3584], w3 [3072, 3584], w2 [3584, 3072]) float32."""
     c13 = rec[:CODES13].view(6144, 896)
     c2 = rec[CODES13:CODES13 + CODES2].view(3584, 768)
-    o = CODES13 + CODES2
-    s13 = rec[o:o + SF13].view(KQ1, 6144, 4)
-    s2 = rec[o + SF13:o + SF13 + SF2].view(KQ2, 3584, 4)
+    s13, s2 = (t[0] for t in scales_of(rec.unsqueeze(0)))                      # either record format
     w13 = _dequant(c13, s13, 6144, KQ1)
     w2 = _dequant(c2, s2, 3584, KQ2)
     r = torch.arange(I, device=rec.device)

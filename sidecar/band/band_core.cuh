@@ -23,6 +23,9 @@
 #ifndef BAND_CG
 #define BAND_CG 0            // 1: the launched kernels also load around L1 (a probe of what that costs)
 #endif
+#ifndef BAND_K2
+#define BAND_K2 0            // 1: records of a hi2-k2 store (engine/k31_engine/recfmt.py) and band records with 2-bit
+#endif                       //    scale codes from per-row bases (0: hi2-k1 records, 4-bit codes from a record base)
 
 namespace band {
 
@@ -31,17 +34,32 @@ constexpr int I = 3072;                 // intermediate: gate / up rows of w13, 
 constexpr int MAXT = 8;                 // rows (tokens) per call = the MMA's N
 constexpr int MAXE = 16;                // distinct experts per call
 constexpr int CSTEP = 512;              // codes of one step: 32 lanes x 16 B
-constexpr int SSTEP = 32;               // scale codes of one step: 16 rows x 4 K-blocks x 4 bits
 constexpr int KQ1 = H / 128;            // 28 steps per w13 row tile
 constexpr int KQ2 = I / 128;            // 24 steps per w2 row tile
 constexpr int RT1 = 2 * I / 16;         // 384 row tiles of w13
 constexpr int RT2 = H / 16;             // 224 row tiles of w2
-// band record: w13 codes [tile][step][512], w13 scale codes [tile][step][32], w2 codes, w2 scale codes
 constexpr long long W13C = (long long)RT1 * KQ1 * CSTEP;         // 5,505,024
-constexpr long long W13S = (long long)RT1 * KQ1 * SSTEP;         //   344,064
 constexpr long long W2C = (long long)RT2 * KQ2 * CSTEP;          // 2,752,512
+#if BAND_K2
+// band record: w13 codes [tile][step][512], w13 scales [tile]{16 row bases, [step][16 rows x 4 two-bit codes]},
+// w2 codes, w2 scales, then XENT exception entries per 128 rows (as the hi2-k2 record has them, one for one):
+// row in its 128-row block | K block << 7 | scale byte << 14, unused = 0xFFFFFFFF. sbase[slot] = 1 if any is in use.
+constexpr int SSTEP = 16;               // scale codes of one step: 16 rows x 4 K-blocks x 2 bits
+constexpr int SHEAD = 16;               // a row tile's base bytes, before its steps
+constexpr int XENT = 4;                 // exception entries per 128 rows
+constexpr int XTILES = (2 * I + H) / 128;                        // 76
+constexpr long long W13S = (long long)RT1 * (SHEAD + KQ1 * SSTEP);   //   178,176
+constexpr long long W2S = (long long)RT2 * (SHEAD + KQ2 * SSTEP);    //    89,600
+constexpr long long XOFF = W13C + W13S + W2C + W2S;              // 8,525,312
+constexpr long long REC_BYTES = XOFF + XTILES * XENT * 4;        // 8,526,528
+#else
+// band record: w13 codes [tile][step][512], w13 scale codes [tile][step][32], w2 codes, w2 scale codes
+constexpr int SSTEP = 32;               // scale codes of one step: 16 rows x 4 K-blocks x 4 bits
+constexpr int SHEAD = 0;
+constexpr long long W13S = (long long)RT1 * KQ1 * SSTEP;         //   344,064
 constexpr long long W2S = (long long)RT2 * KQ2 * SSTEP;          //   172,032
 constexpr long long REC_BYTES = W13C + W13S + W2C + W2S;         // 8,773,632
+#endif
 constexpr int BREC = 1056;              // activation step record: 32 lanes x 4 K-blocks x 8 B + 8 tokens x 4 scale B
 constexpr int XF_BYTES = KQ1 * BREC;    // 29,568: the call's input
 constexpr int AQ_BYTES = KQ2 * BREC;    // 25,344 per expert: linear 2's input
@@ -60,7 +78,7 @@ constexpr int SPIN_LIMIT = 1 << 21;     // polls before a wait gives up (of the 
                                         // must not hang the GPU
 static_assert(RT1 % W == 0 && RT2 % W == 0 && W % 4 == 0, "warps per CTA");
 static_assert(KQ1 % BAND_PF == 0 && KQ2 % BAND_PF == 0, "lookahead must divide the steps of both linears");
-static_assert(REC_BYTES == 8773632, "record size");
+static_assert(REC_BYTES == (BAND_K2 ? 8526528 : 8773632), "record size");
 
 constexpr int FLAG_WEIGHT_AFTER = 1;    // routing weight applied to linear 2's output (the runner's order) instead of
                                         // to the activation before its FP8 cast (MegaMoE's order)
@@ -89,7 +107,8 @@ static_assert(sizeof(BandCall) == 4 * (8 + MAXE + MAXE * MAXT), "BandCall layout
 
 struct Bufs {                           // device buffers of a band, fixed for its lifetime
   const uint8_t* store;                 // band records by slot
-  const uint8_t* sbase;                 // one byte per slot: the record's lowest scale code
+  const uint8_t* sbase;                 // one byte per slot: the record's lowest scale code (BAND_K2: 1 if the
+                                        // record has exception entries)
   uint8_t* aq;                          // [MAXE][AQ_BYTES] linear 2's input, written by linear 1
   float* ypart;                         // [MAXE - 1][MAXT][H] partial outputs
   float* y;                             // [rows][H] the call's output (the service: the result rows in the mailbox)
@@ -114,6 +133,15 @@ __device__ __forceinline__ uint32_t ld_u16(const uint8_t* p) {
     return v;
   }
   return *reinterpret_cast<const uint16_t*>(p);
+}
+template <bool SVC>
+__device__ __forceinline__ uint32_t ld_u32(const uint8_t* p) {
+  if (SVC || BAND_CG) {
+    uint32_t v;
+    asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(v) : "l"(p));
+    return v;
+  }
+  return *reinterpret_cast<const uint32_t*>(p);
 }
 template <bool SVC>
 __device__ __forceinline__ uint32_t ld_u8(const uint8_t* p) {
@@ -161,21 +189,35 @@ struct Ahead {
   uint32_t s[BAND_PF];
 };
 
+// a lane's scale codes of one step (its row's four K-blocks)
+template <bool SVC>
+__device__ __forceinline__ uint32_t ld_scales(const uint8_t* p) {
+#if BAND_K2
+  return ld_u8<SVC>(p);
+#else
+  return ld_u16<SVC>(p);
+#endif
+}
+
 template <bool SVC>
 __device__ __forceinline__ void gemm_begin(Ahead& q, const uint8_t* __restrict__ wc, const uint8_t* __restrict__ ws) {
 #pragma unroll
   for (int i = 0; i < BAND_PF; i++) {
     q.c[i] = ld_u4<SVC>(wc + i * CSTEP);
-    q.s[i] = ld_u16<SVC>(ws + i * SSTEP);
+    q.s[i] = ld_scales<SVC>(ws + i * SSTEP);
   }
 }
 
+// BAND_K2: up to two exception bytes of a lane's row (step, byte mask, byte value); step -1 = none
+struct Patch { int s0, s1; uint32_t k0, v0, k1, v1; };
+
 // One row tile: NSTEP steps of weights from global memory (wc = this lane's codes, ws = its row's scale codes,
-// base4 = the record's lowest scale code in every byte) against the activation step records in shared memory.
-template <int NSTEP, bool SVC>
+// base4 = the record's lowest scale code in every byte; BAND_K2: the row's base) against the activation step records
+// in shared memory. X (BAND_K2, a record with exception entries): px = the row's exception bytes.
+template <int NSTEP, bool SVC, bool X = false>
 __device__ __forceinline__ void gemm_tile(Ahead& q, const uint8_t* __restrict__ wc, const uint8_t* __restrict__ ws,
                                           uint32_t base4, const uint8_t* __restrict__ bp, int lane, float& acc0,
-                                          float& acc1, float& acc2, float& acc3) {
+                                          float& acc1, float& acc2, float& acc3, const Patch* px = nullptr) {
   const uint8_t* bx = bp + 32 * lane;                        // my 4 x 8 B of activations
   const uint8_t* bs = bp + 1024 + 4 * (lane >> 2);           // token g's scale word
 #pragma unroll 1
@@ -183,9 +225,19 @@ __device__ __forceinline__ void gemm_tile(Ahead& q, const uint8_t* __restrict__ 
     const bool more = s0 + BAND_PF < NSTEP;
 #pragma unroll
     for (int i = 0; i < BAND_PF; i++) {
+#if BAND_K2
+      const uint32_t s8 = q.s[i];
+      uint32_t sa = (s8 | (s8 << 12)) & 0x000F000Fu;         // four 2-bit codes -> four scale bytes
+      sa = ((sa | (sa << 6)) & 0x03030303u) + base4;
+      if (X) {
+        if (s0 + i == px->s0) sa = (sa & ~px->k0) | px->v0;
+        if (s0 + i == px->s1) sa = (sa & ~px->k1) | px->v1;
+      }
+#else
       const uint32_t s16 = q.s[i];
       uint32_t sa = (s16 | (s16 << 8)) & 0x00FF00FFu;        // four 4-bit codes -> four scale bytes
       sa = ((sa | (sa << 4)) & 0x0F0F0F0Fu) + base4;
+#endif
       const uint4 x0 = *reinterpret_cast<const uint4*>(bx + i * BREC);
       const uint4 x1 = *reinterpret_cast<const uint4*>(bx + i * BREC + 16);
       const uint32_t sb = *reinterpret_cast<const uint32_t*>(bs + i * BREC);
@@ -196,7 +248,7 @@ __device__ __forceinline__ void gemm_tile(Ahead& q, const uint8_t* __restrict__ 
       BAND_EXPAND(q.c[i].w); b0 = x1.z; b1 = x1.w; BAND_MMA(3);
       if (more) {                                            // refill the slot: the step BAND_PF ahead
         q.c[i] = ld_u4<SVC>(wc + (BAND_PF + i) * CSTEP);
-        q.s[i] = ld_u16<SVC>(ws + (BAND_PF + i) * SSTEP);
+        q.s[i] = ld_scales<SVC>(ws + (BAND_PF + i) * SSTEP);
       }
     }
     wc += BAND_PF * CSTEP; ws += BAND_PF * SSTEP; bx += BAND_PF * BREC; bs += BAND_PF * BREC;
@@ -246,6 +298,26 @@ __device__ __forceinline__ uint32_t sf_code(float amax, int sf_min) {
   return (uint32_t)max((int)r - 8, sf_min);
 }
 
+#if BAND_K2
+// The exception bytes of natural row `rib` of the 128-row block `tile128` (w13: 0..47, w2: 48..75) of a record.
+template <bool SVC>
+__device__ __forceinline__ Patch lane_patch(const uint8_t* __restrict__ rec, int tile128, int rib) {
+  Patch p{-1, -1, 0u, 0u, 0u, 0u};
+  const uint8_t* ex = rec + XOFF + (long long)tile128 * (XENT * 4);
+#pragma unroll
+  for (int j = 0; j < XENT; j++) {
+    const uint32_t e = ld_u32<SVC>(ex + 4 * j);
+    if (e != 0xFFFFFFFFu && (int)(e & 127u) == rib) {
+      const int k = (int)((e >> 7) & 127u);
+      const uint32_t m = 0xFFu << (8 * (k & 3)), v = ((e >> 14) & 255u) << (8 * (k & 3));
+      if (p.s0 < 0) { p.s0 = k >> 2; p.k0 = m; p.v0 = v; }
+      else { p.s1 = k >> 2; p.k1 = m; p.v1 = v; }
+    }
+  }
+  return p;
+}
+#endif
+
 // ---------------------------------------------------------------------------------------------------------------
 // Linear 1 + SiTU + FP8 cast. One unit = (expert slot e, W row tiles of 8 neurons), one tile per warp, run by a whole
 // CTA. Four consecutive warps are one 32-neuron block = one K-block of linear 2; the unit writes its part of expert
@@ -263,8 +335,15 @@ __device__ __forceinline__ void l1_body(const BandCall* __restrict__ call, const
   const int slot = call->slot[e];
   const uint8_t* rec = b.store + (long long)slot * REC_BYTES;
   const uint8_t* wc = rec + (long long)tile * (KQ1 * CSTEP) + 16 * lane;
+#if BAND_K2
+  const uint8_t* wst = rec + W13C + (long long)tile * (SHEAD + KQ1 * SSTEP);                 // the tile's scales
+  const uint8_t* ws = wst + SHEAD + (g + 8 * (t & 1));                                       // row g or g + 8
+  const uint32_t base4 = ld_u8<SVC>(wst + (g + 8 * (t & 1))) * 0x01010101u;
+  const uint32_t hasx = ld_u8<SVC>(b.sbase + slot);
+#else
   const uint8_t* ws = rec + W13C + (long long)tile * (KQ1 * SSTEP) + 2 * (g + 8 * (t & 1));   // row g or g + 8
   const uint32_t base4 = ld_u8<SVC>(b.sbase + slot) * 0x01010101u;
+#endif
   Ahead ahead;
   gemm_begin<SVC>(ahead, wc, ws);                          // the first DRAM misses overlap the fill
 
@@ -274,6 +353,12 @@ __device__ __forceinline__ void l1_body(const BandCall* __restrict__ call, const
   if (flags & FLAG_STOP_FILL) return;
 
   float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;   // gate(n, 2t), gate(n, 2t+1), up(n, 2t), up(n, 2t+1)
+#if BAND_K2
+  if (hasx) {                                              // a record with exception entries (rare): this row's
+    const Patch px = lane_patch<SVC>(rec, tile >> 3, 16 * (tile & 7) + g + 8 * (t & 1));
+    gemm_tile<KQ1, SVC, true>(ahead, wc, ws, base4, xsm, lane, acc0, acc1, acc2, acc3, &px);
+  } else
+#endif
   gemm_tile<KQ1, SVC>(ahead, wc, ws, base4, xsm, lane, acc0, acc1, acc2, acc3);
   if (flags & FLAG_STOP_GEMM) { if (acc0 == 1.2345f) b.aq[0] = 1; return; }
 
@@ -344,8 +429,15 @@ __device__ __forceinline__ bool l2_body(const BandCall* __restrict__ call, const
   const int slot = call->slot[e];
   const uint8_t* rec = b.store + (long long)slot * REC_BYTES + W13C + W13S;
   const uint8_t* wc = rec + (long long)tile * (KQ2 * CSTEP) + 16 * lane;
+#if BAND_K2
+  const uint8_t* wst = rec + W2C + (long long)tile * (SHEAD + KQ2 * SSTEP);
+  const uint8_t* ws = wst + SHEAD + (g + 8 * (t & 1));
+  const uint32_t base4 = ld_u8<SVC>(wst + (g + 8 * (t & 1))) * 0x01010101u;
+  const uint32_t hasx = ld_u8<SVC>(b.sbase + slot);
+#else
   const uint8_t* ws = rec + W2C + (long long)tile * (KQ2 * SSTEP) + 2 * (g + 8 * (t & 1));
   const uint32_t base4 = ld_u8<SVC>(b.sbase + slot) * 0x01010101u;
+#endif
   Ahead ahead;
   gemm_begin<SVC>(ahead, wc, ws);
   if (fused) {                                             // expert e's activations must be complete
@@ -363,6 +455,13 @@ __device__ __forceinline__ bool l2_body(const BandCall* __restrict__ call, const
   if (flags & FLAG_STOP_FILL) return false;
 
   float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;   // y(row, 2t), y(row, 2t+1), y(row+8, 2t), y(row+8, 2t+1)
+#if BAND_K2
+  if (hasx) {
+    const Patch px = lane_patch<SVC>(b.store + (long long)slot * REC_BYTES, RT1 / 8 + (tile >> 3),
+                                     16 * (tile & 7) + g + 8 * (t & 1));
+    gemm_tile<KQ2, SVC, true>(ahead, wc, ws, base4, smem, lane, acc0, acc1, acc2, acc3, &px);
+  } else
+#endif
   gemm_tile<KQ2, SVC>(ahead, wc, ws, base4, smem, lane, acc0, acc1, acc2, acc3);
   if (flags & FLAG_STOP_GEMM) { if (acc0 == 1.2345f) y0[0] = 1; return false; }
   if (flags & FLAG_OUT_BF16) {
@@ -464,15 +563,77 @@ __device__ __forceinline__ void prefetch_piece(const uint8_t* store, int slot, i
 // ---------------------------------------------------------------------------------------------------------------
 // hi2 record -> band record (what runs when a record enters the band), as per-thread / per-warp shares:
 //   scale_range_share: bytewise min / max over every `stride`-th uint4 of the record's scale bytes from `first`
+//                      (BAND_K2: scan_share, the record's exception entries and status words: does it fit, has it
+//                      exceptions)
 //   repack_part:       one step (16-row tile x 128 inputs) by one warp: permutes the 2-bit codes into fragment
-//                      order and writes the scale codes as 4-bit offsets from base
-// hi2 layout: engine/store/build_store.py; band layout: band/rtxband.py.
+//                      order and writes the scale codes as 4-bit offsets from base (BAND_K2: copies the row's
+//                      2-bit code bytes and base)
+// hi2 layout: engine/store/build_store.py, engine/k31_engine/recfmt.py; band layout: band/rtxband.py.
 // ---------------------------------------------------------------------------------------------------------------
-constexpr long long HI2_C13 = 6144LL * 896, HI2_C2 = 3584LL * 768, HI2_S13 = 28LL * 6144 * 4, HI2_S2 = 24LL * 3584 * 4;
+constexpr long long HI2_C13 = 6144LL * 896, HI2_C2 = 3584LL * 768;
+#if BAND_K2
+// hi2-k2 scale units (recfmt.py): 512 scale rows = [512 bases][16 exception entries][K groups x 512 code bytes];
+// a tile of 128 rows owns 4 of the entries; then one status word per tile
+constexpr int K2_UROWS = 512, K2_UHEAD = K2_UROWS + 64;
+constexpr long long HI2_U13 = K2_UHEAD + (long long)KQ1 * K2_UROWS, HI2_U2 = K2_UHEAD + (long long)KQ2 * K2_UROWS;
+constexpr long long HI2_S13 = (6144 / K2_UROWS) * HI2_U13, HI2_S2 = (3584 / K2_UROWS) * HI2_U2;
+constexpr long long HI2_STATUS = HI2_C13 + HI2_C2 + HI2_S13 + HI2_S2;
+constexpr long long HI2_BYTES = (HI2_STATUS + 4 * XTILES + 4095) / 4096 * 4096;
+static_assert(HI2_BYTES == 8527872 && HI2_U13 == 14912 && HI2_U2 == 12864, "hi2-k2 record");
+#else
+constexpr long long HI2_S13 = 28LL * 6144 * 4, HI2_S2 = 24LL * 3584 * 4;
 constexpr long long HI2_BYTES = HI2_C13 + HI2_C2 + HI2_S13 + HI2_S2;
-constexpr int HI2_SCALE_U4 = (int)((HI2_S13 + HI2_S2) / 16);
 static_assert(HI2_BYTES == 9289728, "hi2 record size");
+#endif
+constexpr int HI2_SCALE_U4 = (int)((HI2_S13 + HI2_S2) / 16);
 
+#if BAND_K2
+// the hi2-k2 unit that holds scale row `srow` of a tensor (w2: second tensor)
+__device__ __forceinline__ const uint8_t* k2_unit(const uint8_t* __restrict__ hi2, bool w2, int srow) {
+  return hi2 + HI2_C13 + HI2_C2 + (w2 ? HI2_S13 + (long long)(srow / K2_UROWS) * HI2_U2
+                                      : (long long)(srow / K2_UROWS) * HI2_U13);
+}
+
+// Every `stride`-th 128-row tile from `first`: unfit = 1 if its status word is set (the record is not exact) or a
+// row has more than two exception entries (a lane patches two); hasx = 1 if an entry is in use.
+template <bool SVC>
+__device__ __forceinline__ void scan_share(const uint8_t* __restrict__ hi2, int first, int stride, uint32_t& unfit,
+                                           uint32_t& hasx) {
+  for (int T = first; T < XTILES; T += stride) {
+    const bool w2 = T >= 6144 / 128;
+    const int tt = w2 ? T - 6144 / 128 : T;
+    const uint8_t* ex = k2_unit(hi2, w2, 128 * tt) + K2_UROWS + (tt & 3) * (XENT * 4);
+    if (ld_u32<SVC>(hi2 + HI2_STATUS + 4 * T) != 0u) unfit = 1u;
+    uint32_t e[XENT];
+#pragma unroll
+    for (int j = 0; j < XENT; j++) e[j] = ld_u32<SVC>(ex + 4 * j);
+#pragma unroll
+    for (int j = 0; j < XENT; j++) {
+      if (e[j] == 0xFFFFFFFFu) continue;
+      hasx = 1u;
+      int same = 0;
+#pragma unroll
+      for (int k = 0; k < XENT; k++) same += e[k] != 0xFFFFFFFFu && (e[k] & 511u) == (e[j] & 511u);
+      if (same > 2) unfit = 1u;
+    }
+  }
+}
+
+// Exception entry i of the record (4 per 128-row tile, the hi2-k2 record's order) -> the band record's entry i.
+template <bool SVC>
+__device__ __forceinline__ void xent_part(const uint8_t* __restrict__ hi2, uint8_t* __restrict__ rec, int i) {
+  const int T = i / XENT, j = i % XENT;
+  const bool w2 = T >= 6144 / 128;
+  const int tt = w2 ? T - 6144 / 128 : T;
+  const uint32_t e = ld_u32<SVC>(k2_unit(hi2, w2, 128 * tt) + K2_UROWS + (tt & 3) * (XENT * 4) + 4 * j);
+  uint32_t o = 0xFFFFFFFFu;
+  if (e != 0xFFFFFFFFu) {
+    const uint32_t P = e & 511u;                           // scale row in the unit: 128 b + 4 i + j of row 32 j + i
+    o = (32u * (P & 3u) + ((P & 127u) >> 2)) | (((e >> 9) & 127u) << 7) | (((e >> 16) & 255u) << 14);
+  }
+  *reinterpret_cast<uint32_t*>(rec + XOFF + 4 * i) = o;
+}
+#else
 template <bool SVC>
 __device__ __forceinline__ void scale_range_share(const uint8_t* __restrict__ hi2, int first, int stride, uint32_t& lo,
                                                   uint32_t& hi) {
@@ -490,24 +651,16 @@ __device__ __forceinline__ void scale_range_share(const uint8_t* __restrict__ hi
     }
   }
 }
+#endif
 
 // pairs of one hi2 code byte (4 weights of one row) -> the low two bits of the 4 bytes of a word
 __device__ __forceinline__ uint32_t spread4(uint32_t b) {
   return (b | (b << 6) | (b << 12) | (b << 18)) & 0x03030303u;
 }
 
-template <bool SVC>
-__device__ __forceinline__ uint32_t ld_u32(const uint8_t* p) {
-  if (SVC || BAND_CG) {
-    uint32_t v;
-    asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(v) : "l"(p));
-    return v;
-  }
-  return *reinterpret_cast<const uint32_t*>(p);
-}
-
 // One warp per step. Lane = 4 g' + kap for the codes: it reads the four hi2 words of rows g', g' + 8 and both
 // 16-input halves of K-block kap, and writes that K-block's word of lanes 4 g' + 0..3.
+// `scales`: hi2-k1: the tensor's scale bytes; BAND_K2: the hi2 record (w2 = the second tensor).
 template <int ROWS, int KQ, bool SVC>
 __device__ __forceinline__ void repack_part(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ scales,
                                             uint8_t* __restrict__ out_c, uint8_t* __restrict__ out_s, int step,
@@ -529,21 +682,35 @@ __device__ __forceinline__ void repack_part(const uint8_t* __restrict__ codes, c
   if (lane < 16) {                                         // scale codes of row 16 tile + lane
     const int row = 16 * tile + lane;
     const int srow = 128 * (row / 128) + 4 * (row % 32) + (row % 128) / 32;      // the kernel layout's scale row
+#if BAND_K2
+    const uint8_t* unit = k2_unit(scales, ROWS == 3584, srow);
+    uint8_t* ts = out_s + (long long)tile * (SHEAD + KQ * SSTEP);
+    ts[SHEAD + kq * SSTEP + lane] = (uint8_t)ld_u8<SVC>(unit + K2_UHEAD + kq * K2_UROWS + srow % K2_UROWS);
+    if (kq == 0) ts[lane] = (uint8_t)ld_u8<SVC>(unit + srow % K2_UROWS);
+#else
     const uint32_t v = ld_u32<SVC>(scales + ((long long)kq * ROWS + srow) * 4) - base4;
     const uint32_t n = (v | (v >> 4)) & 0x00FF00FFu;       // bytes 0, 2 = nibble pairs (0, 1), (2, 3)
     *reinterpret_cast<uint16_t*>(out_s + (long long)step * SSTEP + 2 * lane) = (uint16_t)(n | (n >> 8));
+#endif
   }
 }
 
-// every step of a record for warp `warp` of `warps`
+// every step of a record for warp `warp` of `warps` (BAND_K2: not its exception entries: xent_part)
 template <bool SVC>
 __device__ __forceinline__ void repack_share(const uint8_t* __restrict__ hi2, uint8_t* __restrict__ rec, int warp,
                                              int warps, uint32_t base4) {
+#if BAND_K2
+  for (int s = warp; s < RT1 * KQ1; s += warps)
+    repack_part<6144, KQ1, SVC>(hi2, hi2, rec, rec + W13C, s, base4);
+  for (int s = warp; s < RT2 * KQ2; s += warps)
+    repack_part<3584, KQ2, SVC>(hi2 + HI2_C13, hi2, rec + W13C + W13S, rec + W13C + W13S + W2C, s, base4);
+#else
   for (int s = warp; s < RT1 * KQ1; s += warps)
     repack_part<6144, KQ1, SVC>(hi2, hi2 + HI2_C13 + HI2_C2, rec, rec + W13C, s, base4);
   for (int s = warp; s < RT2 * KQ2; s += warps)
     repack_part<3584, KQ2, SVC>(hi2 + HI2_C13, hi2 + HI2_C13 + HI2_C2 + HI2_S13, rec + W13C + W13S,
                                 rec + W13C + W13S + W2C, s, base4);
+#endif
 }
 
 }  // namespace band

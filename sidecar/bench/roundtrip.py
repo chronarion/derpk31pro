@@ -37,7 +37,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from band.gbproc import GbProcess                                              # noqa: E402
-from band.rtxband import HI2_REC, Band                                         # noqa: E402
+from band.rtxband import HI2_REC, Band, LIB_SUFFIX  # noqa: E402
 from band.service import Mailbox, Service, make_trace                         # noqa: E402
 
 LINES = (60, 70, 80, 95, 105, 115)
@@ -90,7 +90,7 @@ def main():
     dev = torch.device("cuda")
     mm = np.memmap(a.hi2, dtype=np.uint8, mode="r").reshape(-1, HI2_REC)
     n = a.store_layers * a.per_layer if a.store_layers else min(a.records, mm.shape[0])
-    band = Band(os.path.join(a.build, "librtxband.so"), n, dev)
+    band = Band(os.path.join(a.build, f"librtxband{LIB_SUFFIX}.so"), n, dev)
     fill_store(band, mm, n, a.store_layers, a.per_layer)
     calls = a.steps * 92
     tr = make_trace(band, n, calls, T=a.rows, e_lo=a.e_lo, e_hi=a.e_hi, seed=5, recall=a.recall, dist=a.dist,
@@ -98,7 +98,7 @@ def main():
     trace_file = a.seg + ".trace.npz"
     np.savez(trace_file, calls=tr["calls"], xq=tr["xq"], xs=tr["xs"], hints=tr["hints"], ref=tr["ref"])
     mb = Mailbox(os.path.join(a.build, "libbandhost.so"), a.seg, create=True)
-    svc = Service(band, os.path.join(a.build, "librtxband_svc.so"), mb)
+    svc = Service(band, os.path.join(a.build, f"librtxband_svc{LIB_SUFFIX}.so"), mb)
     ne = tr["n_exp"]
     what = f"{a.e_lo}-{a.e_hi} experts" if a.dist == "uniform" else f"experts as {a.dist} capped at {a.cap}"
     store = f"{a.store_layers} layers x {a.per_layer} slots" if a.store_layers else f"{n} records"

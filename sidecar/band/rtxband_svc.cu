@@ -269,8 +269,13 @@ __device__ __forceinline__ void poller(const SvcParams& p, uint8_t* smem) {
         put_item(C, ++gen, ITEM_RANGE, 0, 0, landing, 0, 0, ps->t_seen);
         fine &= poller_wait(&C->phase, Wk, p.wait_limit_ns);
         atomicExch(&C->phase, 0);
+#if BAND_K2                             // range[0]: the record does not fit; range[1]: it has exception entries
+        const bool fits = atomicExch(&C->range[0], 0) == 0;
+        const int lo = atomicExch(&C->range[1], 0);          // (the byte for sbase[dst])
+#else
         const int lo = 255 - atomicExch(&C->range[0], 0), hi = atomicExch(&C->range[1], 0);
         const bool fits = lo > 0 && hi - lo <= 15;
+#endif
         put_item(C, ++gen, ITEM_PACK, 0, 0, landing, dst, lo, ps->t_seen);
         fine &= poller_wait(&C->phase, Wk, p.wait_limit_ns);
         atomicExch(&C->phase, 0);
@@ -352,6 +357,12 @@ __device__ __forceinline__ void worker(const SvcParams& p, uint8_t* smem) {
         }
       }
     } else if (kind == ITEM_RANGE) {
+#if BAND_K2
+      uint32_t unfit = 0, hasx = 0;
+      scan_share<true>(p.landing + (long long)it->a * HI2_BYTES, wi * THREADS + tid, Wk * THREADS, unfit, hasx);
+      if (unfit) atomicMax(&C->range[0], 1);
+      if (hasx) atomicMax(&C->range[1], 1);
+#else
       uint32_t lo = 0xFFFFFFFFu, hi = 0;
       scale_range_share<true>(p.landing + (long long)it->a * HI2_BYTES, wi * THREADS + tid, Wk * THREADS, lo, hi);
 #pragma unroll
@@ -363,11 +374,16 @@ __device__ __forceinline__ void worker(const SvcParams& p, uint8_t* smem) {
         atomicMax(&C->range[0], 255 - (int)lo);
         atomicMax(&C->range[1], (int)hi);
       }
+#endif
       __syncthreads();
       if (tid == 0) atomicAdd(&C->phase, 1);
     } else if (kind == ITEM_PACK) {
       repack_share<true>(p.landing + (long long)it->a * HI2_BYTES, p.store + (long long)it->b * REC_BYTES,
                          wi * W + warp, Wk * W, (uint32_t)it->c * 0x01010101u);
+#if BAND_K2
+      for (int i = wi * THREADS + tid; i < XTILES * XENT; i += Wk * THREADS)
+        xent_part<true>(p.landing + (long long)it->a * HI2_BYTES, p.store + (long long)it->b * REC_BYTES, i);
+#endif
       __threadfence();
       __syncthreads();
       if (tid == 0) atomicAdd(&C->phase, 1);

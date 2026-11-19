@@ -20,6 +20,17 @@ Record layouts
     w13 scales [384][28][16 rows x uint16]        four 4-bit codes per row and step, K-block j in bits 4j..4j+3:
                stored scale code - base, natural row order
     w2 codes   [224][24][512 B], w2 scales [224][24][32 B]   the same
+
+K31_REC_FMT=hi2-k2 (read at import; the sidecar sets it from the record store's layout.json): the records are hi2-k2
+(engine/k31_engine/recfmt.py: 8,527,872 B, the scales as a base byte per scale row and a 2-bit offset per scale, in
+units of 512 scale rows with exact exception entries) and the band keeps that code, in its own order:
+  band record (8,526,528 B) + one flag byte per record (1 = it has exception entries):
+    w13 codes  as above
+    w13 scales [384 row tiles]{16 row bases, [28 steps][16 rows x 1 B: four 2-bit codes, K-block j in bits 2j..2j+1]}
+    w2 codes, w2 scales [224]{16, [24][16]}
+    exception entries [76 blocks of 128 rows][4 x uint32]: row in the block | K-block << 7 | scale byte << 14,
+               unused 0xFFFFFFFF (the hi2-k2 record's entries, one for one; a row may have two)
+The libraries are built per format (build.sh: librtxband.so / librtxband_k2.so, and the service's).
 """
 import ctypes
 import os
@@ -28,13 +39,28 @@ import torch
 
 H, I = 3584, 3072
 MAXT, MAXE = 8, 16
-HI2_REC = 9289728
+K2 = os.environ.get("K31_REC_FMT", "hi2-k1") == "hi2-k2"
 CODES13, CODES2 = 6144 * 896, 3584 * 768
-SF13, SF2 = 28 * 6144 * 4, 24 * 3584 * 4
+SF13, SF2 = 28 * 6144 * 4, 24 * 3584 * 4      # scale bytes of the kernel tensors (a hi2-k1 record's)
 BREC = 1056
 KQ1, KQ2, RT1, RT2 = 28, 24, 384, 224
-W13C, W13S, W2C, W2S = RT1 * KQ1 * 512, RT1 * KQ1 * 32, RT2 * KQ2 * 512, RT2 * KQ2 * 32
-REC = W13C + W13S + W2C + W2S                 # 8,773,632
+W13C, W2C = RT1 * KQ1 * 512, RT2 * KQ2 * 512
+if K2:
+    UROWS, UHEAD, XENT, XTILES = 512, 512 + 64, 4, (6144 + 3584) // 128      # hi2-k2 scale units; exception entries
+    U13, U2 = UHEAD + KQ1 * UROWS, UHEAD + KQ2 * UROWS                       # 14,912 / 12,864 B per unit
+    P13, P2 = (6144 // UROWS) * U13, (3584 // UROWS) * U2
+    HI2_STATUS = CODES13 + CODES2 + P13 + P2
+    HI2_REC = (HI2_STATUS + 4 * XTILES + 4095) // 4096 * 4096                # 8,527,872
+    W13S, W2S = RT1 * (16 + KQ1 * 16), RT2 * (16 + KQ2 * 16)
+    XOFF = W13C + W13S + W2C + W2S
+    REC = XOFF + XTILES * XENT * 4            # 8,526,528
+    LIB_SUFFIX = "_k2"
+else:
+    HI2_REC = 9289728
+    W13S, W2S = RT1 * KQ1 * 32, RT2 * KQ2 * 32
+    REC = W13C + W13S + W2C + W2S             # 8,773,632
+    LIB_SUFFIX = ""
+EMPTY = 0xFFFFFFFF
 FLAG_WEIGHT_AFTER, FLAG_NO_BF16, FLAG_ACT_BF16, FLAG_PRECISE, FLAG_OUT_BF16 = 1, 2, 4, 8, 16
 # The two arithmetics the band can mirror (both: gate / up rounded to bfloat16, MXFP8 intermediate, fp32 sum):
 #   MEGAMOE  what DeepGEMM's MegaMoE SiTU kernel computes on the GB300: routing weight before the FP8 cast, fast-math
@@ -74,11 +100,79 @@ def _scales_to_steps(s: torch.Tensor, rows: int, base: torch.Tensor) -> torch.Te
     return b.view(n, kq, rows // 16, 16, 2).permute(0, 2, 1, 3, 4).reshape(n, rows // 16, kq, 32)
 
 
+def _k2_parts(r: torch.Tensor, off: int, rows: int, kq: int):
+    """One tensor's hi2-k2 scale units of records r [n, HI2_REC] from byte `off` -> (bases uint8 [n, rows] and code
+    bytes uint8 [n, kq, rows], both in scale-row order, exception entries int64 [n, rows / 128, 4])."""
+    n, units = r.shape[0], rows // UROWS
+    u = r[:, off:off + units * (UHEAD + kq * UROWS)].view(n, units, UHEAD + kq * UROWS)
+    base = u[:, :, :UROWS].reshape(n, rows)
+    codes = u[:, :, UHEAD:].view(n, units, kq, UROWS).permute(0, 2, 1, 3).reshape(n, kq, rows)
+    e = u[:, :, UROWS:UHEAD].reshape(n, units * 16, 4).to(torch.int64)
+    e = e[..., 0] | (e[..., 1] << 8) | (e[..., 2] << 16) | (e[..., 3] << 24)
+    return base, codes, e.view(n, rows // 128, XENT)
+
+
+def scales_of(rec: torch.Tensor):
+    """The scale bytes of hi2 records [n, HI2_REC] of either format as the kernel tensors hold them:
+    (w13 uint8 [n, 28, 6144, 4], w2 uint8 [n, 24, 3584, 4]) (scale-row order, as stored: native - 1)."""
+    n = rec.shape[0]
+    o = CODES13 + CODES2
+    if not K2:
+        return rec[:, o:o + SF13].view(n, KQ1, 6144, 4), rec[:, o + SF13:o + SF13 + SF2].view(n, KQ2, 3584, 4)
+    out = []
+    for off, rows, kq in ((o, 6144, KQ1), (o + P13, 3584, KQ2)):
+        base, codes, e = _k2_parts(rec, off, rows, kq)
+        sh = torch.tensor([0, 2, 4, 6], dtype=torch.uint8, device=rec.device)
+        v = base.view(n, 1, rows, 1) + ((codes.unsqueeze(-1) >> sh) & 3)       # [n, kq, rows, 4]
+        for i, t, j in (e != EMPTY).nonzero().tolist():
+            w = int(e[i, t, j])
+            v[i, ((w >> 9) & 127) // 4, (t // 4) * UROWS + (w & 511), ((w >> 9) & 127) % 4] = (w >> 16) & 255
+        out.append(v)
+    return out[0], out[1]
+
+
+def _repack_k2(r: torch.Tensor):
+    """hi2-k2 records [n, HI2_REC] -> (band records [n, REC], flag uint8 [n]: has exception entries, ok bool [n])."""
+    n = r.shape[0]
+    dev = r.device
+    parts, ents = [], []
+    o = CODES13 + CODES2
+    for coff, soff, rows, row_b, kq in ((0, o, 6144, 896, KQ1), (CODES13, o + P13, 3584, 768, KQ2)):
+        base, codes, e = _k2_parts(r, soff, rows, kq)
+        sr = scale_row(rows, dev)                                              # natural row -> scale row
+        tiles = torch.empty((n, rows // 16, 16 + kq * 16), dtype=torch.uint8, device=dev)
+        tiles[:, :, :16] = base[:, sr].view(n, rows // 16, 16)
+        tiles[:, :, 16:] = codes[:, :, sr].view(n, kq, rows // 16, 16).permute(0, 2, 1, 3).reshape(n, rows // 16, kq * 16)
+        parts += [_codes_to_steps(r[:, coff:coff + rows * row_b].view(n, rows, row_b), kq).reshape(n, -1),
+                  tiles.reshape(n, -1)]
+        ents.append(e)
+    e = torch.cat(ents, dim=1)                                                 # [n, 76, 4] hi2-k2 entries
+    used = e != EMPTY
+    p = e & 511                                                                # scale row in the unit: 128 b + 4 i + j
+    x = (32 * (p & 3) + ((p & 127) >> 2)) | (((e >> 9) & 127) << 7) | (((e >> 16) & 255) << 14)
+    x = torch.where(used, x, torch.full_like(x, EMPTY))
+    xb = torch.stack([(x >> (8 * b)) & 0xFF for b in range(4)], dim=-1).to(torch.uint8).view(n, -1)
+    # fits: no status word set, no row with more than two entries (a lane of the kernel patches two)
+    st = r[:, HI2_STATUS:HI2_STATUS + 4 * XTILES]
+    same = ((p.unsqueeze(-1) == p.unsqueeze(-2)) & used.unsqueeze(-1) & used.unsqueeze(-2)).sum(-1)   # [n, 76, 4]
+    ok = (st == 0).all(1) & (same <= 2).all(-1).all(-1)
+    return torch.cat(parts + [xb], dim=1), used.any(-1).any(-1).to(torch.uint8), ok
+
+
 def repack(rec: torch.Tensor, chunk: int = 4):
     """hi2 records uint8 [N, HI2_REC] -> (band records uint8 [N, REC], base uint8 [N], ok bool [N]) on the same
     device. ok is False for a record whose scale codes do not fit 4 bits above its lowest one (or that has a zero
-    scale code): such a record cannot enter the band (none of the 1,136 K3.1 records looked at is one)."""
+    scale code): such a record cannot enter the band (none of the 1,136 K3.1 records looked at is one).
+    K31_REC_FMT=hi2-k2: `base` is 1 for a record with exception entries, else 0; ok is False for a record with a
+    status word set or a row with more than two exception entries (none of the checkpoint's 82,432 is one)."""
     assert rec.dtype == torch.uint8 and rec.shape[-1] == HI2_REC
+    if K2:
+        out = torch.empty((rec.shape[0], REC), dtype=torch.uint8, device=rec.device)
+        base = torch.empty(rec.shape[0], dtype=torch.uint8, device=rec.device)
+        ok = torch.empty(rec.shape[0], dtype=torch.bool, device=rec.device)
+        for a in range(0, rec.shape[0], chunk):
+            out[a:a + chunk], base[a:a + chunk], ok[a:a + chunk] = _repack_k2(rec[a:a + chunk])
+        return out, base, ok
     out = torch.empty((rec.shape[0], REC), dtype=torch.uint8, device=rec.device)
     base = torch.empty(rec.shape[0], dtype=torch.uint8, device=rec.device)
     ok = torch.empty(rec.shape[0], dtype=torch.bool, device=rec.device)
@@ -157,9 +251,12 @@ class Band:
         sizes = (ctypes.c_longlong * 12)()
         self.lib.rtxband_sizes(sizes)
         self.sizes = list(sizes)
+        assert self.sizes[0] == REC, (f"{lib_path} is built for band records of {self.sizes[0]} B, K31_REC_FMT "
+                                      f"({'hi2-k2' if K2 else 'hi2-k1'}) asks for {REC}: use librtxband{LIB_SUFFIX}.so")
         assert self.sizes[0] == REC and self.sizes[1] == 4 * (8 + MAXE + MAXE * MAXT) and self.sizes[2] == XF_BYTES
         self.store = torch.empty((slots, REC), dtype=torch.uint8, device=self.dev)
         self.sbase = torch.zeros(slots, dtype=torch.uint8, device=self.dev)     # lowest scale code of each slot
+        #                                                                         (hi2-k2: 1 = has exception entries)
         self.xf = torch.zeros(XF_BYTES, dtype=torch.uint8, device=self.dev)
         self.aq = torch.zeros(self.sizes[3], dtype=torch.uint8, device=self.dev)
         self.ypart = torch.zeros(self.sizes[4] // 4, dtype=torch.float32, device=self.dev)
@@ -184,7 +281,7 @@ class Band:
         for a in range(0, hi2.shape[0], 4):
             part = hi2[a:a + 4].to(self.dev)
             rec, base, ok = repack(part)
-            assert bool(ok.all()), "a record's scale codes do not fit the band's 4-bit code"
+            assert bool(ok.all()), "a record's scale codes do not fit the band's code"
             self.store[slot0 + a:slot0 + a + part.shape[0]] = rec
             self.sbase[slot0 + a:slot0 + a + part.shape[0]] = base
 
@@ -284,9 +381,11 @@ class Band:
 
 
 def build(src_dir: str, out: str, defines=()) -> str:
-    """Compile rtxband.cu into a shared library (needs nvcc 13+; sm_120a through -gencode)."""
+    """Compile rtxband.cu into a shared library (needs nvcc 13+; sm_120a through -gencode) for this module's record
+    format (K31_REC_FMT)."""
     import subprocess
     cmd = ["nvcc", "-O3", "-std=c++17", "-gencode", "arch=compute_120a,code=sm_120a", "-shared", "-Xcompiler",
-           "-fPIC", *[f"-D{d}" for d in defines], "-o", out, os.path.join(src_dir, "rtxband.cu")]
+           "-fPIC", *[f"-D{d}" for d in list(defines) + (["BAND_K2=1"] if K2 else [])], "-o", out,
+           os.path.join(src_dir, "rtxband.cu")]
     subprocess.run(cmd, check=True)
     return out
