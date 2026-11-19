@@ -497,7 +497,8 @@ __device__ __forceinline__ void encode_tile(const uint8_t* __restrict__ srow, in
   __syncthreads();
 }
 
-__global__ void __launch_bounds__(THREADS) extract_kernel(Dst src, uint8_t* __restrict__ out, Geo g, long long rec_bytes) {
+// (six blocks per SM, as today's extract kernel fits: the tile encoder must not cost the code blocks their slots)
+__global__ void __launch_bounds__(THREADS, 6) extract_kernel(Dst src, uint8_t* __restrict__ out, Geo g, long long rec_bytes) {
   __shared__ TileMem tm;
   const long long c13 = g.c13b, codes = g.codesb, s13 = g.s13b, s2 = g.s2b;
   const int nt13 = g.n[0] / TILE, nt = g.k2 ? nt13 + g.n[1] / TILE : 0;     // scale tiles of the record
