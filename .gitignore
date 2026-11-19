@@ -1,0 +1,14 @@
+# site configuration and local state
+config.env
+state/
+build/
+out/
+# built libraries (./build.sh)
+engine/band/*.so
+# Python and data files
+__pycache__/
+*.pyc
+*.pt
+*.npy
+*.safetensors
+*.log

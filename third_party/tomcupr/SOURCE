@@ -1,0 +1,4 @@
+Source: https://github.com/tomascupr/dgx-station-recipes (kimi-k3.1-pro/) at commit 3f25e5fff74c4428179ce49efb0f7c51822dfb18, MIT (see LICENSE, NOTICE).
+Fetched 2026-11-16. Unmodified; our runner builds on kstream.py and credits it.
+kstrip.py fetched 2026-11-16 at the same commit (3f25e5ff), unmodified; used to write the stripped checkpoint.
+recipe/ fetched 2026-11-16 at 3f25e5ff (README, RESULTS, LIMITATIONS, docs/ARCHITECTURE.md, kimi, config/, serve/): read-only reference for engine v0

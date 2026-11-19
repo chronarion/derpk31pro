@@ -1,0 +1,90 @@
+# Expert-miss policies (`K31_POLICY`)
+
+One file says what the engine does with every routed pick it cannot serve from a native HBM row, layer by layer and
+rank by rank, and can carry the global knobs (tier sizes, residency rates) that go with it. Code:
+`k31_engine/policy.py` (parser, compiler, checker), applied at bind by `hook._apply_policy`. Check a file without a
+GPU:
+
+    python3 -m k31_engine.policy /engine/profiles/policy-study.json
+
+## The treatments
+
+A pick is (layer L, rank r), r = its place among the token's 16 picks by routing weight (0 = strongest). It is served
+by the first treatment of this fixed menu that its policy allows **and** that is available for its expert:
+
+| treatment | when available | what it costs (11-18 measurements) |
+|---|---|---|
+| `hit` | the expert has a native HBM row | exact; 2.6 us per expert inside MegaMoE |
+| `band` | the expert has a record in the RTX band | 2-bit on time: 0.07-0.15 of a skip in KL; ~0 GB300 time while the RTX keeps up |
+| `stage` | the expert has a Grace bank record | 2-bit on time; ~33 us per record on the critical path (C2C) |
+| `defer` | the expert has a bank record and deferral is on | exact one layer late: 0.16-0.37 of a skip; completion kernels every layer |
+| `mean` | the layer has a mean table (`K31_CUT_MEAN`) | cut, plus weight x the expert's mean output: ~0.5 of a skip for weak picks, nothing for strong |
+| skip | always | cut |
+
+The order is fixed: band experts never have bank records (the band and the bank are disjoint), and an on-time
+treatment always beats a late one. A policy only decides which ranks may use each treatment.
+
+## The file
+
+```json
+{
+  "version": 1,
+  "env": {"K31_BAND_FEED": "0.25", "BAND_READAHEAD": "8"},
+  "policies": {
+    "cheap":     {"hit": "0-15", "band": "0-15", "stage": "0",   "mean": "0-15"},
+    "sensitive": {"hit": "0-15", "band": "0-15", "stage": "0-2", "mean": "0-15", "band_cap": 12},
+    "tail":      {"stage": "0-3", "mean": "all"}
+  },
+  "default": "cheap",
+  "layers": {"48-59": "sensitive", "72-83": "sensitive", "90-92": "tail"},
+  "overrides": {"92": {"band_cap": 16}},
+  "table": {"7": [["hit", "band", "stage", "mean"], ["hit", "band", "mean"], ...16 entries...]}
+}
+```
+
+- **Fields of a policy**: `hit`, `band`, `stage`, `defer`, `mean` take rank sets (`"0-15"`, `"0-2,5"`, `"none"`,
+  `"all"`, `[0, 1]`, an int); `band_cap` is the most distinct band experts per call (1-16; default `K31_BAND_MAXE`).
+  Defaults: `hit` and `band` all ranks, `stage`, `defer` and `mean` none.
+- **`layers`** assigns policies to model layers (`"1-11"`, `"12"`, `"1-11,48-59"`, `"*"`); unnamed layers take
+  `default`.
+- **`overrides`** change single fields of the assigned policy for some layers.
+- **`table`** (a lookup-table policy) gives a layer its 16 per-rank treatment lists directly; it wins over the rest.
+- **`env`** holds global knobs; `k31.sh up` exports each one unless it is already set (an arm's own variables win;
+  the profile's defaults fill what neither gives). Knobs that belong here: `K31_HBM`, `K31_BAND_N`, `K31_BANK`,
+  `K31_PROMOTE`, `K31_BANK_PROMOTE`, `K31_BAND_FEED`, `K31_HALFLIFE`, `K31_ACCEPTED`, `K31_CUT_MEAN`,
+  `K31_BAND_MAXE`, `BAND_READAHEAD`. Speed plumbing (dense formats, side streams, the MegaMoE fork, PDL) stays outside.
+
+`K31_POLICY` takes precedence over `K31_STRONG`, `K31_LAYER_BANDS`, `K31_RES_MAXRANK(_MAP)` and `K31_DEFER_TO` for the
+values it sets. A policy that needs a switch that is off (a `defer` range without `K31_DEFER=1`, `mean` without
+`K31_CUT_MEAN`) stops the bind with the reason.
+
+## How a file runs
+
+Every form compiles to one canonical table: `mask[layer][rank]`, a bitmask over the menu. `compile_layer` turns a
+layer's 16 masks into what the kernels take today:
+
+| kernel parameter | from the masks | v1 constraint |
+|---|---|---|
+| resident cap `resmax` (unitk) | ranks allowed `hit` | a prefix 0..n-1 |
+| `band_ok`, `band_cap` (band send, residency feed) | ranks allowed `band` | all or none |
+| `strong` (unitk staging) | ranks allowed `stage` | a prefix, at most ranks 0-3 |
+| `defer_from`, `defer_to` (deferral plan) | ranks allowed `defer` | one contiguous range; staged ranks never also defer |
+| `cut_mean` (mean tables loaded or not) | ranks allowed `mean` | all or none |
+
+Anything else is refused with the reason (tests/test_policy.py checks every case).
+
+## Lookup-table policies (next)
+
+The file format and the canonical table already hold arbitrary per-(layer, rank) tables. To run them, the kernels
+read the masks instead of the scalars: unitk takes a 16-entry `hit` / `stage` mask per layer, the band plan a `band`
+mask, cut_mean a `mean` mask, the deferral plan a `defer` mask. Nothing in a file written today changes. Natural
+extensions of the table: a routing-weight axis (bucketed weights per rank) and a per-expert axis.
+
+## Examples (`profiles/`)
+
+| file | what |
+|---|---|
+| `policy-s1.json` | bd-all-c8-s1's miss handling (rank 0 staged in layers 12-35, ranks 0-2 elsewhere) |
+| `policy-wide.json` | rank 0 staged in layers 1-47, 60-71, 84-89 (staging time per layer over the study's sensitivity) |
+| `policy-feed.json` | the score-fed band: rank 0 staged everywhere, at most 8 band experts per call, feed 0.25 |
+| `policy-study.json` | named policies by the sensitivity study's blocks (cheap / standard / sensitive / tail) |

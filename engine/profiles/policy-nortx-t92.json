@@ -1,0 +1,46 @@
+{
+ "note": "Staging table without the RTX PRO 6000 for about 92 tok/s: the staged ranks of each layer are chosen by KL cost per microsecond of staging time (ranks 0-3 in the most sensitive layers, rank 0 in most others, none in the cheapest); no band; mean substitute on.",
+ "version": 1,
+ "env": {
+  "K31_BAND_FEED": "0"
+ },
+ "policies": {
+  "s0": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "none",
+   "mean": "0-15"
+  },
+  "s1": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "0",
+   "mean": "0-15"
+  },
+  "s2": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "0-1",
+   "mean": "0-15"
+  },
+  "s3": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "0-2",
+   "mean": "0-15"
+  },
+  "s4": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "0-3",
+   "mean": "0-15"
+  }
+ },
+ "default": "s1",
+ "layers": {
+  "12-13,21,24,28,85": "s0",
+  "8,42,45-46,62,76-77,83,91": "s2",
+  "41,47,51,61,63": "s3",
+  "1,6,11,49,52-60,72-73,81-82,92": "s4"
+ }
+}

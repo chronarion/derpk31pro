@@ -1,0 +1,52 @@
+{
+ "note": "Default staging table: no staging in the 16 least sensitive layers; rank 0 staged in most layers, ranks 0-1 in layers 74, 76-80 and 83, ranks 0-3 in 52-59 and 92; band on every rank (8 band experts per call at most), mean substitute on.",
+ "version": 1,
+ "env": {
+  "K31_BAND_FEED": "0.25",
+  "BAND_READAHEAD": "8"
+ },
+ "policies": {
+  "s0": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "none",
+   "mean": "0-15"
+  },
+  "s1": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0",
+   "mean": "0-15"
+  },
+  "s2": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-1",
+   "mean": "0-15"
+  },
+  "s3": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-2",
+   "mean": "0-15"
+  },
+  "s4": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-3",
+   "mean": "0-15"
+  }
+ },
+ "default": "s1",
+ "layers": {
+  "12-14,17,21,24-25,28-30,32-33,36-37,75,85": "s0",
+  "74,76-80,83": "s2",
+  "48-51,72-73,81-82": "s3",
+  "52-59,92": "s4"
+ }
+}

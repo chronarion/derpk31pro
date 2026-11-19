@@ -1,0 +1,25 @@
+{
+ "note": "Staging table without the RTX PRO 6000: ranks 0-3 staged in layers 1-11 and 48-92, rank 0 in 12-47; no band; mean substitute on. The GB300 stages from CPU memory what the RTX would have computed.",
+ "version": 1,
+ "env": {
+  "K31_BAND_FEED": "0"
+ },
+ "policies": {
+  "s1": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "0",
+   "mean": "0-15"
+  },
+  "s4": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "0-3",
+   "mean": "0-15"
+  }
+ },
+ "default": "s4",
+ "layers": {
+  "12-47": "s1"
+ }
+}

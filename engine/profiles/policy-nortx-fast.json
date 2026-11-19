@@ -1,0 +1,25 @@
+{
+ "note": "Faster staging table without the RTX PRO 6000: ranks 0-1 staged in layers 1-11 and 48-92, rank 0 in 12-47; no band; mean substitute on.",
+ "version": 1,
+ "env": {
+  "K31_BAND_FEED": "0"
+ },
+ "policies": {
+  "s1": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "0",
+   "mean": "0-15"
+  },
+  "s2": {
+   "hit": "0-15",
+   "band": "none",
+   "stage": "0-1",
+   "mean": "0-15"
+  }
+ },
+ "default": "s2",
+ "layers": {
+  "12-47": "s1"
+ }
+}

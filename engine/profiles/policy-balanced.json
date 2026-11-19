@@ -1,0 +1,52 @@
+{
+ "note": "Staging table at the default table's staging time (~2.1 ms per forward in simulation), staged ranks per layer chosen by the KLD cost per staged record: no staging in 12-14, 17, 21, 24, 28-30, 32-33, 36, 75 and 85; ranks 0-3 in 52-60, 72, 82 and 92; band on every rank (cap 8), mean substitute on. About 1.4% lower KLD than the default table in simulation.",
+ "version": 1,
+ "env": {
+  "K31_BAND_FEED": "0.25",
+  "BAND_READAHEAD": "8"
+ },
+ "policies": {
+  "s0": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "none",
+   "mean": "0-15"
+  },
+  "s1": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0",
+   "mean": "0-15"
+  },
+  "s2": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-1",
+   "mean": "0-15"
+  },
+  "s3": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-2",
+   "mean": "0-15"
+  },
+  "s4": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-3",
+   "mean": "0-15"
+  }
+ },
+ "default": "s1",
+ "layers": {
+  "12-14,17,21,24,28-30,32-33,36,75,85": "s0",
+  "6,41,51,63,81": "s2",
+  "1,11,49,73": "s3",
+  "52-60,72,82,92": "s4"
+ }
+}

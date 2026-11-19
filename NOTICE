@@ -1,0 +1,24 @@
+derpk31pro: notices
+
+derpk31pro's own code, scripts, profiles, maps and documentation are MIT licensed (LICENSE), copyright 2026 chronarion.
+
+It carries modified copies of, or builds on, these components; each modified file says so at its top:
+
+- engine/overlay/megamoe_k31/: two headers of DeepGEMM (https://github.com/deepseek-ai/DeepGEMM, MIT,
+  engine/overlay/megamoe_k31/LICENSE.DeepGEMM) with Derpseek's MegaMoE changes (https://github.com/chronarion/derpseek,
+  MIT), which build on the MegaMoE fork in Garner McCloud's dgx-station-recipes (MIT,
+  engine/overlay/megamoe_k31/LICENSE.ds41).
+- engine/csrc/k31i8/: the int8 decode GEMV of the Hecate overlay (chronarion, MIT) with ExLlamaV3's graph and utility
+  headers (https://github.com/turboderp-org/exllamav3, MIT, turboderp).
+- third_party/tomcupr/: kstream.py, kstrip.py and the Kimi K3.1 Pro recipe from Tomas Cupr's dgx-station-recipes
+  (https://github.com/tomascupr/dgx-station-recipes, MIT; third_party/tomcupr/LICENSE and NOTICE), unmodified. The
+  reference runner (tools/runner) builds on kstream.py; store/run_kstrip.sh uses kstrip.py.
+- third_party/moonshot-k3-ref/: Moonshot AI's Kimi K3 configuration and modeling code (https://huggingface.co/moonshotai/Kimi-K3,
+  Kimi K3 License, third_party/moonshot-k3-ref/LICENSE), unmodified; the reference runner imports it.
+
+At run time the engine uses vLLM (https://github.com/vllm-project/vllm, Apache-2.0) through its vllm/vllm-openai:kimi-k31
+image, with the DeepGEMM it vendors; neither is redistributed here. The model weights (moonshotai/Kimi-K3.1-Pro, Kimi
+K3 License) and the DSpark drafter (Inferact/Kimi-K3.1-Pro-DSpark-preview) are downloaded separately.
+
+The KLD evaluation follows brandonmusic's quantization KLD protocol (cuts, domains and metrics), rebuilt for Kimi K3.1
+in tools/runner/tools/bm_eval.py.

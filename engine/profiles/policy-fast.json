@@ -1,0 +1,52 @@
+{
+ "note": "Faster staging table: about 0.6 ms less staging per forward than the default table in simulation, for about 4.6% more KLD.",
+ "version": 1,
+ "env": {
+  "K31_BAND_FEED": "0.25",
+  "BAND_READAHEAD": "8"
+ },
+ "policies": {
+  "s0": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "none",
+   "mean": "0-15"
+  },
+  "s1": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0",
+   "mean": "0-15"
+  },
+  "s2": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-1",
+   "mean": "0-15"
+  },
+  "s3": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-2",
+   "mean": "0-15"
+  },
+  "s4": {
+   "hit": "0-15",
+   "band": "0-15",
+   "band_cap": 8,
+   "stage": "0-3",
+   "mean": "0-15"
+  }
+ },
+ "default": "s1",
+ "layers": {
+  "12-15,17,19,21-22,24-25,27-34,36-37,75,84-85,91": "s0",
+  "1,60,73,82": "s2",
+  "55,57-58": "s3",
+  "52-54,56,59,92": "s4"
+ }
+}
