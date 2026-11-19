@@ -11,7 +11,7 @@ of the model cannot sit on the GPU.
 
 derpk31pro serves the model from one DGX Station anyway, by keeping each expert where it is cheapest to use:
 
-- **GPU memory** holds about 9,700 experts in their official form: the ones the conversation uses most. Which ones
+- **GPU memory** holds about 9,400 experts in their official form: the ones the conversation uses most. Which ones
   changes as the conversation goes; experts move in from the drive in the background.
 - **The RTX PRO 6000** (the Station's second card) holds about 11,000 more experts in a compact 2-bit form and computes
   them at the same time as the GB300 computes its own.
@@ -29,10 +29,12 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 
 ## How fast and how close
 
-| profile | decode, 1 conversation | reading a prompt (8K / 16K / 32K tokens) | KLD vs the official model |
+| profile | decode, 1 conversation | reading a prompt (32K / 128K tokens) | KLD: 512 samples / long context / prompts |
 |---|---|---|---|
-| `default` (GB300 + RTX PRO 6000) | TBD tokens/s | TBD tokens/s | TBD |
-| `nortx` (GB300 alone) | TBD tokens/s | TBD tokens/s | TBD |
+| `default` (GB300 + RTX PRO 6000) | TBD tokens/s | TBD / TBD tokens/s | TBD / TBD / TBD |
+| `nortx` (GB300 alone) | TBD tokens/s | TBD / TBD tokens/s | TBD / TBD / TBD |
+
+Both profiles serve one conversation of up to 262,144 tokens (a 260,000-token prompt reads at about 2,000 tokens/s).
 
 | benchmark (lil-bench) | derpk31pro (`default`) | for comparison |
 |---|---|---|
@@ -41,13 +43,17 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 
 - **Speed:** [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) (lil-bench) 1.7.1,
   standard profile. Decode is its single-conversation cell (a chat prompt, 2,048 generated tokens); reading a prompt
-  is the prompt's length divided by the time to the first token. Sampling is the model card's: temperature 1, top-p
-  0.95, which is also the engine's default. The DSpark drafter proposes 4 tokens per step.
+  is the prompt's length divided by the time to the first token (its 32K and 128K prompts are 32,030 and 127,363
+  tokens). Sampling is the model card's: temperature 1, top-p 0.95, which is also the engine's default. The DSpark
+  drafter proposes 4 tokens per step; how many it gets right depends on the text it happens to sample, so one decode
+  run can land 4% either side of the average (TBD: the decode column is the mean of TBD runs of the same cell).
 - **Benchmarks:** lil-bench's own GPQA Diamond and tool-calling runs, with their default settings, against the
   same server. They check what KLD cannot fully see (below).
 - **KLD** (lower is closer): how far the next-token probabilities are from the official model's, measured on the
-  tokens a model generates, over 512 text samples of 11 kinds of text, each read as the engine serves it (a short
-  prompt, then one token at a time). See [Measuring KLD](#measuring-kld).
+  tokens a model generates. **512 samples:** 2,048-token samples of 11 kinds of text, each read as the engine serves
+  it (a short prompt, then one token at a time). **Long context:** 32 samples of 32,768 tokens, mostly read as a
+  prompt, the last part generated. **Prompts:** the rows of 1,024-token prompts that hold generated-style text, read
+  the way the engine reads prompts. See [Measuring KLD](#measuring-kld).
 
 ## What you need
 
@@ -60,7 +66,7 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
   (PCIe Gen5 x4, 14 GB/s rated read). A Gen4 drive (about 7 GB/s) still works, but the experts follow the
   conversation more slowly, so expect lower speed and higher KLD; we have not measured how much.
 - Docker with the NVIDIA Container Toolkit (CDI device names), and the `vllm/vllm-openai:kimi-k31` image.
-- The official checkpoint (`moonshotai/Kimi-K3.1-Pro`) and the DSpark drafter (`Inferact/Kimi-K3.1-Pro-DSpark-preview`).
+- The official checkpoint (`moonshotai/Kimi-K3.1-Pro`) and the DSpark drafter (`Inferact/Kimi-K3.1-Pro-DSpark`).
 
 ## Getting started
 
@@ -98,14 +104,17 @@ is computed depends on where that expert currently is. The default profile place
 
 | Where | Experts | Per layer | Form | How a pick of it is computed |
 |---|---:|---:|---|---|
-| GPU memory | 9,980 (12%) | 56 to 378 | Moonshot's own MXFP4 | exactly as shipped, in one MegaMoE launch with the layer's other picks |
+| GPU memory | 9,390 (11%) | 46 to 378 | Moonshot's own MXFP4 | exactly as shipped, in one MegaMoE launch with the layer's other picks |
 | RTX PRO 6000 | 10,856 (13%) | 48 to 216 | 2-bit copies | on the RTX, while the GB300 runs MegaMoE; the GB300 adds the results in the kernel that finishes the layer |
 | CPU memory | 41,661 (51%) | 200 to 640 | 2-bit copies (387 GB) | copied into one of 128 shared staging rows on the GB300 and computed in the same MegaMoE launch |
-| Nowhere in memory | 19,935 (24%) | 0 to 592 | | skipped: the expert's average output, scaled by the pick's weight, stands in for it |
+| Nowhere in memory | 20,525 (25%) | 0 to 602 | | skipped: the expert's average output, scaled by the pick's weight, stands in for it |
 
-Layers whose output matters more get more GPU memory (`engine/profiles/hbm-map-256k.json`, `band-map.json`,
-`bank-map-256k.json`). The GPU's share is sized to fill what the KV cache for 262,144 tokens, the prompt chunks and a
-safety margin leave.
+Without the RTX (`nortx`), the band's experts move to CPU memory: 9,390 in GPU memory, 45,000 in CPU memory (418 GB),
+28,042 nowhere.
+
+Layers whose output matters more get more GPU memory (`engine/profiles/hbm-map-256k-final.json`, `band-map.json`,
+`bank-map-256k.json`). The GPU's share is what is left after the KV cache for one 262,144-token conversation (16 GiB)
+and the measured peak of reading a 4,096-token prompt chunk (which does not grow with the context), plus 2 GiB.
 
 ### How experts are chosen for GPU memory
 
@@ -140,7 +149,7 @@ background, between steps, from the one model drive.
 
 Two more things make decoding fast: the dense parts of the model run in 8-bit forms chosen per layer kind (int8,
 FP8, MXFP4), and the DSpark drafter proposes 4 tokens per step that the model checks in one pass, so a step yields
-about 2.6 tokens on average.
+about 2.45 tokens on average at the model card's sampling (temperature 1, top-p 0.95).
 
 ## Policies
 
@@ -156,6 +165,7 @@ each of a token's 16 picks (strongest first), how a pick of an expert that is no
 | staged | its 2-bit copy is copied from CPU memory into a shared row on the GB300 and computed with the others | close to exact; tens of microseconds per copy, on the critical path |
 | average | the expert's average output, scaled by the pick's weight, stands in for it | about half the error of leaving it out, for weak picks |
 | left out | nothing | the whole pick's error |
+| capped (resident) | a weak pick of an expert that *is* in GPU memory gets the average instead of its row | MegaMoE reads fewer experts per step; the pick's error is the average's |
 | deferred (experimental) | computed exactly, one layer late | exact but late; not used by the included policies |
 
 Staging more picks brings the engine closer to the official model and costs time; staging fewer is faster. Because
@@ -163,20 +173,28 @@ the measurements say where a microsecond buys the most KLD, a policy can aim at 
 gets its own rule: the least sensitive layers stage nothing, the most sensitive stage a token's four strongest picks.
 Several policies are included, and we keep trying new ones:
 
-| policy | hardware | what it stages | trade (simulated, against `policy-default`) |
+| policy | hardware | what it does | trade |
 |---|---|---|---|
-| `policy-default.json` | GB300 + RTX | the strongest pick in most layers, the 2 strongest in layers 74, 76-80 and 83, the 4 strongest in 52-59 and 92, nothing in the 16 least sensitive layers | |
-| `policy-quality.json` | GB300 + RTX | more | about 0.5 ms more per forward pass, about 4.9% lower KLD |
-| `policy-balanced.json` | GB300 + RTX | as much as the default, placed by KLD per staged copy | same time, about 1.4% lower KLD |
-| `policy-fast.json` | GB300 + RTX | less | about 0.6 ms less per forward pass, about 4.6% higher KLD |
-| `policy-nortx.json` | GB300 alone | the 4 strongest picks in layers 1-11 and 48-92, the strongest in 12-47 | |
-| `policy-nortx-fast.json` | GB300 alone | the 2 strongest in layers 1-11 and 48-92, the strongest in 12-47 | faster than `policy-nortx`, higher KLD |
-| `policy-nortx-t92.json` | GB300 alone | placed by KLD per microsecond of staging, for the GB300-alone speed target | |
+| `policy-joint15.json` (**`default` profile**) | GB300 + RTX | staged ranks and resident caps chosen together for about 1.5 ms less per step: in the least sensitive layers a token's weaker picks get the average even when their expert is in GPU memory | measured: +6% steps per second, KLD screen 0.0882 against 0.0702 without caps |
+| `policy-joint12.json`, `policy-joint20.json` | GB300 + RTX | the same, for about 1.2 / 2.0 ms less | measured: joint20 +2% steps per second over joint15, KLD screen 0.1022 against 0.0882 (too far for the KLD target) |
+| `policy-caps06.json`, `policy-caps12.json` | GB300 + RTX | resident caps only, the default's staged ranks | measured: caps12's KLD screen 0.0846 against joint12's 0.0833 |
+| `policy-default.json` | GB300 + RTX | no caps; the strongest pick staged in most layers, the 2 strongest in layers 74, 76-80 and 83, the 4 strongest in 52-59 and 92, nothing in the 16 least sensitive layers | the base the others are compared with |
+| `policy-quality.json` | GB300 + RTX | more staging | simulated: about 0.5 ms more per forward pass, about 4.9% lower KLD |
+| `policy-balanced.json` | GB300 + RTX | as much staging as the default, placed by KLD per staged copy | simulated: same time, about 1.4% lower KLD |
+| `policy-fast.json` | GB300 + RTX | less staging | simulated: about 0.6 ms less per forward pass, about 4.6% higher KLD |
+| `policy-nortx-t92-allrows.json` (**`nortx` profile**) | GB300 alone | staged ranks placed by KLD per microsecond of staging: the 4 strongest picks in the most sensitive layers, the strongest in most others, none in the cheapest | |
+| `policy-nortx-joint03/06/09.json` | GB300 alone | resident caps without the RTX | measured: joint06 +2% steps per second, KLD screen 0.1005 against 0.0892 without caps |
+| `policy-nortx.json`, `policy-nortx-fast.json`, `policy-nortx-t92.json` | GB300 alone | earlier GB300-alone tables | |
 
 The RTX policies send every pick of an RTX expert to the RTX (at most 8 experts per call) and give the average to
-the picks that are not staged; the GB300-alone policies have no RTX. Choose a policy with `K31_POLICY`, or start a
-profile that sets one (`engine/k31.sh up nortx`, `nortx-fast`, `nortx-t92`). The file format is in
-`engine/POLICY.md`; the trades above are from the simulator, and measured ones will replace them.
+the picks that are not staged. Choose a policy with `K31_POLICY`, for example
+`K31_POLICY=/engine/profiles/policy-fast.json engine/k31.sh up`. The file format is in `engine/POLICY.md`.
+
+Two settings change what every policy stages. A record staged for a token's strong pick also serves that expert's
+weaker picks and its picks in the other rows of the verify block (`K31_STAGE_ALL`, on in both profiles: the same
+copies, more picks served). And `K31_STAGE_ROWS` caps the staged ranks per row of the verify block, because a later
+draft row only counts when the drafts before it were accepted (about 69%, 43%, 24% and 14% of the time for rows 1-4):
+`K31_STAGE_ROWS=4,4,2,1,1` measured +2.8% steps per second without the RTX, KLD screen 0.1006 against 0.0892.
 
 ## What made it fast, and what kept it close
 
@@ -204,6 +222,21 @@ compared only within one protocol.
 | **The staging table** | No staging in the 16 layers where a missing expert matters least; more ranks staged in the most sensitive layers. | Forward 26.12 to 25.69 ms (with a promotion-margin change in the same run). |
 | **int8 on the main chain** | The int8 GEMV from the Hecate overlay for the attention's output and query projections, the routed output's up-projection, and the drafter: a per-row int8 weight, read at 4-6 TB/s. | Forward 26.04 to 25.41 ms and the drafter 1.284 to 1.189 ms, with KLD unchanged (0.1156 / 0.1158). Later also the routed output's up-projection: forward 24.60 to 24.23 ms and KLD slightly lower (paired -0.0011). On every dense layer at once it was slower: its whole-GPU launches starve the work beside them. |
 | **Rows, band and bank sized per layer** | (In the KLD table.) More of a token's picks resident means less staging. | Forward 25.4 to 24.6 ms over the KLD screen (23.8 in the bench's part of the run); part of it is the stricter screen's more realistic rejected drafts, which need less staging. |
+| **The final DSpark drafter** | Inferact's final drafter instead of the preview. Its sliding-window layers are handed to vLLM's KV manager as full attention (`K31_DRAFT_FULL_KV`); otherwise every chat request re-read its whole prompt and the first token took 1.1 s. | 83.6 to 93.1 tokens/s on lil-bench's decode cell (4 runs each, the same engine otherwise): 2.19 to 2.44 tokens per step; first token 0.12 s. |
+| **Draft-side top-p** | The drafter's proposal is truncated by the request's own top-k / top-p before a draft is sampled (`K31_DRAFT_TOPP`); the verifier checks against the same truncated distribution, so the output distribution stays exact. | About +1% accepted tokens at top-p 0.95, for 14 us of masking per draft position. |
+| **Fused sparse-attention kernels** | The DSA layers' small decode kernels (index key insert, index query quantization, cache insert, query padding, output gate) in three launches, bit-exact (`K31_DSA_FUSED`). | 18.0 to 5.4 us per DSA layer, 24 layers. |
+| **int8 latent down-projection** | The routed experts' shared down-projection on the int8 GEMV. | +1.8% steps per second. |
+| **Resident caps** | In the least sensitive layers a token's weaker picks get the expert's average even when the expert is in GPU memory, so MegaMoE reads fewer experts per step (`policy-joint15.json`). | 38.1 to 40.4 steps per second (+6%); the KLD it costs is in [Policies](#policies). |
+
+### Reading prompts
+
+| change | what it does | what it bought |
+|---|---|---|
+| **The prompt path** | Prompts in 4,096-token chunks: every CPU-memory pick of a chunk is staged (each layer's records stream in once per chunk), the RTX gets each layer's band picks in one bulk request, and the tiers keep adapting during the prompt. | From about 230 tokens/s (512-token chunks, the decode path) to 1,400-1,650 on 8K-32K prompts. |
+| **Big-row dense kernels** | Prompt chunks through int8 and W8A16 kernels made for thousands of rows (`K31_I8_BIG_M_KERNEL`, `K31_W8A16_BIG_M`). | Together with the next row, below. |
+| **A copy-engine lane** | Each chunk's CPU-memory records are copied by the GPU's copy engines into a scratch buffer while MegaMoE runs, instead of by the stager kernel (`K31_PROMPT_CELANE`). | With the big-row kernels, on 16K prompts: 1,600 to 1,808 tokens/s (+13%), and 1,585 to 1,904 (+20%) without the RTX. |
+| **Row slices for sparse attention** | A chunk's sparse attention in slices of 2,048 rows (`K31_DSA_ROW_SLICE`), bit-identical. | No speed cost (1,816 tokens/s); a smaller peak. |
+| **GPU memory sized by the prompt's peak** | The memory peak of a 4,096-token chunk was measured per step (`K31_MEM_PEAK`); it does not grow with the context, so the resident experts fill what the KV cache, that peak and 2 GiB leave. | A 260,000-token prompt reads at about 2,000 tokens/s; 2.8 GiB stay free at the peak. |
 
 ### KLD
 
@@ -216,6 +249,7 @@ compared only within one protocol.
 | **Rows per layer** | GPU memory split between layers by how much one more resident expert lowers KLD (56 to 378 per layer instead of 105 each). | 0.1158 to 0.0973 (paired -0.0117, the largest single KLD step). |
 | **No hand-offs, weighted credit** | A band expert promoted to GPU memory frees its slot for the best expert in CPU memory, instead of handing it to the expert it replaced; each layer's adaptation speed weighted by its sensitivity. | 0.0973 to 0.0854 (paired -0.0045). |
 | **Band and CPU-memory sizes per layer** | The RTX band and the CPU-memory copies split between layers the same way, and 5,000 more CPU-memory copies. | 0.0854 to 0.0797 (paired -0.0050); predicted 512-sequence headline 0.061. |
+| **Staged experts serve every row** | A record staged for a token's strong pick also serves that expert's other picks in the verify block (`K31_STAGE_ALL`), and the band's 8 slots per call go to the experts whose rows are most likely to be accepted (`K31_BAND_PRIOR`). | 0.0752 to 0.0702 at the same speed. |
 
 Two choices raise the KLD we report on purpose: the engine learns which experts matter only from tokens the model
 accepted (+0.0072 paired against learning from every draft), and the screen accepts drafts at the drafter's real
@@ -232,6 +266,15 @@ rates (about +10%). Both make the number what a user would see.
 - **Band entries from CPU memory instead of the drive** (`K31_BAND_RING`): works (no drive reads for band entries),
   but spending the freed drive bandwidth on twice as many promotions cost 1.2 ms per forward and raised KLD. Off.
 - **int8 on every dense layer**: slower (above). **Our own router kernels**: slower than vLLM's.
+- **Copying the staged records ahead** (`K31_PRESTAGE`): the next layer's picks predicted before its attention and
+  their records copied while the attention runs. The copies left the critical path, but the attention's kernels
+  beside them slowed by as much (an int8 GEMV 18 to 88 us): 1.5% slower; with a narrower copy the attention could
+  not hide it (19% slower). Copying from CPU memory is bound by what the copying SMs can move, not by when it runs.
+- **vLLM's adaptive verification** (verify blocks sized from the drafter's confidence head) and **a sharper draft
+  temperature** (0.85): no measured gain for one conversation.
+- **The Grace CPU computing cold experts** (`K31_POOL`, `K31_LATE`): 64 us per record, too slow to finish on time.
+- **MegaMoE's inputs without vLLM's prep kernel** (`K31_MEGAMOE_NOPREP`): no measured gain.
+- **8,192-token prompt chunks**: they do not fit beside a 262,144-token KV cache.
 
 </details>
 
@@ -261,6 +304,21 @@ rates (about +10%). Both make the number what a user would see.
 Forward ms is the median time of the main CUDA graph over the run. The bench's tokens/s moves with the drafter's
 acceptance on its three prompts (2.4 to 2.7 tokens per step between runs), which is why some speed changes show in
 the forward time but not in it.
+
+From here on, speed is lil-bench's decode cell at the model card's sampling (temperature 1, top-p 0.95), the mean of
+4 runs, and steps per second beside it (steadier: the drafter's acceptance moves tokens/s by about 4% per run).
+
+| run | change | tokens/s | steps/s | rot32 KLD |
+|---|---|---|---|---|
+| XB | R3 + fused DSA kernels, staged experts serving every row, band prior (preview drafter) | 83.6 | 38.2 | 0.0702 |
+| XBT | + draft-side top-p | 84.7 | 38.1 | |
+| FX | final drafter with full-attention KV specs (instead of XBT) | 93.1 | 38.1 | |
+| FXJ15T | + resident caps (joint15), draft-side top-p | 99.8 | 40.4 | 0.0882 |
+| RF15T | + int8 latent down-projection | 101.7 | 41.0 | 0.0878 |
+| RF | release map (9,390 experts, sized by the prompt's peak), prompt kernels: the `default` profile | 103.4 | 41.1 | 0.0896 |
+| NF0T | without the RTX: the final drafter, staging table t92 for stage-all, fused DSA, int8 latent, top-p | 87.8 | 35.5 | 0.0892 |
+| NF | release map: the `nortx` profile | 86.4 | 35.6 | |
+| NRC1 | + row caps 4,4,2,1,1 | 88.3 | 36.6 | 0.1006 |
 </details>
 
 <details>
@@ -271,19 +329,25 @@ overridden when starting (`K31_X=... engine/k31.sh up`).
 
 | setting | default | what it does |
 |---|---|---|
-| `K31_HBM_MAP` | `hbm-map-256k.json` | experts kept in GPU memory per layer (9,980 in all; `hbm-map.json`: 9,660, for a 65,536-token context) |
+| `DRAFT` (config.env), `DRAFTS` | the final DSpark drafter, 4 | the drafter and its draft tokens per step |
+| `KV_BYTES`, `MAXLEN` | 16 GiB, 262,144 | KV cache size and the longest conversation (one request at full length) |
+| `K31_HBM_MAP` | `hbm-map-256k-final.json` | experts kept in GPU memory per layer (9,390 in all) |
 | `K31_BAND_N`, `K31_BAND_MAP` | 118, `band-map.json` | experts on the RTX per layer (10,856 in all); 0 turns the RTX off |
-| `K31_BANK_MAP` | `bank-map-256k.json` | 2-bit copies in CPU memory per layer (41,661; `bank-map-large.json`: 41,800 beside `hbm-map.json`; `bank-map.json`: 36,800 for hosts with less free memory) |
-| `K31_POLICY` | `policy-default.json` | which ranks may be staged in each layer; `policy-fast.json`, `policy-balanced.json`, `policy-quality.json` trade speed and KLD |
+| `K31_BANK_MAP` | `bank-map-256k.json` | 2-bit copies in CPU memory per layer (41,661; `bank-map-nortx.json`: 45,000 without the RTX; `bank-map.json`: 36,800 for hosts with less free memory) |
+| `K31_POLICY` | `policy-joint15.json` | staged ranks and resident caps per layer (see [Policies](#policies)) |
+| `K31_STAGE_ALL`, `K31_STAGE_ROWS` | on, none | a staged expert serves all of its picks; optional per-row staging caps |
+| `K31_BAND_PRIOR` | 1,0.69,0.43,0.24,0.14 | the band's slots by each verify row's chance of being accepted |
 | `K31_PROMOTE`, `K31_BANK_PROMOTE` | 0.1, 0.08 | how fast GPU memory and the CPU-memory copies follow the conversation (per layer per token) |
 | `K31_HAND_FEED`, `K31_CREDIT_WEIGHTS` | 1, `credit-weights.json` | band slots refilled from CPU memory; adaptation speed weighted per layer |
 | `K31_CUT_MEAN` | `/means/k31-expert-means.safetensors` | the average substitute for skipped picks (empty: none) |
 | `K31_DENSE_FMT` | int8 / FP8 / MXFP4 / W8A16 per layer kind | the dense layers' 8-bit forms |
-| `DRAFTS` | 4 | draft tokens per step (DSpark drafter) |
-| `KV_BYTES`, `MAXLEN` | 8 GiB, 65,536 | KV cache size and the longest conversation |
+| `K31_DSA_FUSED` | on | the sparse-attention layers' small decode kernels fused (bit-exact) |
+| `K31_DRAFT_TOPP`, `K31_DRAFT_FULL_KV` | on, on | the request's top-p applied to the drafts; the drafter's KV as full attention |
+| `K31_I8_BIG_M_KERNEL`, `K31_W8A16_BIG_M`, `K31_PROMPT_CELANE`, `K31_DSA_ROW_SLICE` | on | the prompt path's big-row kernels, copy-engine lane and row slices (runtime flags: `engine/k31_engine/flags.py`) |
 
 Other `K31_*` switches in `engine/k31_engine` (deferral, the CPU-memory ring for band entries, other dense formats,
-timing and checks) are experiments left off by default; each is described where it is read.
+pre-staging, the Grace pool, timing and checks) are experiments left off by default; each is described where it is
+read. The `nortx` profile (`engine/profiles/nortx.env`) changes the band, bank, map and policy settings above.
 </details>
 
 ## Measuring KLD
@@ -304,6 +368,11 @@ model's, over the whole vocabulary: 0 means identical. derpk31pro reports it the
   activations, run layer by layer by the reference runner (`tools/runner`).
 - **Generated rows:** the headline counts the positions where a model produces text (assistant output and plain
   text), not the positions inside system, user or tool messages, which a model reads but never writes.
+- **Long context:** 32 sequences of 32,768 tokens of the same kinds of text, read as a prompt up to their last 2,048
+  to 4,096 tokens, which are then decoded the same way; KLD over the decoded rows, and separately over the
+  generated-text rows inside the long prompt.
+- **Prompts:** the same 32 screen sequences with 1,024-token prompts, the KL computed exactly on every prompt row as
+  the prompt path reads it; we report the generated-text rows (`kld_generated_prompt_rows_exact`).
 
 **How far to trust it.** We adapted brandonmusic's protocol to this engine, and we have doubts about how accurately it
 measures what derpk31pro changes. KLD can only see the experts that the evaluation text routes to. The engine's
@@ -326,7 +395,9 @@ SUBSET=rot32 HMODE=decode PROMPT=64 KLREF=/kl/ref-w4a8-rot32.npy KLD_FAST=1 \
 ```
 
 `KLD_DATA` (default `$STATE/kld-data`) holds the evaluation set, `KLD_DIR` the reference files; results land in
-`$STATE/results`. For the full 512-sequence headline use `KLHIDDEN=/kl/hidden-512.npy` instead of `SUBSET` and `KLREF`.
+`$STATE/results`. For the full 512-sequence headline use `KLHIDDEN=/kl/hidden-512.npy` instead of `SUBSET` and `KLREF`;
+for prompt rows `PROMPT=1024`; for the long-context set `L32=1 L32_HIDDEN=/kl/l32/hidden-l32.npy
+L32_REF=/kl/l32/kld.pt` (its reference comes from the reference runner's long-sequence pass).
 </details>
 
 ## Credits
@@ -346,7 +417,8 @@ Papers behind what ships:
 
 - Speculative decoding: Leviathan, Kalman and Matias, [Fast Inference from Transformers via Speculative
   Decoding](https://arxiv.org/abs/2211.17192); Chen et al., [Accelerating Large Language Model Decoding with
-  Speculative Sampling](https://arxiv.org/abs/2302.01318).
+  Speculative Sampling](https://arxiv.org/abs/2302.01318). Verifying the drafts as a block: Sun et al., [Block
+  Verification Accelerates Speculative Decoding](https://arxiv.org/abs/2403.10444).
 - Keeping the experts in use on the GPU and the rest elsewhere: Eliseev and Mazur, [Fast Inference of
   Mixture-of-Experts Language Models with Offloading](https://arxiv.org/abs/2312.17238).
 - Computing less critical cache-miss experts at low precision: Tang et al., [HOBBIT: A Mixed Precision Expert
