@@ -1363,8 +1363,13 @@ def _bind(runner) -> None:
     if MODE == "staged":
         from .stager import Stager
         layout = json.load(open(os.path.join(HI2, "layout.json")))
-        if layout.get("format") != "hi2-k1":
-            raise RuntimeError(f"K31: {HI2} is not a hi2-k1 record store")
+        from . import recfmt
+        if recfmt.fmt(layout) not in (recfmt.K1, recfmt.K2):
+            raise RuntimeError(f"K31: {HI2} is not a hi2-k1 or hi2-k2 record store")
+        if recfmt.fmt(layout) != recfmt.K1 and (LATE or os.environ.get("K31_POOL", "0") == "1"):
+            raise RuntimeError(f"K31: the Grace pool and the late tier (K31_POOL, K31_LATE) compute hi2-k1 records in "
+                               f"place; {HI2} is {recfmt.fmt(layout)}")
+        _LOG(f"record store {HI2}: {recfmt.fmt(layout)}, {layout['record_bytes']:,} B per record")
     ck = Experts(NATIVE)
     t0, nbytes, bank_bytes = time.time(), 0, 0
     first = min(LAYERS)

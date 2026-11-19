@@ -232,9 +232,10 @@ _MOD = []
 def _module():
     if not _MOD:
         from torch.utils.cpp_extension import load_inline
-        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "10.3a")
-        _MOD.append(load_inline(name="k31_celane", cpp_sources="", cuda_sources=_SRC,
-                                extra_cuda_cflags=["-O3", "-std=c++20", "-gencode=arch=compute_103a,code=sm_103a"],
+        from .stager2 import ARCH                 # K31_CUDA_ARCH (default 103a, the GB300)
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", f"{ARCH[:-2]}.{ARCH[-2:]}")
+        _MOD.append(load_inline(name="k31_celane" + ("" if ARCH == "103a" else "_" + ARCH), cpp_sources="", cuda_sources=_SRC,
+                                extra_cuda_cflags=["-O3", "-std=c++20", f"-gencode=arch=compute_{ARCH},code=sm_{ARCH}"],
                                 verbose=False))
     return _MOD[0]
 
@@ -313,6 +314,7 @@ class Lane:
         assert 0.0 < share <= 1.0, f"K31_PROMPT_CELANE share {share} must be in (0, 1]"
         self.share, self.lanes, self.bufs, self.xblocks = share, lanes, bufs, xblocks
         self.R = int(layout["record_bytes"])
+        self.layout = layout
         self.segs = segs_of(layout)
         self.cap = take(share, UNIT)                  # most records any unit (<= 128 rows) gives the lane
         self.dev = torch.device(dev)
@@ -365,9 +367,13 @@ class Lane:
         cur = torch.cuda.current_stream(self.dev)
         for ev in evs:
             cur.wait_event(ev)
-        bases, strides = dst_of(mod)
         b = u % self.bufs
-        self.m.expand(self.scratch[b].data_ptr(), self.R, n, bases, strides, row0, self.segs, self.lut, self.xblocks)
+        from . import stager2
+        if stager2.active(self.layout, mod):          # hi2-k2 records or 6-bit scale rows: stager2's expand
+            stager2.expand(self.scratch[b].data_ptr(), self.R, n, mod, row0, self.layout, self.xblocks)
+        else:
+            bases, strides = dst_of(mod)
+            self.m.expand(self.scratch[b].data_ptr(), self.R, n, bases, strides, row0, self.segs, self.lut, self.xblocks)
         ev = torch.cuda.Event()
         ev.record(cur)
         self.free[b] = ev
@@ -450,7 +456,10 @@ _CHECKED: dict = {}
 
 def _row_bytes(mod, row: int) -> torch.Tensor:
     from .stager import _row_bytes as rb
-    return torch.cat([rb(t, row) for t in (mod.w13_weight, mod.w2_weight, mod.w13_weight_scale, mod.w2_weight_scale)])
+    from .stager2 import coded
+    c = coded(mod)                                   # 6-bit scale rows: the coded banks hold the scale bytes
+    sc = [rb(mod.w13_weight_scale, row), rb(mod.w2_weight_scale, row)] if c is None else [c[0][row], c[1][row]]
+    return torch.cat([rb(mod.w13_weight, row), rb(mod.w2_weight, row)] + sc)
 
 
 def check_rows(st, kept: torch.Tensor, p0: int, q0: int, a: int, b: int) -> int:

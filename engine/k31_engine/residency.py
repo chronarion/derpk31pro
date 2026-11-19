@@ -106,7 +106,11 @@ class Residency:
         self.merge_ok = layout is not None and all(
             os.path.exists(os.path.join(store, f"L{st.idx:02d}.lo2")) for st in self.st)
         R = layout["record_bytes"] if layout else 0
-        self.bufs = [(torch.empty(R, dtype=torch.uint8, device=dev), torch.empty(R, dtype=torch.uint8, device=dev))
+        # a lo2 record keeps the hi2-k1 layout whatever the hi2 format (recfmt.py): its own size
+        self.RL = int(layout.get("lo2_record_bytes", R)) if layout else 0
+        self.k2 = bool(layout) and layout.get("format") == "hi2-k2"
+        self.n_wb_bad = 0
+        self.bufs = [(torch.empty(R, dtype=torch.uint8, device=dev), torch.empty(self.RL, dtype=torch.uint8, device=dev))
                      for _ in range(MAX_FLIGHT)] if self.merge_ok else []
         self.buf_ev = [None] * MAX_FLIGHT
         self.free = list(range(MAX_FLIGHT))
@@ -273,15 +277,15 @@ class Residency:
             loc.fds = {}
         s = loc.stream
         if self.merge_ok:
-            R = self.layout["record_bytes"]
+            R, RL = self.layout["record_bytes"], self.RL
             if not hasattr(loc, "lo"):
-                loc.lo = torch.empty(R, dtype=torch.uint8, pin_memory=True)
+                loc.lo = torch.empty(RL, dtype=torch.uint8, pin_memory=True)
                 loc.hi = torch.empty(R, dtype=torch.uint8, pin_memory=True)
             ev_free = self.buf_ev[buf]
             if ev_free is not None:
                 ev_free.synchronize()                    # the previous merge from this buffer pair has run
             d_hi, d_lo = self.bufs[buf]
-            nbytes = self._pread(loc, os.path.join(self.store, f"L{st.idx:02d}.lo2"), loc.lo, e * R)
+            nbytes = self._pread(loc, os.path.join(self.store, f"L{st.idx:02d}.lo2"), loc.lo, e * RL)
             with torch.cuda.stream(s):
                 d_lo.copy_(loc.lo, non_blocking=True)
                 if slot >= 0:                            # the slot is held (bank_ref) until this promotion lands
@@ -483,7 +487,9 @@ class Residency:
                 keep.append((j, v, slot, ev_w, wb))
                 continue
             self.bank_busy[j, slot] = False
-            if self.resident[j, v] or self.bank_slot[j, v] >= 0:   # promoted again meanwhile, or already banked
+            if self.k2 and self._wb_unfit(j, slot):                # a row the record format cannot hold: no record
+                self.bank_owner[j, slot] = -1
+            elif self.resident[j, v] or self.bank_slot[j, v] >= 0:   # promoted again meanwhile, or already banked
                 self.bank_owner[j, slot] = -1                      # (the slot stays free for a refill)
             else:
                 self.bank_slot[j, v] = slot
@@ -650,6 +656,21 @@ class Residency:
             n += k
         self.n_rewarm = getattr(self, "n_rewarm", 0) + 1
         return n
+
+    def _wb_unfit(self, j: int, slot: int) -> bool:
+        """hi2-k2: True if the record just written back into bank slot `slot` has a status word set (a tile with more
+        exceptions than it holds: recfmt.py; none of the checkpoint's experts is such a row). The slot then stays empty."""
+        if not hasattr(self, "_wb_np"):
+            from . import recfmt
+            g = recfmt.geom(self.layout)
+            self._wb_np = ([st.bank_cpu.numpy() for st in self.st], g["status"], g["status"] + 4 * g["status_words"])
+        banks, a, b = self._wb_np
+        if not banks[j][slot, a:b].any():
+            return False
+        self.n_wb_bad += 1
+        if self.n_wb_bad <= 3:
+            _LOG(f"residency: layer {self.st[j].idx}: an evicted row does not fit a hi2-k2 record; no record written back")
+        return True
 
     def _wb_slot(self, j: int, v: int) -> int:
         """A bank slot for an evicted expert's record when its promoted replacement freed none: an empty slot, else the

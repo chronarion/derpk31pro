@@ -302,9 +302,10 @@ _MOD = []
 def _module():
     if not _MOD:
         from torch.utils.cpp_extension import load_inline
-        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "10.3a")
-        _MOD.append(load_inline(name="k31_stager", cpp_sources="", cuda_sources=_SRC % dict(CHUNK=CHUNK, STAGES=STAGES, SLOTS=SLOTS),
-                                extra_cuda_cflags=["-O3", "-std=c++20", "-gencode=arch=compute_103a,code=sm_103a"],
+        from .stager2 import ARCH                 # K31_CUDA_ARCH (default 103a, the GB300)
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", f"{ARCH[:-2]}.{ARCH[-2:]}")
+        _MOD.append(load_inline(name="k31_stager" + ("" if ARCH == "103a" else "_" + ARCH), cpp_sources="", cuda_sources=_SRC % dict(CHUNK=CHUNK, STAGES=STAGES, SLOTS=SLOTS),
+                                extra_cuda_cflags=["-O3", "-std=c++20", f"-gencode=arch=compute_{ARCH},code=sm_{ARCH}"],
                                 verbose=False))
     return _MOD[0]
 
@@ -317,6 +318,13 @@ def _lut16(t: torch.Tensor, device) -> torch.Tensor:
 
 class Stager:
     """Per layer: the destination slot rows (rows first..first+SLOTS-1 of the module's four kernel tensors)."""
+
+    def __new__(cls, mod, first_slot: int, layout: dict, sms: int = 24):
+        if cls is Stager:                        # hi2-k2 records or 6-bit scale rows: stager2.py's kernels, same call
+            from . import stager2
+            if stager2.active(layout, mod):
+                return stager2.Stager2(mod, first_slot, layout, sms)
+        return object.__new__(cls)
 
     def __init__(self, mod, first_slot: int, layout: dict, sms: int = 24):
         self.m = _module()
@@ -344,6 +352,12 @@ class RingStager(Stager):
     """Stage 1 ring: per layer, the shared deferral rows (first_slot..) and the layer's ring rows (ring_base..) of the
     same module tensors; one read per record, written to both (or only to the ring row when the layer does not
     compute late)."""
+
+    def __new__(cls, mod, first_slot: int, ring_base: int, layout: dict, sms: int = 24):
+        from . import stager2
+        if stager2.active(layout, mod):
+            return stager2.RingStager2(mod, first_slot, ring_base, layout, sms)
+        return object.__new__(cls)
 
     def __init__(self, mod, first_slot: int, ring_base: int, layout: dict, sms: int = 24):
         super().__init__(mod, first_slot, layout, sms)
@@ -384,6 +398,9 @@ def _row_bases(mod, row: int) -> list:
 def merge(hi_ptr: int, lo_ptr: int, mod, row: int, layout: dict, blocks: int = 32) -> None:
     """Rebuild expert row `row` of the module's four kernel tensors from its hi2 and lo2 records (device-visible
     addresses; host memory is fine), on the current stream."""
+    from . import stager2
+    if stager2.active(layout, mod):
+        return stager2.merge(hi_ptr, lo_ptr, mod, row, layout, blocks)
     bases = _row_bases(mod, row)
     nb = layout["native_bytes"]
     _module().merge(hi_ptr, lo_ptr, bases, [nb["w13"] // 2, nb["w2"] // 2, nb["w13s"], nb["w2s"]], blocks)
@@ -397,6 +414,9 @@ def _row_bytes(t: torch.Tensor, row: int) -> torch.Tensor:
 
 def extract_hi2(mod, row: int, layout: dict, out: torch.Tensor, blocks: int = 152) -> None:
     """extract_record(.., low=False) as one kernel (the inverse of merge for the hi2 half): ~27 MB of HBM traffic."""
+    from . import stager2
+    if stager2.active(layout, mod):
+        return stager2.extract_hi2(mod, row, layout, out, blocks)
     bases = _row_bases(mod, row)
     nb = layout["native_bytes"]
     _module().extract(out.data_ptr(), bases, [nb["w13"] // 2, nb["w2"] // 2, nb["w13s"], nb["w2s"]], blocks)
@@ -407,6 +427,9 @@ def extract_record(mod, row: int, layout: dict, out: torch.Tensor, low: bool = F
     tensors -> its hi2 record (the top two bits of every nibble, scale bytes lowered by one) or with `low` its lo2
     record (the bottom two bits, scale bytes as they are), written into out[:record_bytes] on the current stream.
     Used when a promotion evicts a native row: the evicted expert's 2-bit record goes back to the Grace bank."""
+    from . import stager2
+    if stager2.active(layout, mod):
+        return stager2.extract_record(mod, row, layout, out, low)
     codes = torch.cat((_row_bytes(mod.w13_weight, row), _row_bytes(mod.w2_weight, row)))
     if low:
         lo, hi = codes & 0x03, (codes >> 4) & 0x03

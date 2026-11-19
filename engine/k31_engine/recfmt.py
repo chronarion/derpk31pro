@@ -16,12 +16,13 @@ hi2-k2 scale section, after the code bytes: for w13 then w2, the tensor's scale 
 consecutive rows (12 units for w13, 7 for w2). A unit is self-contained (a staging kernel decodes it from one bulk
 copy):
     [UNIT_ROWS base bytes]            base of scale row 512 u + r
-    [EXC x uint32 exception entries]  row in unit | K block << 9 | stored byte << 16; unused entries are 0xFFFFFFFF;
-                                      sorted by (row, K block)
+    [EXC x uint32 exception entries]  row in unit | K block << 9 | stored byte << 16; unused entries are 0xFFFFFFFF.
+                                      Each tile of TILE_ROWS (128) rows owns EXC_TILE (4) of them, entries
+                                      [4 g, 4 g + 4) for rows 128 g .. 128 g + 127, sorted by (row, K block)
     [KQ x UNIT_ROWS code bytes]       byte (kq, r): the four K blocks 4 kq .. 4 kq + 3 of row r, block j in bits
                                       2 j .. 2 j + 1: stored byte = base + code (an exception's code is 0)
-then STATUS_WORDS uint32 (one per unit: 0, or the number of exceptions the unit could not hold: such a record is not
-representable and must not be used), then zeros up to a multiple of 4096.
+then one uint32 status word per tile (0, or the number of exceptions the tile could not hold: such a record is not
+representable and must not be used), then zeros up to a multiple of 4096. (The checkpoint's worst tile has 2.)
 
 The encoder is canonical (the device encoder in stager2.py writes the same bytes): a row's base is its lowest byte
 if the row spans at most 4 values, else the lowest s in [min, max - 3] whose window [s, s + 3] holds the most bytes.
@@ -30,7 +31,9 @@ import torch
 
 K1, K2 = "hi2-k1", "hi2-k2"
 UNIT_ROWS = 512
-EXC = 8                       # exception entries per unit
+TILE_ROWS = 128               # a unit's exception entries are owned by its tiles (one warp encodes a tile)
+EXC_TILE = 4                  # exception entries per tile
+EXC = EXC_TILE * (UNIT_ROWS // TILE_ROWS)      # per unit
 EMPTY = 0xFFFFFFFF
 BLOCK = 4096                  # records are whole 4 KiB blocks (the k2 store can share the code blocks of a k1 store)
 
@@ -54,8 +57,8 @@ def geom(layout: dict) -> dict:
         g["units" + t] = n // UNIT_ROWS
         g["unit" + t] = UNIT_ROWS + 4 * EXC + kq * UNIT_ROWS
         g["p" + t] = g["units" + t] * g["unit" + t]
-    g["status"] = g["codes"] + g["p13"] + g["p2"]    # offset of the status words
-    g["status_words"] = g["units13"] + g["units2"]
+    g["status"] = g["codes"] + g["p13"] + g["p2"]    # offset of the status words (one per tile)
+    g["status_words"] = (g["n13"] + g["n2"]) // TILE_ROWS
     g["k2_bytes"] = (g["status"] + 4 * g["status_words"] + BLOCK - 1) // BLOCK * BLOCK
     return g
 
@@ -77,7 +80,7 @@ def layout_k2(layout_k1: dict) -> dict:
         "format": K2, "record_bytes": g["k2_bytes"], "codes_bytes": g["codes"],
         "scale_bytes": g["p13"] + g["p2"], "lo2_record_bytes": g["k1_bytes"],
         "scales": {"code": "row base + 2-bit offset, exact exceptions", "unit_rows": UNIT_ROWS,
-                   "exceptions_per_unit": EXC,
+                   "tile_rows": TILE_ROWS, "exceptions_per_tile": EXC_TILE,
                    "w13": {"rows": g["n13"], "k_groups": g["kq13"], "units": g["units13"], "unit_bytes": g["unit13"]},
                    "w2": {"rows": g["n2"], "k_groups": g["kq2"], "units": g["units2"], "unit_bytes": g["unit2"]},
                    "status_offset": g["status"], "status_words": g["status_words"]},
@@ -99,7 +102,7 @@ def _best_base(row: torch.Tensor) -> int:
 
 def pack_scales(sf: torch.Tensor, n_rows: int, kq: int):
     """One kernel scale tensor of n records, k1 bytes uint8 [n, kq * n_rows * 4] (memory order [kq][row][4]) ->
-    (packed uint8 [n, units * unit_bytes], overflow int32 [n, units]: exceptions a unit could not hold)."""
+    (packed uint8 [n, units * unit_bytes], overflow int32 [n, tiles]: exceptions a tile could not hold)."""
     n = sf.shape[0]
     dev = sf.device
     units = n_rows // UNIT_ROWS
@@ -112,17 +115,18 @@ def pack_scales(sf: torch.Tensor, n_rows: int, kq: int):
     bad = (off < 0) | (off > 3)
     code = torch.where(bad, torch.zeros_like(off), off).view(n, n_rows, kq, 4)
     cb = (code[..., 0] | (code[..., 1] << 2) | (code[..., 2] << 4) | (code[..., 3] << 6)).to(torch.uint8)   # [n, row, kq]
-    exc = torch.full((n, units, EXC), EMPTY, dtype=torch.int64, device=dev)
-    over = torch.zeros((n, units), dtype=torch.int32, device=dev)
+    tiles = n_rows // TILE_ROWS
+    exc = torch.full((n, tiles, EXC_TILE), EMPTY, dtype=torch.int64, device=dev)
+    over = torch.zeros((n, tiles), dtype=torch.int32, device=dev)
     count = {}
     for i, r, k in bad.nonzero().tolist():                          # sorted by (record, row, K block)
-        u = r // UNIT_ROWS
-        j = count.get((i, u), 0)
-        count[(i, u)] = j + 1
-        if j < EXC:
-            exc[i, u, j] = (r % UNIT_ROWS) | (k << 9) | (int(v[i, r, k]) << 16)
+        t = r // TILE_ROWS
+        j = count.get((i, t), 0)
+        count[(i, t)] = j + 1
+        if j < EXC_TILE:
+            exc[i, t, j] = (r % UNIT_ROWS) | (k << 9) | (int(v[i, r, k]) << 16)
         else:
-            over[i, u] += 1
+            over[i, t] += 1
     ub = UNIT_ROWS + 4 * EXC + kq * UNIT_ROWS
     out = torch.empty((n, units, ub), dtype=torch.uint8, device=dev)
     out[:, :, :UNIT_ROWS] = base.to(torch.uint8).view(n, units, UNIT_ROWS)
@@ -149,13 +153,14 @@ def unpack_scales(p: torch.Tensor, n_rows: int, kq: int) -> torch.Tensor:
     for i, u, j in (e != EMPTY).nonzero().tolist():
         w = int(e[i, u, j])
         r, k, val = u * UNIT_ROWS + (w & 511), (w >> 9) & 127, (w >> 16) & 255
+        assert (w & 511) // TILE_ROWS == j // EXC_TILE, "an exception entry outside its tile's slots"
         v[i, r, k // 4, k % 4] = val
     return v.permute(0, 2, 1, 3).reshape(n, kq * n_rows * 4)
 
 
 def k1_to_k2(rec: torch.Tensor, layout: dict):
     """hi2-k1 records uint8 [n, >= codes + scales] -> (hi2-k2 records uint8 [n, record bytes], ok bool [n]). ok is
-    False for a record with a unit of more than EXC exceptions (its status words say how many did not fit)."""
+    False for a record with a tile of more than EXC_TILE exceptions (its status words say how many did not fit)."""
     g = geom(layout)
     n = rec.shape[0]
     out = torch.zeros((n, g["k2_bytes"]), dtype=torch.uint8, device=rec.device)
@@ -185,7 +190,7 @@ def k2_to_k1(rec: torch.Tensor, layout: dict) -> torch.Tensor:
 
 
 def status(rec: torch.Tensor, layout: dict) -> torch.Tensor:
-    """int64 [n]: exceptions that did not fit, summed over a k2 record's units (0 = the record is exact)."""
+    """int64 [n]: exceptions that did not fit, summed over a k2 record's tiles (0 = the record is exact)."""
     g = geom(layout)
     w = rec[:, g["status"]:g["status"] + 4 * g["status_words"]].reshape(rec.shape[0], -1, 4).to(torch.int64)
     return (w[..., 0] | (w[..., 1] << 8) | (w[..., 2] << 16) | (w[..., 3] << 24)).sum(1)

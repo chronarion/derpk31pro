@@ -25,9 +25,9 @@ def check(name, cond):
 
 
 g = recfmt.geom(LAYOUT_K1)
-check("sizes: k1 9,289,728 B, k2 8,527,872 B, packed scales 268,384 B, units 12 x 14,880 + 7 x 12,832",
-      (g["k1_bytes"], g["k2_bytes"], g["p13"] + g["p2"], g["units13"], g["unit13"], g["units2"], g["unit2"]) ==
-      (9289728, 8527872, 268384, 12, 14880, 7, 12832) and LAYOUT_K2["record_bytes"] == 8527872
+check("sizes: k1 9,289,728 B, k2 8,527,872 B, packed scales 268,992 B, units 12 x 14,912 + 7 x 12,864, 76 tiles",
+      (g["k1_bytes"], g["k2_bytes"], g["p13"] + g["p2"], g["units13"], g["unit13"], g["units2"], g["unit2"],
+       g["status_words"]) == (9289728, 8527872, 268992, 12, 14912, 7, 12864, 76) and LAYOUT_K2["record_bytes"] == 8527872
       and LAYOUT_K2["lo2_record_bytes"] == 9289728 and recfmt.geom(LAYOUT_K2) == g)
 
 # 1. synthetic
@@ -64,12 +64,20 @@ e = recfmt.exceptions(k2, LAYOUT_K2)[0]
 check("{120 x 13, 121 x 60, 122 x 10, 123 x 11, 124 x 2}: base 120 (94 in the window), exceptions at K blocks 94, 95",
       e == [("w2", 700, 94, 124), ("w2", 700, 95, 124)] and int(k2[0, u2 + 700 % 512]) == 120
       and torch.equal(recfmt.k2_to_k1(k2, LAYOUT_K2), rec))
-# nine exceptions in one unit: the ninth does not fit, the status word says so
+# four exceptions in one tile fit, in the tile's own entries; a fifth does not, and the status word says so
 sf13 = rec[0, g["codes"]:g["codes"] + g["s13"]].view(28, 6144, 4)
-for r in range(9):
-    sf13[5, 1024 + 3 * r, 2] = sf13[:, 1024 + 3 * r, :].min() + 6
+for r in range(4):
+    sf13[5, 1024 + 128 + 3 * r, 2] = sf13[:, 1024 + 128 + 3 * r, :].min() + 6
 k2, okr = recfmt.k1_to_k2(rec, LAYOUT_K2)
-check("nine exceptions in one unit of 512 rows: ok = False, status 1 (the record is refused, not written wrong)",
+ua = g["codes"] + 2 * g["unit13"] + 512
+ent = k2[0, ua:ua + 64].view(16, 4).to(torch.int64)
+ent = (ent[:, 0] | (ent[:, 1] << 8) | (ent[:, 2] << 16) | (ent[:, 3] << 24)).tolist()
+check("four exceptions in rows 1152..1279 (unit 2, tile 1): entries 4..7 of the unit, the others unused, exact",
+      bool(okr[0]) and all(x == recfmt.EMPTY for x in ent[:4] + ent[8:]) and [x & 511 for x in ent[4:8]] == [128, 131, 134, 137]
+      and torch.equal(recfmt.k2_to_k1(k2, LAYOUT_K2), rec))
+sf13[5, 1024 + 128 + 100, 2] = sf13[:, 1024 + 128 + 100, :].min() + 6
+k2, okr = recfmt.k1_to_k2(rec, LAYOUT_K2)
+check("five exceptions in one tile of 128 rows: ok = False, status 1 (the record is refused, not written wrong)",
       not bool(okr[0]) and int(recfmt.status(k2, LAYOUT_K2)[0]) == 1)
 # a zero byte (native 0 or 1) is an exception like any other
 rec = tl.synth_records(1, seed=4)
