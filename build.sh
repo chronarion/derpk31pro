@@ -5,8 +5,9 @@
 #                   librtxband_fused_v4.so (the fused band send / finish), libk31route.so, k31i8.so (int8 GEMV),
 #                   libcpustage.so (the Grace pool, g++; build/pool/ gets its self-test and benches),
 #                   liblate.so (the late tier's send / landing, K31_LATE)
-#   build/sidecar/  the RTX band sidecar's libraries: librtxband.so, librtxband_svc.so (RTX PRO 6000, sm_120a),
-#                   libbandhost.so, librtxband_gb300.so
+#   build/sidecar/  the RTX band sidecar's libraries: librtxband.so, librtxband_svc.so (RTX PRO 6000, sm_120a; and
+#                   librtxband_k2.so, librtxband_svc_k2.so for hi2-k2 record stores), libbandhost.so,
+#                   librtxband_gb300.so
 # usage: ./build.sh            (IMG overrides the image)
 set -eu
 REPO=$(cd "$(dirname "$0")" && pwd)
