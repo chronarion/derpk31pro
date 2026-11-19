@@ -8,6 +8,8 @@ It carries modified copies of, or builds on, these components; each modified fil
   engine/overlay/megamoe_k31/LICENSE.DeepGEMM) with Derpseek's MegaMoE changes (https://github.com/chronarion/derpseek,
   MIT), which build on the MegaMoE fork in Garner McCloud's dgx-station-recipes (MIT,
   engine/overlay/megamoe_k31/LICENSE.ds41).
+- engine/k31_engine/sf6.py: the 6-bit scale coder of Derpseek (https://github.com/chronarion/derpseek, MIT), unchanged
+  in what it computes; the fork's kernel side of it is part of the headers above.
 - engine/k31_engine/csrc/noprep_plan.cu: the scoring and routing-weight steps of vLLM's grouped top-k kernel
   (csrc/moe/grouped_topk_kernels.cu at commit 266e88c05, https://github.com/vllm-project/vllm, Apache-2.0, there adapted
   from TensorRT-LLM and FlashInfer; engine/k31_engine/csrc/LICENSE.vllm), copied so that the plan kernel's routing
