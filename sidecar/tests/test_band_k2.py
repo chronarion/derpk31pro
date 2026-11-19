@@ -100,7 +100,7 @@ def role(a):
     torch.cuda.synchronize()
     repack_same = bool(torch.equal(band.store, store_t)) and bool(torch.equal(band.sbase, base_t)) and all(fit_dev)
     out = {"names": names, "repack_same": repack_same, "nexc": nexc, "flags": base_t.cpu().tolist(), "y": [], "aq": [],
-           "unfit": None}
+           "ybulk": [], "unfit": None}
     # ---- the same seeded work lists in both processes
     g = torch.Generator().manual_seed(1234)
     for c in range(a.calls):
@@ -124,6 +124,22 @@ def role(a):
         assert not band.error()
         out["y"].append(y.cpu().view(torch.int32).numpy().copy())
         out["aq"].append(aq[:len(slots) * rb.KQ2 * rb.BREC].cpu().numpy().copy())
+    # bulk units (prompt chunks, band/bulk.py): 16 units in one launch, each its own 8 rows in and out
+    import ctypes
+    V = ctypes.c_void_p
+    band.lib.rtxband_run_bulk.argtypes = [ctypes.c_void_p, V, ctypes.c_int, V, V, V]
+    for c in range(2):
+        slots = [(c * 5 + i) % n for i in range(rb.MAXE)]
+        w = torch.rand((rb.MAXE, rb.MAXT), generator=g) + 0.05
+        xf = torch.stack([rb.pack_x(*rb.mxfp8_encode(torch.randn((rb.MAXT, rb.H), generator=g).to(dev), 0)[:2])
+                          for _ in range(rb.MAXE)]).contiguous()
+        call = band.make_call(slots, w, rb.MAXT, flags=rb.FLAGS_MEGAMOE | 1024, sf_min=rb.SF_MIN_MEGAMOE)
+        yu = torch.zeros((rb.MAXE * rb.MAXT, rb.H), dtype=torch.float32, device=dev)
+        rc = band.lib.rtxband_run_bulk(ctypes.byref(band.c), call.data_ptr(), 1, xf.data_ptr(), yu.data_ptr(),
+                                       torch.cuda.current_stream(dev).cuda_stream)
+        torch.cuda.synchronize()
+        assert rc == 0 and not band.error()
+        out["ybulk"].append(yu.cpu().view(torch.int32).numpy().copy())
     if k2:                                                 # what the band's format cannot hold
         bad = tl.synth_records(2, seed=23)
         b2 = bad[:, o2:o2 + G["s2"]].view(2, 24, 3584, 4)
@@ -179,6 +195,9 @@ def main():
     same_a = sum(int(np.array_equal(u, v)) for u, v in zip(d1["aq"], d2["aq"]))
     check(f"{len(d1['y'])} calls (1-8 rows, 1-16 experts, MegaMoE and runner arithmetic): output rows bit-identical in "
           f"{same_y}, intermediate activations in {same_a}", same_y == len(d1["y"]) == len(d2["y"]) and same_a == same_y)
+    same_b = sum(int(np.array_equal(u, v)) for u, v in zip(d1["ybulk"], d2["ybulk"]))
+    check(f"bulk units (16 units of 8 rows per launch, the prompt path's form): unit rows bit-identical in {same_b} of "
+          f"{len(d1['ybulk'])} launches, non-zero", same_b == len(d1["ybulk"]) == 2 and all(int(np.count_nonzero(v)) > 0 for v in d2["ybulk"]))
     u = d2["unfit"]
     check(f"hi2-k2: a row with three exception entries and a record with a status word set do not fit the band "
           f"(torch {u['torch']}, device {u['device']}; the second is not a valid hi2-k2 record either: {u['k2_fits']})",
