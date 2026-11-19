@@ -97,6 +97,12 @@ up() {
   # PREFIX_UNIT: prefix-cache hits land on multiples of this many tokens (vLLM --prefix-match-unit); without it they land
   # on the hybrid KV blocks (16,384 tokens here), so a repeated long prompt recomputes up to 16K tokens
   PREFIX_UNIT=${PREFIX_UNIT-64}
+  # GEN_DEFAULTS: the sampling a request gets when it sets none (vLLM --override-generation-config): temperature 1.0,
+  # top-p 0.95, the model card's evaluation setting and the benchmarks' (requests may still send any value); empty =
+  # vLLM's own defaults (top-p 1.0)
+  GEN_DEFAULTS=${GEN_DEFAULTS-'{"temperature":1.0,"top_p":0.95}'}
+  GEN_ARGS=()
+  [ -n "$GEN_DEFAULTS" ] && GEN_ARGS=(--override-generation-config "$GEN_DEFAULTS")
   mkdir -p $KLD_DIR
   [ -z "${DRAFTS:-}" ] || [ -n "$DRAFT" ] || { log "DRAFTS needs DRAFT (the DSpark drafter checkpoint) in config.env"; return 1; }
   for p in $MODEL $NATIVE ${DRAFTS:+$DRAFT} $HI2_DIR ${MEANS_DIR:+$MEANS_DIR}; do   # docker would create missing paths as root
@@ -126,7 +132,7 @@ up() {
     --gpu-memory-utilization ${GPU_UTIL:-0.92} ${KV_BYTES:+--kv-cache-memory-bytes $KV_BYTES} \
     --max-model-len $MAXLEN --max-num-seqs ${MAX_SEQS:-4} --max-num-batched-tokens ${MAX_BATCHED:-2048} \
     --disable-flashinfer-autotune ${EAGER:+--enforce-eager} "${SPEC_ARGS[@]}" ${PREFIX_UNIT:+--prefix-match-unit $PREFIX_UNIT} \
-    "${HARNESS_ARGS[@]}" \
+    "${HARNESS_ARGS[@]}" "${GEN_ARGS[@]}" \
     --tool-call-parser kimi_k3 --reasoning-parser kimi_k3 --enable-auto-tool-choice \
     --host ${HOST:-127.0.0.1} --port $PORT ${SERVE_EXTRA:+"$SERVE_EXTRA_FLAG"} ${SERVE_EXTRA:+"$SERVE_EXTRA"} >/dev/null || return 1
   for i in $(seq 1 360); do
