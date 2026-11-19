@@ -1087,10 +1087,12 @@ def _bind_band(dev) -> None:
         st.band_map = torch.tensor(m[idx], dtype=torch.int32, device=dev)
         # K31_BAND_SERVED=1 (librtxband_fused_v3.so): the fused send writes which picks it serves; the cut-mean then
         # gives the mean to band picks past the cap (1.7-2.6% of picks were plain skips)
-        if (BAND_SERVED and not any(v in _FUSED_LIB for v in ("v3", "v4"))) or (TAIL1 and "v4" not in _FUSED_LIB):
-            raise RuntimeError("K31_BAND_SERVED=1 needs K31_BAND_FUSED_LIB=librtxband_fused_v3/v4.so (older builds "
+        # (v5 = v4 + the plan / hint kernel of K31_BAND_HINT)
+        if (BAND_SERVED and not any(v in _FUSED_LIB for v in ("v3", "v4", "v5"))) or \
+                (TAIL1 and not any(v in _FUSED_LIB for v in ("v4", "v5"))):
+            raise RuntimeError("K31_BAND_SERVED=1 needs K31_BAND_FUSED_LIB=librtxband_fused_v3/v4/v5.so (older builds "
                                "never write the flags: the mean would be added to picks the band serves); K31_TAIL1=1 "
-                               "needs librtxband_fused_v4.so")
+                               "needs librtxband_fused_v4/v5.so")
         st.band_served = torch.zeros(16 * 16, dtype=torch.int32, device=dev) if BAND_SERVED else None
         st.msum = torch.zeros(8, 3584, dtype=torch.float32, device=dev) if TAIL1 else None
         st.rstd = torch.zeros(16, dtype=torch.float32, device=dev) if TAIL1 else None

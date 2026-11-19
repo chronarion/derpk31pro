@@ -17,21 +17,33 @@ derpk31pro serves the model from one DGX Station anyway, by keeping each expert 
   them at the same time as the GB300 computes its own.
 - **The CPU's memory** holds about 42,000 experts in 2-bit form. When a token strongly needs one of them, the GB300
   copies it in for that step.
-- **The rest** of a token's picks are skipped and replaced by the expert's average contribution. Each layer has its
-  own rules for what may be skipped, set by how much that layer's output matters.
+- **Everything else is a trade we measure.** Not every pick matters equally: some layers barely notice when an
+  expert is approximated, others carry the error forward, and a token's strongest picks carry most of its weight.
+  derpk31pro's philosophy is to profile the impact of every shortcut, layer by layer and pick by pick, in KLD and in
+  time, and to write the result down as a policy: which picks are computed on the RTX, which are copied in from CPU
+  memory, and which get the expert's average output instead. Policies sit at different points between decode speed
+  and KLD; several are included, and you can write your own (see [Policies](#policies)).
 
 Everything is fed from one 4 TB NVMe drive. The engine runs inside vLLM's `kimi-k31` image and is built around
 MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in one launch.
 
 ## How fast and how close
 
-| profile | decode, 1 conversation | KLD vs the official model |
-|---|---|---|
-| `default` (GB300 + RTX PRO 6000) | TBD tokens/s | TBD |
-| `nortx` (GB300 alone) | TBD tokens/s | TBD |
+| profile | decode, 1 conversation | reading a prompt (8K / 16K / 32K tokens) | KLD vs the official model |
+|---|---|---|---|
+| `default` (GB300 + RTX PRO 6000) | TBD tokens/s | TBD tokens/s | TBD |
+| `nortx` (GB300 alone) | TBD tokens/s | TBD tokens/s | TBD |
 
-- **Speed:** median of 30 decode runs on chat prompts, one conversation, 4 draft tokens per step with the DSpark
-  drafter.
+| benchmark | derpk31pro (`default`) | the official model |
+|---|---|---|
+| GPQA Diamond | TBD | 93.97 (NVIDIA's evaluation of the official MXFP4 checkpoint) |
+| Tool calling (Kimi Vendor Verifier, ToolCall) | TBD | 97.2 (Moonshot's own API) |
+
+- **Speed:** [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) (lil-bench) 1.7.1,
+  standard profile. Decode is its single-conversation cell (a chat prompt, 2,048 generated tokens); reading a prompt
+  is the prompt's length divided by the time to the first token. Sampling is the model card's: temperature 1, top-p
+  0.95, which is also the engine's default. The DSpark drafter proposes 4 tokens per step.
+- **Benchmarks:** the same sampling, thinking on. They check what KLD cannot fully see (below).
 - **KLD** (lower is closer): how far the next-token probabilities are from the official model's, measured on the
   tokens a model generates, over 512 text samples of 11 kinds of text, each read as the engine serves it (a short
   prompt, then one token at a time). See [Measuring KLD](#measuring-kld).
@@ -40,7 +52,12 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 
 - A DGX Station GB300 (GB300 + Grace, 512 GB of CPU memory). The RTX PRO 6000 Blackwell is optional: the `nortx`
   profile runs on the GB300 alone, slower and less close to the official model (below).
-- One 4 TB NVMe drive for the model data (~3.1 TB: the official checkpoint, a stripped copy, and the 2-bit records).
+- One fast 4 TB NVMe drive for the model data (~3.1 TB: the official checkpoint, a stripped copy, and the 2-bit
+  records). Its read speed is part of the engine's speed: while decoding, the engine reads 9.4 to 10.2 GB/s from it
+  (about 400 experts a second moving into GPU memory, and nearly as many 2-bit copies refreshed in CPU memory), and we
+  have seen it keep the drive fully busy at 13.7 GB/s. Every number here was measured on a **WD_BLACK SN8100 4 TB**
+  (PCIe Gen5 x4, 14 GB/s rated read). A Gen4 drive (about 7 GB/s) still works, but the experts follow the
+  conversation more slowly, so expect lower speed and higher KLD; we have not measured how much.
 - Docker with the NVIDIA Container Toolkit (CDI device names), and the `vllm/vllm-openai:kimi-k31` image.
 - The official checkpoint (`moonshotai/Kimi-K3.1-Pro`) and the DSpark drafter (`Inferact/Kimi-K3.1-Pro-DSpark-preview`).
 
@@ -110,9 +127,8 @@ while a less frequently picked one whose 2-bit copy is poor, or whose output the
 cost more. Choosing the experts by measured KLD (each expert's cost in its fallback tier, per layer) rather than by
 usage should buy KLD at no speed cost, or speed at the same KLD.
 
-When decoding, a token's strongest CPU-memory picks are staged and the rest get the average; a table per layer
-(`engine/profiles/policy-default.json`) says which ranks may be staged, and the least sensitive layers stage none.
-When reading a prompt, every CPU-memory pick is staged (each layer's copies stream in once per 4,096-token chunk),
+When decoding, a policy decides which CPU-memory picks are staged and which get the average (see
+[Policies](#policies)). When reading a prompt, every CPU-memory pick is staged (each layer's copies stream in once per 4,096-token chunk),
 the RTX gets each layer's band picks in one bulk request instead of one per eight tokens, and the tiers keep adapting
 while the prompt is read, so the prompt's own rows are computed about as well as decoded ones.
 
@@ -124,6 +140,41 @@ background, between steps, from the one model drive.
 Two more things make decoding fast: the dense parts of the model run in 8-bit forms chosen per layer kind (int8,
 FP8, MXFP4), and the DSpark drafter proposes 4 tokens per step that the model checks in one pass, so a step yields
 about 2.6 tokens on average.
+
+## Policies
+
+derpk31pro does not assume which shortcuts are safe: it measures them. A sensitivity study replays real routing,
+degrades one layer's picks at a time and records what that does to KLD; profiles of the decode step record what each
+way of serving a pick costs in time. A policy turns those measurements into a table: for each of the 92 layers and
+each of a token's 16 picks (strongest first), how a pick of an expert that is not in GPU memory is served.
+
+| treatment | what happens | what it costs |
+|---|---|---|
+| RTX | computed on the RTX PRO 6000 from its 2-bit copy, while the GB300 computes the rest | close to exact; no GB300 time while the RTX keeps up |
+| staged | its 2-bit copy is copied from CPU memory into a shared row on the GB300 and computed with the others | close to exact; tens of microseconds per copy, on the critical path |
+| average | the expert's average output, scaled by the pick's weight, stands in for it | about half the error of leaving it out, for weak picks |
+| left out | nothing | the whole pick's error |
+| deferred (experimental) | computed exactly, one layer late | exact but late; not used by the included policies |
+
+Staging more picks brings the engine closer to the official model and costs time; staging fewer is faster. Because
+the measurements say where a microsecond buys the most KLD, a policy can aim at a speed or at a KLD, and every layer
+gets its own rule: the least sensitive layers stage nothing, the most sensitive stage a token's four strongest picks.
+Several policies are included, and we keep trying new ones:
+
+| policy | hardware | what it stages | trade (simulated, against `policy-default`) |
+|---|---|---|---|
+| `policy-default.json` | GB300 + RTX | the strongest pick in most layers, the 2 strongest in layers 74, 76-80 and 83, the 4 strongest in 52-59 and 92, nothing in the 16 least sensitive layers | |
+| `policy-quality.json` | GB300 + RTX | more | about 0.5 ms more per forward pass, about 4.9% lower KLD |
+| `policy-balanced.json` | GB300 + RTX | as much as the default, placed by KLD per staged copy | same time, about 1.4% lower KLD |
+| `policy-fast.json` | GB300 + RTX | less | about 0.6 ms less per forward pass, about 4.6% higher KLD |
+| `policy-nortx.json` | GB300 alone | the 4 strongest picks in layers 1-11 and 48-92, the strongest in 12-47 | |
+| `policy-nortx-fast.json` | GB300 alone | the 2 strongest in layers 1-11 and 48-92, the strongest in 12-47 | faster than `policy-nortx`, higher KLD |
+| `policy-nortx-t92.json` | GB300 alone | placed by KLD per microsecond of staging, for the GB300-alone speed target | |
+
+The RTX policies send every pick of an RTX expert to the RTX (at most 8 experts per call) and give the average to
+the picks that are not staged; the GB300-alone policies have no RTX. Choose a policy with `K31_POLICY`, or start a
+profile that sets one (`engine/k31.sh up nortx`, `nortx-fast`, `nortx-t92`). The file format is in
+`engine/POLICY.md`; the trades above are from the simulator, and measured ones will replace them.
 
 ## What made it fast, and what kept it close
 
@@ -251,6 +302,16 @@ model's, over the whole vocabulary: 0 means identical. derpk31pro reports it the
   activations, run layer by layer by the reference runner (`tools/runner`).
 - **Generated rows:** the headline counts the positions where a model produces text (assistant output and plain
   text), not the positions inside system, user or tool messages, which a model reads but never writes.
+
+**How far to trust it.** We adapted brandonmusic's protocol to this engine, and we have doubts about how accurately it
+measures what derpk31pro changes. KLD can only see the experts that the evaluation text routes to. The engine's
+shortcuts land hardest on the experts that are picked least often: those are the ones most often served from 2-bit
+copies, given their average or left out, and the ones whose placement rests on a usage ranking (see
+[How experts are chosen for GPU memory](#how-experts-are-chosen-for-gpu-memory)). Text the protocol does not cover may
+depend on exactly those experts: obscure Chinese is the example we worry about most, and the same goes for other rare
+languages, scripts and specialised subjects. There the engine may be further from the official model than the
+headline says. Moving the experts a conversation needs into GPU memory as it goes should limit the damage in a long
+conversation, but we have not measured that. This is one reason the task benchmarks above are reported beside KLD.
 
 <details>
 <summary>Running a KLD screen</summary>
