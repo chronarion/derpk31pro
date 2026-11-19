@@ -1183,11 +1183,16 @@ def _eager_legacy(self, st, hidden_states, topk_weights, topk_ids, shared_expert
 # ------------------------------------------------------------------------------------------------- binding
 def _write_expert(mod, r: int, t: dict, dev) -> None:
     """One expert's six checkpoint tensors into kernel row r, as vLLM's weight_loader would write them."""
+    six = getattr(mod, "_k31_sf6", None) is not None     # K31_SF6: the row's scales are 6-bit codes (sf6rows.py)
     for shard in ("w1", "w2", "w3"):
         packed, scale = t[shard]
         pre = "w2" if shard == "w2" else "w13"
         mod._load_weight(getattr(mod, f"{pre}_weight").data[r], packed.to(dev), shard, False)
-        mod._load_weight(getattr(mod, f"{pre}_weight_scale").data[r], scale.to(dev), shard, True)
+        if not six:
+            mod._load_weight(getattr(mod, f"{pre}_weight_scale").data[r], scale.to(dev), shard, True)
+    if six:
+        from . import sf6rows
+        sf6rows.write_scales(mod, r, t["w1"][1], t["w3"][1], t["w2"][1], dev)
 
 
 def _cut_mean_table(idx: int) -> torch.Tensor:
@@ -1360,6 +1365,15 @@ def _bind(runner) -> None:
         if not BAND_N:
             _LOG("K31_BAND_PRIOR: no RTX band in this profile (K31_BAND_N=0): no effect")
     layout = None
+    SF6 = os.environ.get("K31_SF6", "0") == "1"
+    shared6 = None
+    if SF6:
+        if MODE != "staged":
+            raise RuntimeError("K31_SF6=1 needs K31_MODE=staged")
+        from . import sf6rows
+        from vllm.utils.deep_gemm import _import_deep_gemm
+        sf6rows.check_fork(os.path.dirname(os.path.abspath(_import_deep_gemm().__file__)))
+        _LOG("K31_SF6: expert rows with 6-bit scale codes (17,289,216 B per row instead of 17,547,264)")
     if MODE == "staged":
         from .stager import Stager
         layout = json.load(open(os.path.join(HI2, "layout.json")))
@@ -1389,11 +1403,19 @@ def _bind(runner) -> None:
         if MODE == "staged":                 # the four kernel tensors as [shared slots | own resident rows] ranges
             from .vmm import SharedSlots
             names = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
+            if SF6:                          # K31_SF6: the scale tensors are 6-bit coded banks (sf6rows.py)
+                from . import sf6rows
+                names = ("w13_weight", "w2_weight")
             with torch.cuda.device(dev):
                 if shared is None:
                     shared = {n: SharedSlots(getattr(st.mod, n), SHARED) for n in names}
+                    if SF6:
+                        shared6 = [SharedSlots(sf6rows.prototype(getattr(st.mod, n)), SHARED)
+                                   for n in ("w13_weight_scale", "w2_weight_scale")]
                 for n in names:
                     setattr(st.mod, n, torch.nn.Parameter(shared[n].tensor(st.S), requires_grad=False))
+                if SF6:
+                    sf6rows.attach(st.mod, shared6[0].tensor(st.S), shared6[1].tensor(st.S))
             st.mod.num_experts = st.mod.num_local_experts = st.slots + st.S
             st.mod.experts_end_idx = st.mod.experts_start_idx + st.slots + st.S
             torch.cuda.empty_cache()
@@ -1410,6 +1432,12 @@ def _bind(runner) -> None:
         st.arange = torch.arange(max(SLOTS, TOPK), dtype=torch.long, device=dev)
         if MODE == "staged":
             bank_bytes += _load_bank(st, layout)
+            if SF6 and idx == first and st.bank:     # a 6-bit row holds scale bytes E0 .. E0 + 63: look at a few records
+                from . import recfmt, sf6
+                sc = recfmt.scale_view(st.bank_cpu[:min(4, len(st.bank))].clone(), layout)
+                if int(sc.min()) < sf6.E0 or int(sc.max()) > sf6.E0 + 63:
+                    raise RuntimeError(f"K31_SF6=1: records with scale bytes {int(sc.min())}..{int(sc.max())} do not "
+                                       f"fit 6-bit rows ({sf6.E0}..{sf6.E0 + 63})")
             st.stager = Stager(st.mod, st.slot_base, layout, sms=STAGER_SMS)
             if PRESTAGE:                                 # the side stream's plan outputs (prestage.fork)
                 st.pre_bufs = (torch.empty((16, TOPK), dtype=torch.int32, device=dev),
@@ -1478,7 +1506,7 @@ def _bind(runner) -> None:
     if MODE == "staged":                         # one symmetric buffer for every layer's expert count (_get_symm_buffer)
         _SYMM["emax"] = max(st.slots + st.S for st in LAYERS.values())
     _LOG(f"ACTIVE mode {MODE}: {len(LAYERS)} MoE layers, {rows} resident expert rows in HBM "
-         f"({rows * 17.55e6 / 1e9:.0f} GB)"
+         f"({rows * (17.29e6 if SF6 else 17.55e6) / 1e9:.0f} GB)"
          + (f", {SHARED} staging rows shared by all layers ({SLOTS} per call), banks {bank_bytes / 1e9:.0f} GB "
             f"pinned (strong ranks < {STRONG}), promotion {PROMOTE:g} and bank refill {BANK_PROMOTE:g} per layer-token "
             f"(half-life {HALFLIFE:g} tokens)"

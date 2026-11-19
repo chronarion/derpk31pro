@@ -82,29 +82,33 @@ class SharedSlots:
         self.g = granularity(self.di)
         self.nslots = nslots
         self.slot_bytes = nslots * self.row
-        if self.slot_bytes % self.g:
-            raise RuntimeError(f"K31 vmm: {nslots} slots of {self.row} B are not a whole number of {self.g} B granules")
-        self.slots = _create(self.slot_bytes, self.di) if nslots else None
+        # the slot region must end on a granule: rows whose slots are not whole granules (6-bit scale rows, sf6rows.py:
+        # 128 x 516,096 B = 31.5 granules) start `front` bytes into the shared mapping
+        self.front = (-self.slot_bytes) % self.g if nslots else 0
+        if self.front % 128:
+            raise RuntimeError(f"K31 vmm: {nslots} slots of {self.row} B leave rows off a 128-byte boundary")
+        self.slots = _create(self.front + self.slot_bytes, self.di) if nslots else None
 
     def tensor(self, own_rows: int) -> torch.Tensor:
         lib = _lib()
         own = -(-own_rows * self.row // self.g) * self.g
-        total = self.slot_bytes + own
+        shared = self.front + self.slot_bytes
+        total = shared + own
         va = ctypes.c_uint64()
         _ck(lib.cuMemAddressReserve(ctypes.byref(va), ctypes.c_size_t(total), ctypes.c_size_t(0), ctypes.c_uint64(0),
                                     ctypes.c_uint64(0)), "cuMemAddressReserve")
         _KEEP.append(va)
         if self.nslots:
-            _ck(lib.cuMemMap(va, ctypes.c_size_t(self.slot_bytes), ctypes.c_size_t(0), self.slots, ctypes.c_uint64(0)),
+            _ck(lib.cuMemMap(va, ctypes.c_size_t(shared), ctypes.c_size_t(0), self.slots, ctypes.c_uint64(0)),
                 "cuMemMap slots")
         if own:
             h = _create(own, self.di)
-            _ck(lib.cuMemMap(ctypes.c_uint64(va.value + self.slot_bytes), ctypes.c_size_t(own), ctypes.c_size_t(0), h,
+            _ck(lib.cuMemMap(ctypes.c_uint64(va.value + shared), ctypes.c_size_t(own), ctypes.c_size_t(0), h,
                              ctypes.c_uint64(0)), "cuMemMap own rows")
         acc = _Access(1, self.di, 3)          # device, read-write
         _ck(lib.cuMemSetAccess(va, ctypes.c_size_t(total), ctypes.byref(acc), ctypes.c_size_t(1)), "cuMemSetAccess")
         rows = self.nslots + own_rows
-        arr = _Arr(va.value, (rows,) + self.tail, (self.row,) + self.inner, _TS[self.dtype])
+        arr = _Arr(va.value + self.front, (rows,) + self.tail, (self.row,) + self.inner, _TS[self.dtype])
         t = torch.as_tensor(arr, device=self.dev)
         if own_rows:                          # fresh physical memory is not zeroed
             t[self.nslots:].zero_()
