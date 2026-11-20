@@ -29,6 +29,14 @@ Two switches change what a treatment covers, not which ranks may use it:
 - `K31_STAGE_ALL=1`: the `stage` ranks decide which experts a call stages; once staged, every pick of that expert in
   the call uses its record, at any rank and in any row (off: only the picks of the `stage` ranks). No extra records,
   no extra MegaMoE experts. Not with `K31_DEFER=1`.
+- `K31_STAGE_CAP=n` (or a policy's `stage_cap`, per layer): a decode call stages at most n records, the candidates
+  with the largest routing weight first, so the staging time per call is bounded whatever ranks `stage` names.
+- `K31_STAGE_ROWS=c0,c1,...`: row p of a request's verify block stages its ranks < c_p only.
+- `K31_DECODE_SPLIT=1` (the profiles' default): a decode step that carries several requests runs each MoE layer as
+  one call per request's verify block, so the per-call limits above and below (the band's 8 rows and experts per
+  call, the 16 staging slots, `stage_cap`, the row caps) apply per request, not per step, and the residency scores
+  come from accepted rows at any number of requests. Without it a step of 9-16 rows has no band and one call's
+  slots, and a step of more than 16 rows takes a one-round fallback (no band, no row caps, scores from every row).
 - `K31_BAND_PRIOR=p0,p1,...`: a call with more band experts than `band_cap` keeps those with the largest weight x
   their row's prior chance of being accepted (`p_i` for row i of a request's verify block: row 0 always, draft row i
   when drafts 1..i are accepted; e.g. the measured acceptance `1,0.64,0.36,0.19,0.09` at 4 drafts) instead of the
@@ -54,7 +62,8 @@ Two switches change what a treatment covers, not which ranks may use it:
 
 - **Fields of a policy**: `hit`, `band`, `stage`, `late`, `defer`, `mean` take rank sets (`"0-15"`, `"0-2,5"`,
   `"none"`, `"all"`, `[0, 1]`, an int); `band_cap` is the most distinct band experts per call (1-16; default
-  `K31_BAND_MAXE`); `late_slots` the records per late job (0-8; default `K31_LATE_SLOTS`). Defaults: `hit` and `band`
+  `K31_BAND_MAXE`); `late_slots` the records per late job (0-8; default `K31_LATE_SLOTS`); `stage_cap` the most
+  records staged per decode call (1-16; default `K31_STAGE_CAP`, else 16). Defaults: `hit` and `band`
   all ranks, `stage`, `late`, `defer` and `mean` none.
 - **`layers`** assigns policies to model layers (`"1-11"`, `"12"`, `"1-11,48-59"`, `"*"`); unnamed layers take
   `default`.

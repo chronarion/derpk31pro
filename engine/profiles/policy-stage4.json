@@ -1,0 +1,18 @@
+{
+ "note": "Every layer alike, closeness before speed: resident rows on every rank (no resident caps), the RTX band on every rank (8 experts per call), the misses of ranks 0-3 that have a 2-bit record in CPU memory staged in every layer, the mean substitute for the rest. The staging time per call is bounded by K31_STAGE_CAP (records per decode call, largest routing weight first) and K31_STAGE_ROWS (staged ranks per row of a verify block), which the quality profile sets.",
+ "version": 1,
+ "env": {
+  "K31_BAND_FEED": "0.25",
+  "BAND_READAHEAD": "8"
+ },
+ "policies": {
+  "s4": {
+   "hit": "0-15",
+   "band": "0-15",
+   "stage": "0-3",
+   "mean": "0-15",
+   "band_cap": 8
+  }
+ },
+ "default": "s4"
+}

@@ -174,6 +174,94 @@ PRESTAGE = os.environ.get("K31_PRESTAGE", "0") == "1"
 # strong misses buy less KLD per staged record; with K31_STAGE_ALL a staged expert still serves its picks in every row
 STAGE_ROWCAPS = [int(x) for x in os.environ.get("K31_STAGE_ROWS", "").split(",") if x.strip()]
 _RCAP: list = [None]                # int32 [16] per row of a decode call (bind)
+# K31_STAGE_CAP=n (1..16; a policy's `stage_cap` per layer wins): a decode call stages at most n records, the candidates
+# with the largest routing weight first (unitk's order), so a layer's staging time per call is bounded whatever ranks
+# its policy stages. Default: the 16 slots of the call.
+STAGE_CAP = int(os.environ.get("K31_STAGE_CAP", "0") or 0) or None
+# K31_DECODE_SPLIT=1: a decode step of more than 8 rows (several requests' verify blocks in one batch) runs each MoE
+# layer as one call per verify block instead of one call for the batch, so every request gets what a request alone
+# gets: the RTX band (it takes calls of up to 8 rows), the call's 16 staging slots, the per-row staging caps, the
+# resident caps and the accepted-row residency scores. Without it a batch of 9-16 rows loses the band and shares one
+# call's slots, and a batch of more than 16 rows (4 requests x (1 + 4 drafts) = 20) takes the one-round fallback
+# below: no band, 16 slots for the whole batch, and residency scores from every row with the decay of a prompt chunk.
+# Applies to calls captured into CUDA graphs and to eager decode-only steps of up to K31_DECODE_SPLIT_MAX rows
+# (default 40); prompt chunks keep the prompt path. Not with K31_DEFER, K31_PRESTAGE, K31_MEGAMOE_NOPREP, K31_LATE.
+DECODE_SPLIT = os.environ.get("K31_DECODE_SPLIT", "0") == "1"
+SPLIT_ROWS = 8                      # the largest call that is not split (the band's call size)
+SPLIT_MAX = int(os.environ.get("K31_DECODE_SPLIT_MAX", "40"))
+PEND_ROWS = 64                      # rows of the accepted-row buffers with the split (residency.py)
+_SPLIT: dict = {"block": SPLIT_ROWS, "P": 1, "sub": False, "row0": 0, "decode": False, "seen": set()}
+
+
+def split_blocks(T: int, block: int, rows: int = SPLIT_ROWS) -> list:
+    """The row ranges [(a, b), ...] of a decode batch of T rows as calls of `block` rows (a whole number of verify
+    blocks, at most `rows`); a tail of up to `rows` rows (the last blocks plus a graph's padding rows) is one call."""
+    out, a = [], 0
+    while T - a > rows:
+        out.append((a, a + block))
+        a += block
+    if T > a:
+        out.append((a, T))
+    return out
+
+
+class _PadRows:
+    """MegaMoE skips the rows the forward context marks as padding: a call on rows [a, b) of the batch needs the
+    mask's rows (as prompt_path._PaddingSlice; a no-op without a forward context or a mask)."""
+
+    def __init__(self, a, b):
+        self.a, self.b, self.ctx, self.p = a, b, None, None
+
+    def __enter__(self):
+        try:
+            from vllm.forward_context import get_forward_context, is_forward_context_available
+            if is_forward_context_available():
+                ctx = get_forward_context()
+                p = getattr(ctx, "is_padding", None)
+                if p is not None and p.shape[0] > self.b - self.a:
+                    self.ctx, self.p = ctx, p
+                    ctx.is_padding = p[self.a:self.b]
+        except ImportError:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        if self.ctx is not None:
+            self.ctx.is_padding = self.p
+
+
+def _split_wanted(hidden_states) -> bool:
+    """K31_DECODE_SPLIT: this MoE call is a decode batch to run block by block (not already one of its blocks; a
+    call inside a graph capture, or an eager step in which no request brings more rows than a verify block)."""
+    return DECODE_SPLIT and hidden_states.dim() == 2 and not _SPLIT["sub"] and \
+        SPLIT_ROWS < hidden_states.shape[0] <= SPLIT_MAX and \
+        (_SPLIT["decode"] or torch.cuda.is_current_stream_capturing() or _breakable_capture())
+
+
+def _split_call(one, hidden_states, idx: int = -1):
+    """K31_DECODE_SPLIT: one MoE layer over a decode batch as one call per verify block (split_blocks). `one(rows)`
+    is the whole decode-size path (router, band, plan, staging, MegaMoE, finish, up-projection) on those rows; the
+    plan reads the block's first row from _SPLIT for the accepted-row buffers. A call's output is copied out before
+    the next call runs (kernels may return buffers they reuse)."""
+    T = hidden_states.shape[0]
+    blocks = split_blocks(T, _SPLIT["block"])
+    if T not in _SPLIT["seen"]:
+        _SPLIT["seen"].add(T)
+        _LOG(f"decode split: a batch of {T} rows as calls of {[b - a for a, b in blocks]} rows (first seen in layer "
+             f"{idx}, capturing {torch.cuda.is_current_stream_capturing()})")
+    out = None
+    _SPLIT["sub"] = True
+    try:
+        for a, b in blocks:
+            _SPLIT["row0"] = a
+            with _PadRows(a, b):
+                y = one(hidden_states[a:b])
+            if out is None:
+                out = torch.empty((T,) + tuple(y.shape[1:]), dtype=y.dtype, device=y.device)
+            out[a:b].copy_(y)
+    finally:
+        _SPLIT["sub"], _SPLIT["row0"] = False, 0
+    return out
 # K31_W8I_DRAFT=1: the drafter's linears and the FP8 head copy on the int8 GEMV (w8i.py) instead of W8A16 / Marlin
 W8I_DRAFT = os.environ.get("K31_W8I_DRAFT", "0") == "1"
 # K31_FORCE_DRAFTS=1: in forced decoding (force.py, the KLD harness) the
@@ -432,6 +520,7 @@ class LayerState:
         self.up_eps = None                 # K31_TAIL1: the routed output transform's RMSNorm eps (first call)
         self.strong, self.defer_from, self.defer_to = STRONG, DEFER_FROM, DEFER_TO
         self.resmax = RES_MAXRANK
+        self.stage_cap = STAGE_CAP                   # K31_STAGE_CAP / the policy's stage_cap: records per decode call
         self.band = []                               # experts with a record in the RTX band (static start)
         self.band_map = self.band_call = self.band_args = self.band_stats = None
         self.ring_ok = False
@@ -657,7 +746,9 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
     if _RES and st.idx == _FIRST_MOE[0]:                 # K31_RES_STREAM: an eager path with no graph replay since the
         _RES[0].join_eager()                             # tick waits for its GPU work here (no-op while capturing)
     T0, _K0 = topk_ids.shape
-    if not (MODE != "hbm" and T0 <= 16 and (torch.cuda.is_current_stream_capturing() or T0 * st.strong <= SLOTS)):
+    sub = _SPLIT["sub"]                                  # K31_DECODE_SPLIT: one verify block of a larger decode batch
+    if not (MODE != "hbm" and T0 <= 16 and (torch.cuda.is_current_stream_capturing() or sub
+                                            or T0 * st.strong <= SLOTS)):
         _ld_join()                                       # every path but the one-round one reads hidden_states first
     if MODE == "hbm":
         rows = st.row_map[topk_ids.clamp_min(0).long()]
@@ -665,7 +756,7 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
         return _orig["forward"](self, hidden_states, topk_weights, ids, shared_experts)
     T, K = topk_ids.shape
     capturing = torch.cuda.is_current_stream_capturing()
-    if T <= 16 and (capturing or T * st.strong <= SLOTS):          # one round: the fused planner (unitk.py)
+    if T <= 16 and (capturing or sub or T * st.strong <= SLOTS):   # one round: the fused planner (unitk.py)
         from . import unitk
         main = torch.cuda.current_stream()
         if WINDOW_TEST and _WIN["ev"] is not None:       # join the previous layer's window before this MegaMoE call
@@ -706,7 +797,8 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
                                     score=st.score, lam=LAM, stats=st.stats, pend=getattr(st, "pend", None),
                                     resmax=st.resmax, pre=pre["pre"] if pre is not None else None,
                                     fill=pre is not None,   # with pre: `stage` = the misses (the late list)
-                                    rowcap=_RCAP[0])
+                                    rowcap=_RCAP[0], cap=st.stage_cap if pre is None else None,
+                                    row0=_SPLIT["row0"] if sub else 0)
         if _LT[0] is not None:                           # K31_LATE: this call's late job, on the late stream
             _LT[0].post(st, hidden_states, topk_ids, topk_weights, ids, main, _LD["ev"], _breakable_capture())
         tail = TAIL1 and BAND_FIN_SIDE and band_on and not DEFER and _BAND.get("fused") is not None and T <= 8 \
@@ -1016,6 +1108,20 @@ def _bind(runner) -> None:
         rc = [STAGE_ROWCAPS[min(t % P, len(STAGE_ROWCAPS) - 1)] for t in range(16)]
         _RCAP[0] = torch.tensor(rc, dtype=torch.int32, device=dev)
         _LOG(f"K31_STAGE_ROWS: row p of a {P}-row verify block stages ranks < min(strong, {rc[:P]}[p])")
+    if STAGE_CAP is not None and not 1 <= STAGE_CAP <= SLOTS:
+        raise RuntimeError(f"K31_STAGE_CAP={STAGE_CAP} outside 1..{SLOTS}")
+    if DECODE_SPLIT:
+        off = [n for n, v in (("K31_DEFER", DEFER), ("K31_PRESTAGE", PRESTAGE), ("K31_MEGAMOE_NOPREP", NOPREP),
+                              ("K31_LATE", LATE), ("K31_WINDOW_TEST", WINDOW_TEST)) if v]
+        if MODE != "staged" or off or not SPLIT_ROWS < SPLIT_MAX <= PEND_ROWS:
+            raise RuntimeError(f"K31_DECODE_SPLIT=1 needs K31_MODE=staged, K31_DECODE_SPLIT_MAX in {SPLIT_ROWS + 1}.."
+                               f"{PEND_ROWS} and none of: " + (", ".join(off) or "(none set)"))
+        P = _rows_per_request(runner)
+        _SPLIT["P"] = P
+        _SPLIT["block"] = P * (SPLIT_ROWS // P) if P <= SPLIT_ROWS else SPLIT_ROWS
+        _LOG(f"K31_DECODE_SPLIT: decode batches of {SPLIT_ROWS + 1}..{SPLIT_MAX} rows run every MoE layer as calls of "
+             f"{_SPLIT['block']} rows ({P} rows per request); e.g. 20 rows -> "
+             f"{[b - a for a, b in split_blocks(20, _SPLIT['block'])]}")
     if PRESTAGE and (MODE != "staged" or DEFER or NOPREP or LATE):
         raise RuntimeError("K31_PRESTAGE=1 needs K31_MODE=staged and K31_DEFER=0, K31_MEGAMOE_NOPREP=0, K31_LATE=0")
     if PRESTAGE:
@@ -1263,6 +1369,8 @@ def _apply_policy(st, idx: int) -> None:
     st.strong = p.strong
     st.band_ok = p.band
     st.band_cap = p.band_cap
+    if getattr(p, "stage_cap", None) is not None:
+        st.stage_cap = p.stage_cap
     if p.defer is not None:
         if not DEFER:
             raise RuntimeError(f"K31 policy: layer {idx} defers ranks {p.defer} but K31_DEFER is off")
@@ -1503,11 +1611,15 @@ def _patch_runner(module) -> None:
         if MEM_PEAK:
             from . import mempeak
             mempeak.step_begin(ntok)
+        if DECODE_SPLIT:                                         # a decode-only step: no request brings more rows
+            nst = getattr(so, "num_scheduled_tokens", None)      # than a verify block (eager calls split only then)
+            _SPLIT["decode"] = bool(nst) and ntok <= SPLIT_MAX and max(nst.values()) <= _SPLIT["P"]
         _IN_EXEC[0] = True                                       # the prompt path may tick the residency (serving
         try:                                                     # steps only: never the start-up's profile run,
             out = orig_exec(self, *args, **kwargs)               # whose promotions would land during graph capture)
         finally:
             _IN_EXEC[0] = False
+            _SPLIT["decode"] = False
         if MEM_PEAK:
             mempeak.step_end()
         _STEPS[0] += 1
@@ -1770,7 +1882,7 @@ def _patch_model(module) -> None:
             return orig_pan(self, hidden_states, residual, prefix_sum)
         dlate._post_attn_norm = _post_attn_norm_late
         dlate._k31_late = True
-    if not DEFER and not SHARED_SIDE:
+    if not DEFER and not SHARED_SIDE and not DECODE_SPLIT:
         return
     cls = module.KimiMoE
     orig = cls.forward
@@ -1782,7 +1894,8 @@ def _patch_model(module) -> None:
         down-projection on vLLM's aux stream, the router GEMV and grouped top-k on this one; the aux stream's event is
         left in _LD for _forward to join where the latent rows are read (the band send's branch, prep / MegaMoE)."""
         main = torch.cuda.current_stream()
-        ev0, ev1 = moe._down_proj_events
+        # (a block of a split batch takes its own events: the module's pair would be recorded once per block)
+        ev0, ev1 = (torch.cuda.Event(), torch.cuda.Event()) if _SPLIT["sub"] else moe._down_proj_events
         ev0.record(main)                             # h is ready
         # router GEMV and top-k first, as vLLM orders them: the graph launches its parallel branches in capture order,
         # and a latent down captured first takes the SMs and delays the router (arm C / D 11-18: router + top-k
@@ -1854,6 +1967,11 @@ def _patch_model(module) -> None:
         st = getattr(getattr(self, "experts", None), "_k31", None)
         if st is not None:
             _MOE[st.idx] = self
+        if st is not None and _split_wanted(hidden_states):      # K31_DECODE_SPLIT: one call per verify block
+            return _split_call(lambda rows: one_forward(self, st, rows), hidden_states, st.idx)
+        return one_forward(self, st, hidden_states)
+
+    def one_forward(self, st, hidden_states):
         if SHARED_SIDE and st is not None and getattr(self, "use_mega_moe", False) and \
                 self.shared_experts is not None and self.routed_output_transform is not None:
             out = moe_shared_side(self, hidden_states)

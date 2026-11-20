@@ -10,6 +10,8 @@ work is [T*SP, T*SP] (64 x 64 at T = 16).
 K31_STAGE_ALL=1 (ALLROWS): every pick of an expert that holds a slot uses the slot's row, at any rank and in any row of
 the call, not only the candidate picks that put it there. The same records are staged and MegaMoE sees the same
 distinct experts; picks that were cut (or given the mean) get the staged 2-bit record instead.
+A step whose rows come as several calls per layer (K31_DECODE_SPLIT: one call per verify block) passes each call's
+first row as `row0`: the accepted-row buffers (K31_ACCEPTED) are indexed by the row of the step, not of the call.
 """
 import os
 
@@ -25,7 +27,7 @@ STAGE_ALL = os.environ.get("K31_STAGE_ALL", "0") == "1"
 
 @triton.jit
 def _unitk(ids_ptr, w_ptr, row_ptr, bank_ptr, out_ptr, stage_ptr, T, strong, S, score_ptr, decay, stats_ptr,
-           pre_ptr, pid_ptr, pw_ptr, pt_ptr, resmax, cap, rcap_ptr, TB: tl.constexpr, K: tl.constexpr,
+           pre_ptr, pid_ptr, pw_ptr, pt_ptr, resmax, cap, rcap_ptr, row0, TB: tl.constexpr, K: tl.constexpr,
            SPC: tl.constexpr, SLOTSC: tl.constexpr, NE: tl.constexpr, SCORE: tl.constexpr, PRE: tl.constexpr,
            ACC: tl.constexpr, ALLROWS: tl.constexpr = False, FILL: tl.constexpr = False, ROWCAP: tl.constexpr = False):
     tl.extra.cuda.gdc_wait()                 # PDL: the router's ids / weights (and earlier writes) are visible
@@ -134,9 +136,10 @@ def _unitk(ids_ptr, w_ptr, row_ptr, bank_ptr, out_ptr, stage_ptr, T, strong, S, 
         if ACC:
             # accepted rows only (K31_ACCEPTED): the rows' picks wait in the layer's pending buffer [16, 16]; commit()
             # adds the accepted rows after the step's rejection sampling
-            tl.store(pid_ptr + off, tl.where(valid, ids, -1), mask=m2)
-            tl.store(pw_ptr + off, tl.where(valid, w * w, 0.0), mask=m2)
-            tl.store(pt_ptr, T)
+            # (row0: the call's first row in the step; the last call of a layer leaves the step's row count)
+            tl.store(pid_ptr + row0 * K + off, tl.where(valid, ids, -1), mask=m2)
+            tl.store(pw_ptr + row0 * K + off, tl.where(valid, w * w, 0.0), mask=m2)
+            tl.store(pt_ptr, row0 + T)
         else:
             eo = tl.arange(0, NE)
             em = eo < 896
@@ -156,7 +159,7 @@ def _unitk(ids_ptr, w_ptr, row_ptr, bank_ptr, out_ptr, stage_ptr, T, strong, S, 
 def plan(ids: torch.Tensor, w: torch.Tensor, row_map: torch.Tensor, bank_map: torch.Tensor, strong: int, S: int,
          out: torch.Tensor = None, stage: torch.Tensor = None, score: torch.Tensor = None, lam: float = 1.0,
          stats: torch.Tensor = None, pre: torch.Tensor = None, pend=None, resmax: int = 16, allrows: bool = None,
-         fill: bool = False, cap: int = None, rowcap: torch.Tensor = None):
+         fill: bool = False, cap: int = None, rowcap: torch.Tensor = None, row0: int = 0):
     """S: the first row of the call's staging slots. score (float32 [896]) and stats (int32 [4]): residency inputs,
     updated in place when given (decay lam per token). pre (int32 [SLOTS], bank index per slot): the slots were
     staged ahead; candidates map onto them or are cut, and `stage` is left untouched; with fill=True (K31_PRESTAGE)
@@ -164,7 +167,8 @@ def plan(ids: torch.Tensor, w: torch.Tensor, row_map: torch.Tensor, bank_map: to
     written with those slots' bank indices only (the late list; -1 elsewhere). cap (default SLOTS, without pre): the
     plain planner uses at most `cap` slots. allrows (default K31_STAGE_ALL): every non-resident pick of an expert in a
     slot uses the slot, at any rank (PRE: by bank index). rowcap (int32 [16], K31_STAGE_ROWS): row t's candidates are
-    its picks of rank < min(strong, rowcap[t])."""
+    its picks of rank < min(strong, rowcap[t]). row0 (with pend): the call's first row in the step's batch; the
+    buffers must hold row0 + T rows (commit() reads the step's rows from them)."""
     allrows = STAGE_ALL if allrows is None else bool(allrows)
     T, K = ids.shape
     assert K == 16 and T <= 16 and strong <= SP
@@ -176,10 +180,11 @@ def plan(ids: torch.Tensor, w: torch.Tensor, row_map: torch.Tensor, bank_map: to
     sc = score is not None
     acc = sc and pend is not None
     pid, pw, pt = pend if acc else (out, out, out)
+    assert row0 == 0 or not acc or pid.shape[0] >= row0 + T
     _unitk[(1,)](ids.int() if ids.dtype != torch.int32 else ids, w.contiguous(), row_map, bank_map, out, stage, T,
                  strong, S, score if sc else out, float(lam ** T), stats if sc else out, pre if pre is not None else stage,
                  pid, pw, pt, int(resmax), int(SLOTS if cap is None else cap), rowcap if rowcap is not None else out,
-                 TB=TB, K=K, SPC=SP, SLOTSC=SLOTS, NE=1024, SCORE=sc, PRE=pre is not None, ACC=acc, ALLROWS=allrows,
+                 int(row0), TB=TB, K=K, SPC=SP, SLOTSC=SLOTS, NE=1024, SCORE=sc, PRE=pre is not None, ACC=acc, ALLROWS=allrows,
                  FILL=bool(fill) and pre is not None, ROWCAP=rowcap is not None, num_warps=4 if TB <= 4 else 8,
                  launch_pdl=PDL)
     return out, stage
@@ -223,8 +228,10 @@ def commit(score: torch.Tensor, pend_ids: torch.Tensor, pend_w2: torch.Tensor, p
     """After a step's sampling: per layer with pending rows (unitk with `pend`), decay the scores by lam^A (A = the
     step's accepted tokens = sum num_sampled) and add the accepted rows' squared weights (row t of request r is
     accepted if t - qsl[r] < num_sampled[r]); acc += A (promotion credit per accepted token). One launch, no host
-    sync. score [L, 896] float32, pend_ids / pend_w2 [L, 16, 16], pend_t [L] int32."""
+    sync. score [L, 896] float32, pend_ids / pend_w2 [L, R, 16] (R = 16, or a larger power of two when a step's rows
+    come as several calls per layer), pend_t [L] int32."""
     import math
-    L = score.shape[0]
+    L, R = score.shape[0], pend_ids.shape[1]
+    assert R >= 16 and R & (R - 1) == 0 and pend_w2.shape[1] == R
     _commit[(L,)](score, pend_ids, pend_w2, pend_t, qsl, num_sampled, nreq, math.log2(lam), acc,
-                  RB=max(2, triton.next_power_of_2(nreq + 1)), NE=1024, TB=16, K=16, num_warps=4)
+                  RB=max(2, triton.next_power_of_2(nreq + 1)), NE=1024, TB=R, K=16, num_warps=4)

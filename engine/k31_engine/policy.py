@@ -24,6 +24,8 @@ File (JSON):
       "standard": {"hit": "0-15",                       ranks that may use a native row (default all)
                    "band": "0-15", "band_cap": 16,      ranks the RTX may serve (default all) / experts per call
                    "stage": "0-2",                      ranks staged from the bank when missing (default none)
+                   "stage_cap": 4,                      records staged per decode call at most (1-16; default 16,
+                                                        or K31_STAGE_CAP), the largest routing weights first
                    "late": "0-15", "late_slots": 5,     ranks the Grace pool may serve late / records per call
                    "defer": "3-11",                     ranks deferred one layer (default none)
                    "mean": "0-15"}                      ranks given the mean substitute when cut (default none)
@@ -121,9 +123,10 @@ def parse_layers(spec: str) -> list:
 
 def masks_of(fields: dict) -> list:
     """A policy's fields -> 16 bitmasks (rank 0 first)."""
-    unknown = set(fields) - set(NAMES) - {"band_cap", "note", "late_slots"}
+    unknown = set(fields) - set(NAMES) - {"band_cap", "note", "late_slots", "stage_cap"}
     if unknown:
-        raise PolicyError(f"unknown policy fields {sorted(unknown)} (menu: {', '.join(ORDER)}, band_cap, late_slots)")
+        raise PolicyError(f"unknown policy fields {sorted(unknown)} (menu: {', '.join(ORDER)}, band_cap, late_slots, "
+                          f"stage_cap)")
     m = [0] * K
     for name in ORDER:
         for r in parse_ranks(fields.get(name, DEFAULTS[name])):
@@ -138,6 +141,7 @@ class LayerParams:
     band: bool = True           # the RTX band serves this layer's band experts
     band_cap: int = 16          # at most this many distinct band experts per call
     strong: int = 0             # misses of rank < strong with a bank record are staged
+    stage_cap: int | None = None  # at most this many records staged per decode call (None: K31_STAGE_CAP or 16)
     defer: tuple | None = None  # (from, to): misses of these ranks with a bank record are deferred
     mean: bool = False          # cut picks get the mean substitute
     late: tuple | None = None   # (from, to): bank misses of these ranks may be computed late by the Grace pool
@@ -234,9 +238,14 @@ def load(path: str) -> dict:
         fields.update(over.get(L, {}))
         cap = int(fields.get("band_cap", os.environ.get("K31_BAND_MAXE", "16") or 16))
         masks = table.get(L) if L in table else masks_of({k: v for k, v in fields.items()
-                                                          if k not in ("band_cap", "late_slots")})
+                                                          if k not in ("band_cap", "late_slots", "stage_cap")})
         label = ("table" if L in table else (nm or "(defaults)")) + ("+override" if L in over else "")
         out[L] = compile_layer(L, masks, cap, label, fields.get("late_slots"))
+        if fields.get("stage_cap") is not None:
+            sc = int(fields["stage_cap"])
+            if not 1 <= sc <= 16:
+                raise PolicyError(f"layer {L}: stage_cap {sc} outside 1..16")
+            out[L].stage_cap = sc
     return out
 
 
@@ -250,7 +259,7 @@ def env_section(path: str) -> dict:
 def describe(params: dict) -> str:
     """One line per run of consecutive layers with the same compiled parameters."""
     def key(p):
-        return (p.policy, p.resmax, p.band, p.band_cap, p.strong, p.defer, p.mean, p.late, p.late_n)
+        return (p.policy, p.resmax, p.band, p.band_cap, p.strong, p.defer, p.mean, p.late, p.late_n, p.stage_cap)
     lines, run = [], None
     for L in LAYERS:
         p = params[L]
@@ -265,7 +274,8 @@ def describe(params: dict) -> str:
     for a, b in lines:
         p = params[a]
         out.append(f"layers {a}-{b} [{p.policy}]: hit < {p.resmax}, band {'on' if p.band else 'off'} (cap {p.band_cap}), "
-                   f"stage < {p.strong}, defer {p.defer or '-'}, mean {'on' if p.mean else 'off'}"
+                   f"stage < {p.strong}{f' (cap {p.stage_cap})' if p.stage_cap else ''}, defer {p.defer or '-'}, "
+                   f"mean {'on' if p.mean else 'off'}"
                    + (f", late {p.late[0]}..{p.late[1] - 1} x{p.late_n}" if p.late else ""))
     return "\n".join(out)
 

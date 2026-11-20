@@ -187,8 +187,12 @@ class Residency:
         # K31_ACCEPTED: scores and promotion credit from accepted rows only (rejected draft rows route on tokens that
         # never happened); unitk parks a call's picks in pend_*, commit() adds the accepted rows after sampling
         self.accepted = os.environ.get("K31_ACCEPTED", "0") == "1"
-        self.pend_ids = torch.full((n, 16, 16), -1, dtype=torch.int32, device=dev)
-        self.pend_w2 = torch.zeros((n, 16, 16), dtype=torch.float32, device=dev)
+        # (16 rows: a call; with K31_DECODE_SPLIT a step's rows come as several calls per layer: hook.PEND_ROWS)
+        pr = 16
+        if os.environ.get("K31_DECODE_SPLIT", "0") == "1":
+            from .hook import PEND_ROWS as pr
+        self.pend_ids = torch.full((n, pr, 16), -1, dtype=torch.int32, device=dev)
+        self.pend_w2 = torch.zeros((n, pr, 16), dtype=torch.float32, device=dev)
         self.pend_t = torch.zeros(n, dtype=torch.int32, device=dev)
         self.acc = torch.zeros(1, dtype=torch.int64, device=dev)
         # K31_BANK_EXCL: promotions swap with the bank (write-back of the evicted row's hi2 record into the promoted
