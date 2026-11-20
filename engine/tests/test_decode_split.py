@@ -1,7 +1,8 @@
 """K31_DECODE_SPLIT (a decode batch of more than 8 rows as one MoE call per verify block) and K31_STAGE_CAP.
 
-1. hook.split_blocks: the row ranges cover the batch in order, every call but the last is one block, no call has
-   more than 8 rows, a tail of up to 8 rows (blocks + padding) is one call.
+1. hook.split_block / split_blocks: a call is a whole number of verify blocks; the row ranges cover the batch in
+   order, every call but the last is one block, no call has more than K31_DECODE_SPLIT_ROWS rows (8), a tail of up
+   to that many rows (blocks + padding) is one call.
 2. unitk with `cap`: against the reference plan (candidates' distinct experts by largest weight, ties by lower id, the
    first `cap` staged), with row caps, resident caps and K31_STAGE_ALL, 300 random calls; the policy field
    `stage_cap` and the two quality policies.
@@ -32,7 +33,8 @@ os.environ["K31_MODE"] = "staged"
 os.environ["K31_DECODE_SPLIT"] = "1"
 for k in ("K31_STAGE_ALL", "K31_DEFER", "K31_PROMPT_PATH", "K31_RES_MAXRANK", "K31_TAIL1", "K31_BAND", "K31_PDL",
           "K31_BAND_FIN_SIDE", "K31_STAGE_ROWS", "K31_SHARED_SIDE", "K31_MEGAMOE_NOPREP", "K31_PRESTAGE", "K31_LATE",
-          "K31_POLICY", "K31_CUT_MEAN", "K31_STAGE_CAP", "K31_DECODE_SPLIT_MAX", "K31_WINDOW_TEST"):
+          "K31_POLICY", "K31_CUT_MEAN", "K31_STAGE_CAP", "K31_DECODE_SPLIT_MAX", "K31_DECODE_SPLIT_ROWS",
+          "K31_WINDOW_TEST"):
     os.environ.pop(k, None)
 
 import torch  # noqa: E402
@@ -116,19 +118,22 @@ def plan_ref(st, ids, w, strong, S, resmax=16, allrows=False, cap=SL, rowcap=Non
 
 # 1. split_blocks
 bad = 0
-for block in (1, 2, 3, 4, 5, 6, 7, 8):
-    blk = block * (8 // block)
-    for T in range(1, 65):
-        bl = hook.split_blocks(T, blk)
-        ok = bl[0][0] == 0 and bl[-1][1] == T and all(bl[i][1] == bl[i + 1][0] for i in range(len(bl) - 1)) \
-            and all(0 < b - a <= 8 for a, b in bl) and all(b - a == blk for a, b in bl[:-1]) \
-            and (T > 8 or len(bl) == 1)
-        bad += not ok
+for rows in (8, 5, 2, 1):                    # K31_DECODE_SPLIT_ROWS: the largest batch that stays one call
+    for P in (1, 2, 3, 4, 5, 6, 7, 8, 9, 17):
+        blk = hook.split_block(P, rows)
+        bad += not (1 <= blk <= rows and (blk % P == 0 if P <= rows else blk == rows))
+        for T in range(1, 65):
+            bl = hook.split_blocks(T, blk, rows)
+            ok = bl[0][0] == 0 and bl[-1][1] == T and all(bl[i][1] == bl[i + 1][0] for i in range(len(bl) - 1)) \
+                and all(0 < b - a <= rows for a, b in bl) and all(b - a == blk for a, b in bl[:-1]) \
+                and (T > rows or len(bl) == 1)
+            bad += not ok
 check("split_blocks: ordered cover, whole blocks, at most 8 rows per call, a tail of up to 8 rows is one call",
       bad == 0 and hook.split_blocks(20, 5) == [(0, 5), (5, 10), (10, 15), (15, 20)]
       and hook.split_blocks(16, 5) == [(0, 5), (5, 10), (10, 16)] and hook.split_blocks(10, 5) == [(0, 5), (5, 10)]
       and hook.split_blocks(24, 5) == [(0, 5), (5, 10), (10, 15), (15, 20), (20, 24)]
-      and hook.split_blocks(16, 8) == [(0, 8), (8, 16)], f"({bad} wrong)")
+      and hook.split_blocks(16, 8) == [(0, 8), (8, 16)] and hook.split_block(5) == 5 and hook.split_block(2) == 8
+      and hook.split_blocks(8, hook.split_block(2, 2), 2) == [(0, 2), (2, 4), (4, 6), (6, 8)], f"({bad} wrong)")
 
 # 2. unitk with a stage cap
 rng = random.Random(21)
@@ -280,7 +285,7 @@ else:
             T = [10, 15, 16, 20, 24, 40][trial % 6]
             P = 5 if T != 16 or trial % 12 < 6 else 2
             block = P * (8 // P)
-            hook._SPLIT["block"], hook._SPLIT["P"] = block, P
+            hook._SPLIT["block"], hook._SPLIT["P"], hook._SPLIT["rows"] = block, P, 8
             st = make_layer(rng, rng.randint(50, 250), rng.randint(200, 500), idx=rng.randint(1, 92))
             st.band_map = None
             st.strong = rng.randint(1, 4)
@@ -371,7 +376,7 @@ else:
 
     # 5. the split in a CUDA graph
     T, P, block = 20, 5, 5
-    hook._SPLIT["block"], hook._SPLIT["P"] = block, P
+    hook._SPLIT["block"], hook._SPLIT["P"], hook._SPLIT["rows"] = block, P, 8
     hook.STAGE_ALL = unitk.STAGE_ALL = True
     rc = [[4, 4, 2, 1, 1][t % P] for t in range(16)]
     hook._RCAP[0] = torch.tensor(rc, dtype=torch.int32, device=dev)
