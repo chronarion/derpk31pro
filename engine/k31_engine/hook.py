@@ -178,6 +178,12 @@ _RCAP: list = [None]                # int32 [16] per row of a decode call (bind)
 # with the largest routing weight first (unitk's order), so a layer's staging time per call is bounded whatever ranks
 # its policy stages. Default: the 16 slots of the call.
 STAGE_CAP = int(os.environ.get("K31_STAGE_CAP", "0") or 0) or None
+# K31_STAGE_PRIOR=p0,p1,... (as K31_BAND_PRIOR): the experts a decode call stages are ordered by their largest routing
+# weight x the prior chance that the pick's row is accepted (row p of a verify block: p0 the bonus row, then the
+# drafts; later rows take the last value) instead of by weight alone. It decides which experts keep a slot when a
+# call has more candidates than K31_STAGE_CAP (or than its 16 slots); calls under the cap stage what they staged.
+STAGE_PRIOR = [float(x) for x in os.environ.get("K31_STAGE_PRIOR", "").split(",") if x.strip()]
+_RPRI: list = [None]                # float32 [16] per row of a decode call (bind)
 # K31_DECODE_SPLIT=1: a decode step of more than 8 rows (several requests' verify blocks in one batch) runs each MoE
 # layer as one call per verify block instead of one call for the batch, so every request gets what a request alone
 # gets: the RTX band (it takes calls of up to 8 rows), the call's 16 staging slots, the per-row staging caps, the
@@ -807,7 +813,7 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
                                     resmax=st.resmax, pre=pre["pre"] if pre is not None else None,
                                     fill=pre is not None,   # with pre: `stage` = the misses (the late list)
                                     rowcap=_RCAP[0], cap=st.stage_cap if pre is None else None,
-                                    row0=_SPLIT["row0"] if sub else 0)
+                                    row0=_SPLIT["row0"] if sub else 0, rowprior=_RPRI[0])
         if _LT[0] is not None:                           # K31_LATE: this call's late job, on the late stream
             _LT[0].post(st, hidden_states, topk_ids, topk_weights, ids, main, _LD["ev"], _breakable_capture())
         tail = TAIL1 and BAND_FIN_SIDE and band_on and not DEFER and _BAND.get("fused") is not None and T <= 8 \
@@ -1117,6 +1123,14 @@ def _bind(runner) -> None:
         rc = [STAGE_ROWCAPS[min(t % P, len(STAGE_ROWCAPS) - 1)] for t in range(16)]
         _RCAP[0] = torch.tensor(rc, dtype=torch.int32, device=dev)
         _LOG(f"K31_STAGE_ROWS: row p of a {P}-row verify block stages ranks < min(strong, {rc[:P]}[p])")
+    if STAGE_PRIOR and MODE == "staged":
+        if not all(0.0 <= v < float("inf") for v in STAGE_PRIOR):
+            raise RuntimeError(f"K31_STAGE_PRIOR: row priors {STAGE_PRIOR} must be finite values >= 0")
+        P = _rows_per_request(runner)
+        rp = [STAGE_PRIOR[min(t % P, len(STAGE_PRIOR) - 1)] for t in range(16)]
+        _RPRI[0] = torch.tensor(rp, dtype=torch.float32, device=dev)
+        _LOG(f"K31_STAGE_PRIOR: staging slots by largest weight x the row's prior; rows of a {P}-row verify block: "
+             f"{', '.join(f'{v:g}' for v in rp[:P])}")
     if STAGE_CAP is not None and not 1 <= STAGE_CAP <= SLOTS:
         raise RuntimeError(f"K31_STAGE_CAP={STAGE_CAP} outside 1..{SLOTS}")
     if DECODE_SPLIT:

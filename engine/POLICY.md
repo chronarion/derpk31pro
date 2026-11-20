@@ -32,6 +32,8 @@ Two switches change what a treatment covers, not which ranks may use it:
 - `K31_STAGE_CAP=n` (or a policy's `stage_cap`, per layer): a decode call stages at most n records, the candidates
   with the largest routing weight first, so the staging time per call is bounded whatever ranks `stage` names.
 - `K31_STAGE_ROWS=c0,c1,...`: row p of a request's verify block stages its ranks < c_p only.
+- `K31_STAGE_PRIOR=p0,p1,...`: the staged experts are ordered by weight x the prior chance of their row being
+  accepted (as `K31_BAND_PRIOR`), which decides who keeps a slot under `stage_cap`.
 - `K31_DECODE_SPLIT=1` (the profiles' default): a decode step that carries several requests runs each MoE layer as
   one call per request's verify block, so the per-call limits above and below (the band's 8 rows and experts per
   call, the 16 staging slots, `stage_cap`, the row caps) apply per request, not per step, and the residency scores

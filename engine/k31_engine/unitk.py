@@ -27,9 +27,10 @@ STAGE_ALL = os.environ.get("K31_STAGE_ALL", "0") == "1"
 
 @triton.jit
 def _unitk(ids_ptr, w_ptr, row_ptr, bank_ptr, out_ptr, stage_ptr, T, strong, S, score_ptr, decay, stats_ptr,
-           pre_ptr, pid_ptr, pw_ptr, pt_ptr, resmax, cap, rcap_ptr, row0, TB: tl.constexpr, K: tl.constexpr,
-           SPC: tl.constexpr, SLOTSC: tl.constexpr, NE: tl.constexpr, SCORE: tl.constexpr, PRE: tl.constexpr,
-           ACC: tl.constexpr, ALLROWS: tl.constexpr = False, FILL: tl.constexpr = False, ROWCAP: tl.constexpr = False):
+           pre_ptr, pid_ptr, pw_ptr, pt_ptr, resmax, cap, rcap_ptr, row0, rpri_ptr, TB: tl.constexpr,
+           K: tl.constexpr, SPC: tl.constexpr, SLOTSC: tl.constexpr, NE: tl.constexpr, SCORE: tl.constexpr,
+           PRE: tl.constexpr, ACC: tl.constexpr, ALLROWS: tl.constexpr = False, FILL: tl.constexpr = False,
+           ROWCAP: tl.constexpr = False, ROWPRI: tl.constexpr = False):
     tl.extra.cuda.gdc_wait()                 # PDL: the router's ids / weights (and earlier writes) are visible
     tl.extra.cuda.gdc_launch_dependents()
     t = tl.arange(0, TB)
@@ -60,6 +61,9 @@ def _unitk(ids_ptr, w_ptr, row_ptr, bank_ptr, out_ptr, stage_ptr, T, strong, S, 
     cw = tl.sum(tl.where(sel, w[:, None, :], 0.0), axis=2)
     cc = tl.sum(tl.where(sel & cand[:, None, :], 1, 0), axis=2) > 0
     cb = tl.sum(tl.where(sel, bank[:, None, :], 0), axis=2)
+    if ROWPRI:                               # K31_STAGE_PRIOR: the slots' order is by weight x the row's prior chance
+        pr = tl.load(rpri_ptr + t, mask=t < T, other=0.0)        # of being accepted (the order only: cw is not
+        cw = cw * pr[:, None]                                     # used for anything else)
     # flatten to N = TB * SP entries
     N: tl.constexpr = TB * SPC
     fe = tl.reshape(ce, (N,))
@@ -159,7 +163,8 @@ def _unitk(ids_ptr, w_ptr, row_ptr, bank_ptr, out_ptr, stage_ptr, T, strong, S, 
 def plan(ids: torch.Tensor, w: torch.Tensor, row_map: torch.Tensor, bank_map: torch.Tensor, strong: int, S: int,
          out: torch.Tensor = None, stage: torch.Tensor = None, score: torch.Tensor = None, lam: float = 1.0,
          stats: torch.Tensor = None, pre: torch.Tensor = None, pend=None, resmax: int = 16, allrows: bool = None,
-         fill: bool = False, cap: int = None, rowcap: torch.Tensor = None, row0: int = 0):
+         fill: bool = False, cap: int = None, rowcap: torch.Tensor = None, row0: int = 0,
+         rowprior: torch.Tensor = None):
     """S: the first row of the call's staging slots. score (float32 [896]) and stats (int32 [4]): residency inputs,
     updated in place when given (decay lam per token). pre (int32 [SLOTS], bank index per slot): the slots were
     staged ahead; candidates map onto them or are cut, and `stage` is left untouched; with fill=True (K31_PRESTAGE)
@@ -168,7 +173,9 @@ def plan(ids: torch.Tensor, w: torch.Tensor, row_map: torch.Tensor, bank_map: to
     plain planner uses at most `cap` slots. allrows (default K31_STAGE_ALL): every non-resident pick of an expert in a
     slot uses the slot, at any rank (PRE: by bank index). rowcap (int32 [16], K31_STAGE_ROWS): row t's candidates are
     its picks of rank < min(strong, rowcap[t]). row0 (with pend): the call's first row in the step's batch; the
-    buffers must hold row0 + T rows (commit() reads the step's rows from them)."""
+    buffers must hold row0 + T rows (commit() reads the step's rows from them). rowprior (float32 [16],
+    K31_STAGE_PRIOR): the candidates' experts take the slots in order of their largest weight x rowprior[t] instead
+    of their largest weight (which experts are staged when there are more than `cap`; nothing else changes)."""
     allrows = STAGE_ALL if allrows is None else bool(allrows)
     T, K = ids.shape
     assert K == 16 and T <= 16 and strong <= SP
@@ -184,8 +191,9 @@ def plan(ids: torch.Tensor, w: torch.Tensor, row_map: torch.Tensor, bank_map: to
     _unitk[(1,)](ids.int() if ids.dtype != torch.int32 else ids, w.contiguous(), row_map, bank_map, out, stage, T,
                  strong, S, score if sc else out, float(lam ** T), stats if sc else out, pre if pre is not None else stage,
                  pid, pw, pt, int(resmax), int(SLOTS if cap is None else cap), rowcap if rowcap is not None else out,
-                 int(row0), TB=TB, K=K, SPC=SP, SLOTSC=SLOTS, NE=1024, SCORE=sc, PRE=pre is not None, ACC=acc, ALLROWS=allrows,
-                 FILL=bool(fill) and pre is not None, ROWCAP=rowcap is not None, num_warps=4 if TB <= 4 else 8,
+                 int(row0), rowprior if rowprior is not None else w, TB=TB, K=K, SPC=SP, SLOTSC=SLOTS, NE=1024, SCORE=sc, PRE=pre is not None, ACC=acc, ALLROWS=allrows,
+                 FILL=bool(fill) and pre is not None, ROWCAP=rowcap is not None, ROWPRI=rowprior is not None,
+                 num_warps=4 if TB <= 4 else 8,
                  launch_pdl=PDL)
     return out, stage
 

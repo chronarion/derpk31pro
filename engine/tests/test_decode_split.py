@@ -4,7 +4,8 @@
    order, every call but the last is one block, no call has more than K31_DECODE_SPLIT_ROWS rows (8), a tail of up
    to that many rows (blocks + padding) is one call.
 2. unitk with `cap`: against the reference plan (candidates' distinct experts by largest weight, ties by lower id, the
-   first `cap` staged), with row caps, resident caps and K31_STAGE_ALL, 300 random calls; the policy field
+   first `cap` staged), with row caps, resident caps, K31_STAGE_ALL and the row prior of K31_STAGE_PRIOR (order by
+   weight x prior), 300 random calls; the policy field
    `stage_cap` and the two quality policies.
 3. unitk with `row0` and 64-row accepted-row buffers: a step of several requests planned block by block leaves in
    the buffers exactly the step's rows (expert ids, squared weights, row count) and no score change; commit() then
@@ -82,7 +83,7 @@ def ranks(wrow):
     return [sum(1 for j in range(K) if wrow[j] > wrow[k] or (wrow[j] == wrow[k] and j < k)) for k in range(K)]
 
 
-def plan_ref(st, ids, w, strong, S, resmax=16, allrows=False, cap=SL, rowcap=None):
+def plan_ref(st, ids, w, strong, S, resmax=16, allrows=False, cap=SL, rowcap=None, prior=None):
     """The one-round plan from its definition. Candidates: an expert id, no resident row, a bank record, rank <
     strong (and < rowcap[t]); staged: the candidates' distinct experts by their largest candidate weight (ties: lower
     id), the first `cap` in slots 0, 1, ...; rows: a resident pick of rank < resmax -> its row; a candidate of a
@@ -97,7 +98,7 @@ def plan_ref(st, ids, w, strong, S, resmax=16, allrows=False, cap=SL, rowcap=Non
         for k in range(K):
             if cand[t][k]:
                 e = ids[t][k]
-                best[e] = max(best.get(e, -1.0), w[t][k])
+                best[e] = max(best.get(e, -1.0), w[t][k] * (prior[t] if prior else 1.0))   # (K31_STAGE_PRIOR)
     order = sorted(best, key=lambda e: (-best[e], e))[:cap]
     slot_of = {e: s for s, e in enumerate(order)}
     stage = [bidx[e] for e in order] + [-1] * (SL - len(order))
@@ -137,7 +138,7 @@ check("split_blocks: ordered cover, whole blocks, at most 8 rows per call, a tai
 
 # 2. unitk with a stage cap
 rng = random.Random(21)
-bad, capped = 0, 0
+bad, capped, n_pri = 0, 0, 0
 for trial in range(120 if CPU else 300):
     st = make_layer(rng, rng.randint(40, 200), rng.randint(200, 600), idx=rng.randint(1, 92))
     T = rng.randint(1, 8)
@@ -145,17 +146,21 @@ for trial in range(120 if CPU else 300):
     cap = rng.randint(1, 16)
     rc = [rng.choice([4, 4, 2, 1]) for _ in range(16)] if rng.random() < 0.5 else None
     ids, w = make_call(rng, T, rng.randint(40, 896))
-    want_ids, want_stage = plan_ref(st, ids, w, strong, st.slot_base, resmax, allrows, cap, rc)
+    pri = [[1.0, 0.5, 0.5, 0.25, 0.125][t % 5] for t in range(16)] if trial % 3 == 0 else None   # exact products
+    want_ids, want_stage = plan_ref(st, ids, w, strong, st.slot_base, resmax, allrows, cap, rc, pri)
     uncapped = plan_ref(st, ids, w, strong, st.slot_base, resmax, allrows, SL, rc)[1]
     capped += sum(b >= 0 for b in uncapped) > cap
+    n_pri += pri is not None and want_stage != plan_ref(st, ids, w, strong, st.slot_base, resmax, allrows, cap, rc)[1]
     stage = torch.full((SL,), 77, dtype=torch.int32, device=dev)
     out, stage = unitk.plan(torch.tensor(ids, dtype=torch.int32, device=dev),
                             torch.tensor(w, dtype=torch.float32, device=dev), st.row_map, st.bank_map, strong,
                             st.slot_base, stage=stage, resmax=resmax, allrows=allrows, cap=cap,
-                            rowcap=torch.tensor(rc, dtype=torch.int32, device=dev) if rc else None)
+                            rowcap=torch.tensor(rc, dtype=torch.int32, device=dev) if rc else None,
+                            rowprior=torch.tensor(pri, dtype=torch.float32, device=dev) if pri else None)
     bad += out.tolist() != want_ids or stage.tolist() != want_stage
 check("unitk cap: the plan with at most `cap` staged records equals the reference (row caps, resident caps, "
-      "K31_STAGE_ALL)", bad == 0 and capped > 20, f"({capped} calls with more candidates than the cap; {bad} wrong)")
+      "K31_STAGE_ALL, slots by weight x row prior)", bad == 0 and capped > 20 and n_pri > 5,
+      f"({capped} calls with more candidates than the cap, {n_pri} where the prior changes the staged set; {bad} wrong)")
 
 # 2b. the policy field and the quality policies
 import json  # noqa: E402
