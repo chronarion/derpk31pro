@@ -1094,11 +1094,13 @@ def _selfcheck(st: LayerState, tensors: dict, cfg, dev, bank_tensors: dict) -> N
     cap = st.resmax                              # a resident cap (K31_POLICY hit ranks) gives picks past it the mean:
     st.resmax = TOPK                             # the check compares every pick exactly, so it runs uncapped
     rcap, _RCAP[0] = _RCAP[0], None              # and without per-row staging caps (K31_STAGE_ROWS)
+    scap, st.stage_cap = st.stage_cap, None      # or a cap on the records a call stages (K31_STAGE_CAP / stage_cap)
     try:
         got = mod(x, w.to(dev), ids.to(dev, torch.int32)).float()
     finally:
         st.resmax = cap
         _RCAP[0] = rcap
+        st.stage_cap = scap
     rel = {k: ((got - v).norm() / v.norm()).item() for k, v in want.items()}
     _LOG(f"selfcheck layer {st.idx}: kernel vs float32 formulas (4 tokens x 16 picks"
          + (f", {ns} per token staged from 2-bit records" if staged_pool is not None else "")
