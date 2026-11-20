@@ -1638,7 +1638,11 @@ def _patch_runner(module) -> None:
             mempeak.step_begin(ntok)
         if DECODE_SPLIT:                                         # a decode-only step: no request brings more rows
             nst = getattr(so, "num_scheduled_tokens", None)      # than a verify block (eager calls split only then)
-            _SPLIT["decode"] = bool(nst) and ntok <= SPLIT_MAX and max(nst.values()) <= _SPLIT["P"]
+            try:
+                per = list(nst.values()) if isinstance(nst, dict) else [int(v) for v in nst]
+            except TypeError:
+                per = []
+            _SPLIT["decode"] = bool(per) and ntok <= SPLIT_MAX and max(per) <= _SPLIT["P"]
         _IN_EXEC[0] = True                                       # the prompt path may tick the residency (serving
         try:                                                     # steps only: never the start-up's profile run,
             out = orig_exec(self, *args, **kwargs)               # whose promotions would land during graph capture)
