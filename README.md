@@ -1,7 +1,7 @@
 # derpk31pro
 
-Kimi K3.1 Pro on a single DGX Station GB300: about TBD tokens per second for one conversation, with next-token
-probabilities within TBD (KLD) of the official model.
+Kimi K3.1 Pro on a single DGX Station GB300: over 100 tokens per second for one conversation (about 88 without the
+RTX PRO 6000), with next-token probabilities within 0.062 (KLD) of the official model.
 
 ## What is derpk31pro
 
@@ -31,8 +31,8 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 
 | profile | decode, 1 conversation | reading a prompt (32K / 128K tokens) | KLD: 512 samples / long context / prompts |
 |---|---|---|---|
-| `default` (GB300 + RTX PRO 6000) | 105.1 tokens/s | 2,138 / 2,164 tokens/s | TBD / 0.0240 / 0.0247 |
-| `nortx` (GB300 alone) | TBD tokens/s | TBD / TBD tokens/s | 0.0756 / TBD / TBD |
+| `default` (GB300 + RTX PRO 6000) | 105.1 tokens/s | 2,138 / 2,164 tokens/s | 0.0619 / 0.0240 / 0.0247 |
+| `nortx` (GB300 alone) | 88.5 tokens/s | 2,246 / 2,215 tokens/s | 0.0756 / TBD / TBD |
 
 Both profiles serve one conversation of up to 262,144 tokens (a 260,000-token prompt reads at about 2,000 tokens/s).
 
@@ -46,7 +46,8 @@ Both profiles serve one conversation of up to 262,144 tokens (a 260,000-token pr
   is the prompt's length divided by the time to the first token (its 32K and 128K prompts are 32,030 and 127,363
   tokens). Sampling is the model card's: temperature 1, top-p 0.95, which is also the engine's default. The DSpark
   drafter proposes 4 tokens per step; how many it gets right depends on the text it happens to sample, so one decode
-  run can land 4% either side of the average (TBD: the decode column is the mean of TBD runs of the same cell).
+  run can land 4% either side of the average. The table shows the standard profile's own run; four separate runs of
+  the same decode cell averaged 103.4 tokens/s (`default`) and 88.3 (`nortx`).
 - **Benchmarks:** lil-bench's own GPQA Diamond and tool-calling runs, with their default settings, against the
   same server. They check what KLD cannot fully see (below).
 - **KLD** (lower is closer): how far the next-token probabilities are from the official model's, measured on the
