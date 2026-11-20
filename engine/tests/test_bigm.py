@@ -1,8 +1,8 @@
 """k31_engine.bigm on the GB300: the prompt-size GEMMs against the engine's existing paths for the same weights.
 
-Run from engine/ (GB = the GB300's UUID; ~2-4 min, most of it Triton compiles; safe beside a running server if
+Run from engine/ (~2-4 min, most of it Triton compiles; safe beside a running server if
 ~3 GB of HBM are free, timings are not taken here):
-    GB=GPU-73779fc7-ce41-b87b-5239-16e36ce490fe
+    GB=$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader | awk -F", " 'index($2, "GB300") {print $1; exit}')
     docker run --rm --device nvidia.com/gpu=$GB --ulimit core=0 --network none --cpuset-cpus 60-61 \
         --user $(id -u):$(id -g) -e HOME=/tmp -v "$PWD":/engine:ro --entrypoint python3 vllm/vllm-openai:kimi-k31 \
         /engine/tests/test_bigm.py

@@ -2,7 +2,7 @@
 config table K31_BIGM_CFG reads.
 
 Run from engine/ with the GB300 otherwise idle (~5-8 min: Triton compiles of ~30 configs, then ~2 min of GPU):
-    GB=GPU-73779fc7-ce41-b87b-5239-16e36ce490fe; mkdir -p /tmp/bigm-out
+    GB=$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader | awk -F", " 'index($2, "GB300") {print $1; exit}'); mkdir -p /tmp/bigm-out
     docker run --rm --device nvidia.com/gpu=$GB --ulimit core=0 --network none --cpuset-cpus 60-61 \
         --user $(id -u):$(id -g) -e HOME=/tmp -v "$PWD":/engine:ro -v /tmp/bigm-out:/out \
         --entrypoint python3 vllm/vllm-openai:kimi-k31 /engine/tests/bench_bigm.py
