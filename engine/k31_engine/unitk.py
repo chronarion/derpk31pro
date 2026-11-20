@@ -6,7 +6,8 @@ candidates' distinct experts are ordered by their largest weight (ties: lower ex
 slots 0, 1, ...; their picks go to row S + slot, resident picks to their rows, everything else to -1 (cut).
 Outputs: the call's row ids [T, 16] (int32) and the stage list [SLOTS] (bank index per slot, or -1).
 Only the candidates of rank < SP (= 4, so strong <= 4) are considered, as per-token columns [T, SP]: the pairwise
-work is [T*SP, T*SP] (64 x 64 at T = 16).
+work is [T*SP, T*SP] (64 x 64 at T = 16). K31_STAGE_SP=8 doubles SP (ranks 0-7 may stage) for calls of up to 8 rows
+(the same 64 x 64 work), which is every decode call once K31_DECODE_SPLIT gives each verify block its own call.
 K31_STAGE_ALL=1 (ALLROWS): every pick of an expert that holds a slot uses the slot's row, at any rank and in any row of
 the call, not only the candidate picks that put it there. The same records are staged and MegaMoE sees the same
 distinct experts; picks that were cut (or given the mean) get the staged 2-bit record instead.
@@ -20,7 +21,8 @@ import triton
 import triton.language as tl
 
 SLOTS = 16
-SP = 4
+SP = int(os.environ.get("K31_STAGE_SP", "4") or 4)
+assert SP in (4, 8), f"K31_STAGE_SP={SP}: 4 or 8"
 PDL = __import__("os").environ.get("K31_PDL", "0") == "1"
 STAGE_ALL = os.environ.get("K31_STAGE_ALL", "0") == "1"
 
@@ -179,6 +181,7 @@ def plan(ids: torch.Tensor, w: torch.Tensor, row_map: torch.Tensor, bank_map: to
     allrows = STAGE_ALL if allrows is None else bool(allrows)
     T, K = ids.shape
     assert K == 16 and T <= 16 and strong <= SP
+    assert SP == 4 or T <= 8, f"K31_STAGE_SP={SP} plans calls of up to 8 rows (K31_DECODE_SPLIT=1), got {T}"
     if out is None:
         out = torch.empty((T, K), dtype=torch.int32, device=ids.device)
     if stage is None:

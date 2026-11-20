@@ -174,9 +174,12 @@ PRESTAGE = os.environ.get("K31_PRESTAGE", "0") == "1"
 # strong misses buy less KLD per staged record; with K31_STAGE_ALL a staged expert still serves its picks in every row
 STAGE_ROWCAPS = [int(x) for x in os.environ.get("K31_STAGE_ROWS", "").split(",") if x.strip()]
 _RCAP: list = [None]                # int32 [16] per row of a decode call (bind)
+# K31_STAGE_SP=8 (unitk.SP; needs K31_DECODE_SPLIT=1): a policy may stage ranks 0-7 instead of 0-3.
 # K31_STAGE_CAP=n (1..16; a policy's `stage_cap` per layer wins): a decode call stages at most n records, the candidates
 # with the largest routing weight first (unitk's order), so a layer's staging time per call is bounded whatever ranks
 # its policy stages. Default: the 16 slots of the call.
+STAGE_SP = int(os.environ.get("K31_STAGE_SP", "4") or 4)
+ONE_ROWS = 16 if STAGE_SP == 4 else 8                # the largest call the one-round plan takes (unitk)
 STAGE_CAP = int(os.environ.get("K31_STAGE_CAP", "0") or 0) or None
 # K31_STAGE_PRIOR=p0,p1,... (as K31_BAND_PRIOR): the experts a decode call stages are ordered by their largest routing
 # weight x the prior chance that the pick's row is accepted (row p of a verify block: p0 the bonus row, then the
@@ -762,8 +765,8 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
         _RES[0].join_eager()                             # tick waits for its GPU work here (no-op while capturing)
     T0, _K0 = topk_ids.shape
     sub = _SPLIT["sub"]                                  # K31_DECODE_SPLIT: one verify block of a larger decode batch
-    if not (MODE != "hbm" and T0 <= 16 and (torch.cuda.is_current_stream_capturing() or sub
-                                            or T0 * st.strong <= SLOTS)):
+    if not (MODE != "hbm" and T0 <= ONE_ROWS and (torch.cuda.is_current_stream_capturing() or sub
+                                                  or T0 * st.strong <= SLOTS)):
         _ld_join()                                       # every path but the one-round one reads hidden_states first
     if MODE == "hbm":
         rows = st.row_map[topk_ids.clamp_min(0).long()]
@@ -771,7 +774,7 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
         return _orig["forward"](self, hidden_states, topk_weights, ids, shared_experts)
     T, K = topk_ids.shape
     capturing = torch.cuda.is_current_stream_capturing()
-    if T <= 16 and (capturing or sub or T * st.strong <= SLOTS):   # one round: the fused planner (unitk.py)
+    if T <= ONE_ROWS and (capturing or sub or T * st.strong <= SLOTS):   # one round: the fused planner (unitk.py)
         from . import unitk
         main = torch.cuda.current_stream()
         if WINDOW_TEST and _WIN["ev"] is not None:       # join the previous layer's window before this MegaMoE call
@@ -1131,6 +1134,8 @@ def _bind(runner) -> None:
         _RPRI[0] = torch.tensor(rp, dtype=torch.float32, device=dev)
         _LOG(f"K31_STAGE_PRIOR: staging slots by largest weight x the row's prior; rows of a {P}-row verify block: "
              f"{', '.join(f'{v:g}' for v in rp[:P])}")
+    if STAGE_SP != 4 and not DECODE_SPLIT:
+        raise RuntimeError("K31_STAGE_SP=8 needs K31_DECODE_SPLIT=1 (the wider plan takes calls of up to 8 rows)")
     if STAGE_CAP is not None and not 1 <= STAGE_CAP <= SLOTS:
         raise RuntimeError(f"K31_STAGE_CAP={STAGE_CAP} outside 1..{SLOTS}")
     if DECODE_SPLIT:

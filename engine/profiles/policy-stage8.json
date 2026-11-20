@@ -1,0 +1,19 @@
+{
+ "note": "As policy-stage4.json with the misses of ranks 0-7 staged in every layer (needs K31_STAGE_SP=8 and K31_DECODE_SPLIT=1): resident rows on every rank, the RTX band on every rank (8 experts per call), the mean substitute for the rest. K31_STAGE_CAP, K31_STAGE_ROWS and K31_STAGE_PRIOR bound and order the staging per call.",
+ "version": 1,
+ "env": {
+  "K31_BAND_FEED": "0.25",
+  "BAND_READAHEAD": "8",
+  "K31_STAGE_SP": "8"
+ },
+ "policies": {
+  "s8": {
+   "hit": "0-15",
+   "band": "0-15",
+   "stage": "0-7",
+   "mean": "0-15",
+   "band_cap": 8
+  }
+ },
+ "default": "s8"
+}

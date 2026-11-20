@@ -57,7 +57,7 @@ ORDER = ("hit", "band", "stage", "late", "defer", "mean")
 LATE_MAX = 8                # records per late job (cpustage_seg2.h CPUSEG2_PMAX)
 K = 16                      # picks per token
 LAYERS = range(1, 93)       # MoE layers of K3.1 (model layer numbers)
-STAGE_MAX = 4               # unitk considers ranks < 4 for staging (SP)
+STAGE_MAX = int(os.environ.get("K31_STAGE_SP", "4") or 4)   # unitk considers ranks < SP for staging (4, or 8)
 DEFAULTS = {"hit": "0-15", "band": "0-15", "stage": "none", "defer": "none", "mean": "none", "late": "none"}
 
 
@@ -169,7 +169,8 @@ def compile_layer(layer: int, masks: list, band_cap: int = 16, name: str = "", l
         raise PolicyError(f"layer {layer}: band_cap {band_cap} outside 1..16")
     p.strong = _prefix(sets["stage"], "stage", layer)
     if p.strong > STAGE_MAX:
-        raise PolicyError(f"layer {layer}: 'stage' reaches rank {p.strong - 1}; unitk stages ranks < {STAGE_MAX}")
+        raise PolicyError(f"layer {layer}: 'stage' reaches rank {p.strong - 1}; unitk stages ranks < {STAGE_MAX}"
+                          + ("" if STAGE_MAX >= 8 else " (K31_STAGE_SP=8 with K31_DECODE_SPLIT=1: ranks < 8)"))
     d = sorted(sets["defer"])
     if d:
         if d != list(range(d[0], d[-1] + 1)):

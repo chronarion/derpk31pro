@@ -18,7 +18,8 @@
    calls of 9..K31_DECODE_SPLIT_MAX rows that are captured or part of a decode-only step, never a block itself.
 5. GPU: the split captured in a CUDA graph (20 rows): replays on new picks equal the reference, block by block, and
    the accepted-row buffers after a replay commit to the reference scores.
-CPU (parts 1-3 in the Triton interpreter): K31_TEST_CPU=1. GPU: every part.
+CPU (parts 1-3 in the Triton interpreter): K31_TEST_CPU=1. GPU: every part. With K31_STAGE_SP=8 in the environment
+the same checks run on the wider plan (staged ranks up to 0-7).
     docker run --rm --network none [--device nvidia.com/gpu=...] -v "$PWD":/engine:ro --entrypoint python3 IMAGE \
         /engine/tests/test_decode_split.py
 Exit 0 and "DECODE SPLIT: PASS" = every check passed.
@@ -142,9 +143,9 @@ bad, capped, n_pri = 0, 0, 0
 for trial in range(120 if CPU else 300):
     st = make_layer(rng, rng.randint(40, 200), rng.randint(200, 600), idx=rng.randint(1, 92))
     T = rng.randint(1, 8)
-    strong, resmax, allrows = rng.randint(1, 4), rng.choice([16, 16, 6, 10]), rng.random() < 0.5
+    strong, resmax, allrows = rng.randint(1, unitk.SP), rng.choice([16, 16, 6, 10]), rng.random() < 0.5
     cap = rng.randint(1, 16)
-    rc = [rng.choice([4, 4, 2, 1]) for _ in range(16)] if rng.random() < 0.5 else None
+    rc = [rng.choice([unitk.SP, 4, 2, 1]) for _ in range(16)] if rng.random() < 0.5 else None
     ids, w = make_call(rng, T, rng.randint(40, 896))
     pri = [[1.0, 0.5, 0.5, 0.25, 0.125][t % 5] for t in range(16)] if trial % 3 == 0 else None   # exact products
     want_ids, want_stage = plan_ref(st, ids, w, strong, st.slot_base, resmax, allrows, cap, rc, pri)
@@ -236,7 +237,7 @@ for trial in range(40 if CPU else 160):
     bad += not ok
     n_steps += 1
     if trial < 40:                                                           # 16-row buffers, one call (as before)
-        T16 = min(T, 15)
+        T16 = min(T, 15 if unitk.SP == 4 else 8)           # (K31_STAGE_SP=8: one call has up to 8 rows)
         nr = T16 // P
         if nr:
             sc = score0.clone()
@@ -293,7 +294,7 @@ else:
             hook._SPLIT["block"], hook._SPLIT["P"], hook._SPLIT["rows"] = block, P, 8
             st = make_layer(rng, rng.randint(50, 250), rng.randint(200, 500), idx=rng.randint(1, 92))
             st.band_map = None
-            st.strong = rng.randint(1, 4)
+            st.strong = rng.randint(1, unitk.SP)
             st.resmax = rng.choice([16, 16, 8])
             st.stage_cap = rng.choice([None, None, 2, 5])
             mean = torch.randint(-1, 2, (E, D)).to(torch.bfloat16)
@@ -333,7 +334,7 @@ else:
                 for c, (a, b) in enumerate(blocks):
                     cap = st.stage_cap or SL
                     wi, ws = plan_ref(st, ids[a:b], w[a:b], st.strong, st.slot_base, st.resmax, allrows, cap, rc)
-                    n_over += (b - a) * st.strong > SL
+                    n_over += (b - a) * st.strong > SL and st.strong <= 4
                     ok = ok and calls[c].tolist() == wi and staged[c] == ws
                     for t in range(a, b):                                    # the row's own call + its mean substitute
                         want = torch.full((D,), float(c + 1), dtype=torch.float64)
