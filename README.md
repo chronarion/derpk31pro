@@ -42,8 +42,8 @@ Every profile serves up to four conversations of up to 262,144 tokens each (a 26
 
 | how close (lower is closer) | writing its own answers: distance from the official model, 1 / 4 conversations at once | near-impossible tokens per 1,000 (4 at once) | confident mistakes per 1,000 (4 at once) | long answers stuck in a loop (4 at once) | KLD on fixed text, 512 samples (1 at a time) |
 |---|---|---|---|---|---|
-| `default` | 0.082 / 0.094 | 1.24 | 0.66 | 0 of 72 | measurement in progress, expected below `fast`'s 0.0619 |
-| `nortx` | 0.111 / 0.125 | 2.17 | 1.10 | 0 of 72 | measurement in progress, expected below `fast-nortx`'s 0.0756 |
+| `default` | 0.082 / 0.094 | 1.24 | 0.66 | 0 of 72 | not measured yet, expected below `fast`'s 0.0619 |
+| `nortx` | 0.111 / 0.125 | 2.17 | 1.10 | 0 of 72 | not measured yet, expected below `fast-nortx`'s 0.0756 |
 | `fast` | 0.101 / 0.105 (science questions only) | 1.90 (science questions only) | not measured | not measured | 0.0619 |
 | `fast-nortx` | 0.118 / 0.121 (science questions only) | 2.39 (science questions only) | not measured | not measured | 0.0756 |
 | an early build of `fast` | 0.300 (4 at once) | 10.8 | 3.84 | 6 of 64 | 0.0619 |
