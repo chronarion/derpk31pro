@@ -1,6 +1,6 @@
 # derpk31pro
 
-Kimi K3.1 Pro on a single DGX Station GB300, as close to the official model as GPQA Diamond can tell: TBD of 198
+Kimi K3.1 Pro on a single DGX Station GB300, as close to the official model as GPQA Diamond can tell: 186.3 of 198
 answered right (average of three runs; Moonshot reports 94.2%, 186.5 of 198), at about 76 tokens per second for one
 conversation and 111 for four at once. A `fast` profile trades some of that closeness for over 100 tokens per second.
 
@@ -32,7 +32,7 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 
 | profile | decode, 1 / 2 / 4 conversations at once | reading a prompt (32K / 128K tokens) | GPQA Diamond (198 questions) |
 |---|---|---|---|
-| `default` (GB300 + RTX PRO 6000) | 76.2 / 95.5 / 111.0 tokens/s | 2,117 / 2,163 tokens/s | TBD (runs: 186, TBD, TBD) |
+| `default` (GB300 + RTX PRO 6000) | 76.2 / 95.5 / 111.0 tokens/s | 2,117 / 2,163 tokens/s | 186.3 (runs: 186, 185, 188) |
 | `nortx` (GB300 alone) | 75.9 / 90.2 / 108.4 tokens/s | 2,232 / 2,228 tokens/s | TBD (runs: 188, TBD, TBD) |
 | `fast` (GB300 + RTX PRO 6000) | 103.4 / not measured / not measured | 2,138 / 2,164 tokens/s | not measured |
 | `fast-nortx` (GB300 alone) | 88.3 / not measured / not measured | 2,246 / 2,215 tokens/s | not measured |
