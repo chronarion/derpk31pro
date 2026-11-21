@@ -12,6 +12,12 @@
 # then L32 with the ratio to them (--cuts). L32_HIDDEN / L32_REF: the reference pass's hidden states and top-64 files
 # as both containers see them (default /kl/l32/ref{0,1}/{hidden.npy,kld.pt}); L32_ARGS: more harness arguments (e.g.
 # --windows 1 for a smoke run, --kl-rows=-4097:). Results: $STATE/results/engine-l32-<tag>.json (+ .tokens.pt).
+# OP="bucket1 bucket2 ...": on-policy buckets instead (the engine's own answers, tools/onpolicy/build_sets.py;
+# harness/kld_onpolicy.py): OP_SETS = their directory as the harness sees it (default /s/onpolicy/sets), OP_REF = the
+# reference passes' directory as both containers see it (default /kl/onpolicy: <bucket>/hidden.npy and kld.pt).
+# Results: $STATE/results/engine-op-<tag>-<bucket>.json (+ .tokens.pt). SERVE_E: start the server from another tree's
+# engine directory (default this one), e.g. a release tree, with EXTRA mounting this tree's k31_engine/force.py over
+# it when that tree's does not compute the reverse KL.
 set -u
 E=$(cd "$(dirname "$0")/.." && pwd); REPO=$(cd "$E/.." && pwd)
 [ -f "$REPO/config.env" ] && . "$REPO/config.env"
@@ -50,16 +56,39 @@ if c and c.get('ratio') is not None:
 " $STATE/results/engine-l32-$tag.json $tag 2>&1 | tee -a $L
   log "$tag: L32 scored in $(( $(date +%s) - t0 )) s"
 }
+op_kld() {      # the on-policy buckets $OP for configuration $1 (server up)
+  local tag=$1 b t0
+  for b in $OP; do
+    t0=$(date +%s)
+    docker run --rm --name op-harness --network host --cpus 2 --cpuset-cpus 44-45 --memory 32g --user "$(id -u):$(id -g)" \
+      -e HOME=/tmp -v $S:/s -v $STATE/results:/r -v ${KLD_DIR:-$STATE/kld}:/kl -v $E:/engine:ro --entrypoint python3 \
+      $RUNNER_IMG /engine/harness/kld.py http://127.0.0.1:${PORT:-8113} ${OP_SETS:-/s/onpolicy/sets}/$b.pt \
+      ${OP_REF:-/kl/onpolicy}/$b/kld.pt /r/engine-op-$tag-$b.json --mode decode \
+      --kl-hidden ${OP_REF:-/kl/onpolicy}/$b/hidden.npy --decode-logprobs 1 --pipeline ${OP_ARGS:-} \
+      > $STATE/results/sweep-$tag-op-$b.log 2>&1
+    python3 -I -c "
+import json, sys
+r = json.load(open(sys.argv[1]))
+f = lambda x: '-' if x is None else f'{x:.4f}'
+o, rv = r.get('onpolicy') or {}, (r.get('reverse') or {}).get('onpolicy') or {}
+ci = o.get('ci95') or [None, None]
+print(f'{sys.argv[2]} {sys.argv[3]}: ON-POLICY ROWS KLD {f(o.get(\"kld\"))} [{f(ci[0])}, {f(ci[1])}] over {o.get(\"rows\")} rows, '
+      f'p99 {f(o.get(\"p99\"))}, top-1 {100 * (o.get(\"top1\") or 0):.2f}%, reverse {f(rv.get(\"kld\"))} | by kind '
+      + ' '.join(f'{k} {f(v.get(\"kld\"))}' for k, v in (r.get('by_kind') or {}).items()))
+" $STATE/results/engine-op-$tag-$b.json $tag $b 2>&1 | tail -1 | tee -a $L
+    log "$tag $b: scored in $(( $(date +%s) - t0 )) s ($(grep -cE 'Traceback|RuntimeError|Error' $STATE/results/sweep-$tag-op-$b.log) failure lines)"
+  done
+}
 for cfg in "$@"; do
   tag=${cfg%% *}; envs=${cfg#* }; [ "$envs" = "$cfg" ] && envs=""
   log "== $tag: $PROFILE $envs"
-  (cd $E && ./k31.sh down >/dev/null 2>&1)
-  if ! (cd $E && env HARNESS=1 $envs ./k31.sh up $PROFILE > $STATE/results/sweep-$tag-up.log 2>&1); then
+  (cd ${SERVE_E:-$E} && ./k31.sh down >/dev/null 2>&1)
+  if ! (cd ${SERVE_E:-$E} && env HARNESS=1 $envs ./k31.sh up $PROFILE > $STATE/results/sweep-$tag-up.log 2>&1); then
     log "$tag: server failed to start (see sweep-$tag-up.log)"; continue
   fi
   docker logs derpk31pro 2>&1 | grep -E "^K31 ACTIVE" | tail -1 | tee -a $L
   t0=$(date +%s)
-  if [ -z "${NOKLD:-}" ] && [ "${L32:-}" != 1 ]; then
+  if [ -z "${NOKLD:-}" ] && [ "${L32:-}" != 1 ] && [ -z "${OP:-}" ]; then
   docker run --rm --network host --cpus 2 --cpuset-cpus 44-45 --memory 32g --user "$(id -u):$(id -g)" -e HOME=/tmp \
     -v $S:/s -v $STATE/results:/r -v ${KLD_DIR:-$STATE/kld}:/kl -v $E:/engine:ro --entrypoint python3 $RUNNER_IMG /engine/harness/kld.py \
     http://127.0.0.1:${PORT:-8113} /s/corpus/k31-bm-eval.pt ${REF:-/s/w4ref0/kld.pt,/s/w4ref1/kld.pt} /r/engine-bm-$tag.json ${SUBSET:+--subset $SUBSET} ${HMODE:+--mode $HMODE} ${PROMPT:+--prompt $PROMPT} ${HWIN:+--windows $HWIN} ${KLREF:+--kl-ref $KLREF} ${KLHIDDEN:+--kl-hidden $KLHIDDEN} \
@@ -85,9 +114,10 @@ if r.get('kld_decode_rows') is not None and 'exact' in r.get('note', ''):
   log "$tag: scored in $(( $(date +%s) - t0 )) s"
   fi
   [ -z "${NOKLD:-}" ] && [ -n "${L32:-}" ] && l32_kld "$tag"
+  [ -z "${NOKLD:-}" ] && [ -n "${OP:-}" ] && op_kld "$tag"
   [ -z "${NOBENCH:-}" ] && python3 -I $E/harness/bench.py http://127.0.0.1:8113 --runs ${BENCH_RUNS:-6} --max-tokens ${BENCH_TOKENS:-256} 2>&1 | tee $STATE/results/bench-$tag.out | tail -1 | sed "s/^/$tag decode: /" | tee -a $L
   docker logs derpk31pro 2>&1 | grep -E "SpecDecoding metrics" | tail -1 | sed "s/.*Mean acceptance/$tag acceptance: Mean acceptance/" | tee -a $L
   docker logs derpk31pro 2>&1 | grep -E "^K31 residency: [0-9]" | tail -1 | sed "s/^/$tag /" | tee -a $L
-  (cd $E && ./k31.sh down >/dev/null 2>&1)
+  (cd ${SERVE_E:-$E} && ./k31.sh down >/dev/null 2>&1)
 done
 log "sweep done"

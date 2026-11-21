@@ -18,6 +18,8 @@ to k31_kl_out near the request's end (rewritten on each of its last steps).
 
 Long sequences: a request that also carries `"k31_kl_rows": [A, B]` takes the row-range path at the end of this file
 (only rows [A, B) are read and scored; the reference block stays in pinned host memory, the forced rows sit on the GPU).
+On that path `"k31_kl_rev": 1` also computes the reverse divergence KL(engine || reference) of the same rows from the
+same two distributions and saves it beside k31_kl_out (FILE.rev.npy); the forward values are computed as without it.
 """
 from __future__ import annotations
 
@@ -166,6 +168,8 @@ class ForceTokens(LogitsProcessor):
                 k = self.kl.get(slot)
                 if k is not None and ctx.seq_lens_upper_bound_np[b] >= k["end"] - 4:
                     np.save(k["path"], k["out"][:-1].cpu().numpy())
+                    if k.get("rev") is not None:
+                        np.save(k["path"][:-4] + ".rev.npy", k["rev"][:-1].cpu().numpy())
         f = self.tok[slots, pos]
         rows = (f >= 0).unsqueeze(1)
         idx = f.clamp_min(0).long().unsqueeze(1)
@@ -325,6 +329,7 @@ def _rows_entry(xa: dict, n_force: int, dev) -> dict:
     pend = min(hi, start - 1)                    # prompt rows [lo, pend) stay in host memory until the prompt is done
     return {"ref": ref, "lo": dlo, "hi": max(hi, dlo), "host": host if pend > lo else None, "host_lo": lo,
             "host_hi": pend, "hidden": hidden, "out": torch.full((end + 1,), float("nan"), device=dev),
+            "rev": torch.full((end + 1,), float("nan"), device=dev) if xa.get("k31_kl_rev") else None,
             "path": xa["k31_kl_out"], "end": end}
 
 
@@ -346,6 +351,10 @@ def _rows_apply(k: dict, slot: int, slots: torch.Tensor, pos: torch.Tensor, lp: 
     p0 = r.exp()
     v = torch.where(p0 > 0, p0 * (r - lp), 0.0).sum(-1)
     k["out"].index_put_((torch.where(mine, pos, T),), v)
+    if k.get("rev") is not None:                 # KL(engine || reference) of the same rows
+        q0 = lp.exp()
+        vr = torch.where(q0 > 0, q0 * (lp - r), 0.0).sum(-1)
+        k["rev"].index_put_((torch.where(mine, pos, T),), vr)
 
 
 def _rows_prompt(k: dict, logits_fn, hidden_states, input_batch, i: int, prompt_len: int, dev) -> None:
@@ -384,6 +393,11 @@ def _rows_prompt(k: dict, logits_fn, hidden_states, input_batch, i: int, prompt_
             p0 = r.exp()
             v = torch.where(p0 > 0, p0 * (r - lp), 0.0).sum(-1)
             k["out"][r0:r1] = v[r0 - a:r1 - a]
-            del lp, r, p0, rows, v
+            del p0, v
+            if k.get("rev") is not None:             # after p0 is freed: the same peak memory as without it
+                q0 = lp.exp()
+                k["rev"][r0:r1] = torch.where(q0 > 0, q0 * (lp - r), 0.0).sum(-1)[r0 - a:r1 - a]
+                del q0
+            del lp, r, rows
     if chunk_end >= prompt_len:
         k["host"] = None                             # the prompt is done: release the pinned block

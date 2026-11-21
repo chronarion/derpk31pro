@@ -16,6 +16,9 @@ Per position t (the distribution after token t, predicting t + 1; the last posit
 
 Sequences longer than 2,048 tokens (the L32 set) or --long: kld_long.py's protocol (prompt and forced rows both scored
 exactly in the server, per-sequence prompt lengths, row ranges); the 2,048-token protocol above is unchanged.
+
+A corpus with per-sequence lengths (`lens`: a bucket of the engine's own answers, tools/onpolicy/build_sets.py):
+kld_onpolicy.py's protocol (the engine re-reads what it generated; exact KL and reverse KL per row).
 """
 import argparse
 import json
@@ -120,9 +123,16 @@ def main():
     p.add_argument("--cuts", default="", help="--long: the same arm's 2,048-token-cut result JSON (kld.py on "
                    "k31-bm-eval.pt with --roles): ratio of this set's headline to the cuts' generated-row KLD on the "
                    "same kinds")
+    p.add_argument("--no-rev", action="store_true", help="on-policy buckets: do not ask the server for the reverse "
+                   "KL(engine || reference) (k31_kl_rev; a server whose force.py does not have it)")
+    p.add_argument("--conc", type=int, default=1, help="on-policy buckets: sequences in flight at once (default 1, as "
+                   "the fixed-text protocols read; 4 = as a server with four busy slots reads)")
     a = p.parse_args()
     c = torch.load(a.corpus, weights_only=False)
     tokens = c["tokens"] if isinstance(c, dict) else c
+    if isinstance(c, dict) and c.get("lens") is not None and not a.dump_ref:
+        import kld_onpolicy
+        return kld_onpolicy.run(a, c, ask_decode)
     if (a.long or tokens.shape[1] > 2048) and not a.dump_ref:
         import kld_long
         return kld_long.run(a, c, ask_decode)
