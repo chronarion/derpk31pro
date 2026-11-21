@@ -40,14 +40,14 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 Every profile serves up to four conversations of up to 262,144 tokens each (a 260,000-token prompt reads at about
 2,000 tokens/s).
 
-| how close (lower is closer) | writing its own answers: distance from the official model, 1 / 4 conversations at once | near-impossible tokens per 1,000 (4 at once) | confident mistakes per 1,000 (4 at once) | long answers stuck in a loop (4 at once) | KLD on fixed text, 512 samples (1 at a time) |
+| how close (lower is closer) | writing its own answers: distance from the official model, 1 / 4 conversations at once | near-impossible tokens per 1,000 (4 at once) | confident mistakes per 1,000 (4 at once) | long answers stuck in a loop (4 at once) | KLD on fixed text, 32 / 512 samples (1 at a time) |
 |---|---|---|---|---|---|
-| `default` | 0.082 / 0.094 | 1.24 | 0.66 | 0 of 72 | not measured yet, expected below `fast`'s 0.0619 |
-| `nortx` | 0.111 / 0.125 | 2.17 | 1.10 | 0 of 72 | not measured yet, expected below `fast-nortx`'s 0.0756 |
-| `fast` | 0.101 / 0.105 (science questions only) | 1.90 (science questions only) | not measured | not measured | 0.0619 |
-| `fast-nortx` | 0.118 / 0.121 (science questions only) | 2.39 (science questions only) | not measured | not measured | 0.0756 |
-| an early build of `fast` | 0.300 (4 at once) | 10.8 | 3.84 | 6 of 64 | 0.0619 |
-| the official model, for scale | 0.003 | under 0.01 on science questions, up to 0.8 on chat | 0 | | 0 |
+| `default` | 0.082 / 0.094 | 1.24 | 0.66 | 0 of 72 | 0.0452 / not measured yet, expected below `fast`'s 0.0619 |
+| `nortx` | 0.111 / 0.125 | 2.17 | 1.10 | 0 of 72 | 0.0616 / not measured yet, expected below `fast-nortx`'s 0.0756 |
+| `fast` | 0.101 / 0.105 (science questions only) | 1.90 (science questions only) | not measured | not measured | 0.0896 / 0.0619 |
+| `fast-nortx` | 0.118 / 0.121 (science questions only) | 2.39 (science questions only) | not measured | not measured | 0.1006 / 0.0756 |
+| an early build of `fast` | 0.300 (4 at once) | 10.8 | 3.84 | 6 of 64 | 0.0896 / 0.0619 |
+| the official model, for scale | 0.003 | under 0.01 on science questions, up to 0.8 on chat | 0 | | 0 / 0 |
 
 - **Speed:** [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) (lil-bench) 1.7.1.
   Decode is its decode cell (a chat prompt, generated tokens counted over 30 s) with 1, 2 or 4 conversations at once,
