@@ -33,7 +33,7 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 | profile | decode, 1 / 2 / 4 conversations at once | reading a prompt (32K / 128K tokens) | GPQA Diamond (198 questions) |
 |---|---|---|---|
 | `default` (GB300 + RTX PRO 6000) | 76.2 / 95.5 / 111.0 tokens/s | 2,117 / 2,163 tokens/s | 186.3 (runs: 186, 185, 188) |
-| `nortx` (GB300 alone) | 75.9 / 90.2 / 108.4 tokens/s | 2,232 / 2,228 tokens/s | TBD (runs: 188, TBD, TBD) |
+| `nortx` (GB300 alone) | 75.9 / 90.2 / 108.4 tokens/s | 2,232 / 2,228 tokens/s | 187.0 (runs: 188, 186) |
 | `fast` (GB300 + RTX PRO 6000) | 103.4 / not measured / not measured | 2,138 / 2,164 tokens/s | not measured |
 | `fast-nortx` (GB300 alone) | 88.3 / not measured / not measured | 2,246 / 2,215 tokens/s | not measured |
 
@@ -42,8 +42,8 @@ Every profile serves up to four conversations of up to 262,144 tokens each (a 26
 
 | how close (lower is closer) | writing its own answers: distance from the official model, 1 / 4 conversations at once | near-impossible tokens per 1,000 (4 at once) | confident mistakes per 1,000 (4 at once) | long answers stuck in a loop (4 at once) | KLD on fixed text, 512 samples (1 at a time) |
 |---|---|---|---|---|---|
-| `default` | 0.082 / 0.094 | 1.24 | 0.66 | 0 of 72 | TBD |
-| `nortx` | 0.111 / 0.125 | 2.17 | 1.10 | 0 of 72 | TBD |
+| `default` | 0.082 / 0.094 | 1.24 | 0.66 | 0 of 72 | not measured yet |
+| `nortx` | 0.111 / 0.125 | 2.17 | 1.10 | 0 of 72 | not measured yet |
 | `fast` | 0.101 / 0.105 (science questions only) | 1.90 (science questions only) | not measured | not measured | 0.0619 |
 | `fast-nortx` | 0.118 / 0.121 (science questions only) | 2.39 (science questions only) | not measured | not measured | 0.0756 |
 | an early build of `fast` | 0.300 (4 at once) | 10.8 | 3.84 | 6 of 64 | 0.0619 |
@@ -57,7 +57,8 @@ Every profile serves up to four conversations of up to 262,144 tokens each (a 26
   happens to sample, so one run can land 4% either side of the average.
 - **GPQA Diamond:** lil-bench's `--test-profile gpqa-diamond`, all 198 questions, at the model card's settings
   (reasoning effort max, temperature 1, top-p 0.95), four questions at a time. One run can land about 3.5 questions
-  either side of a configuration's true score, so the table shows the average of three runs and the runs themselves.
+  either side of a configuration's true score, so the table shows the average of three runs (two for `nortx`) and
+  the runs themselves.
   No answer in any run ran out of room.
 - **Writing its own answers:** the engine answers 120 fixed prompts, alone and with four requests running at once, and
   the official model then judges every token it wrote. This catches rare, confident mistakes and damage that only
@@ -266,7 +267,8 @@ The engine was built one change at a time, each measured on its own run where we
 one forward pass in milliseconds (steadier), and KLD on the 32-sequence screen ("rot32"). Several changes went in
 together; where a number covers a bundle, it says so. The KLD screen was made stricter part of the way (drafts accepted
 at the drafter's real rates instead of always): the same engine reads about 10% higher under it, so KLD numbers are
-compared only within one protocol.
+compared only within one protocol. Most of this history built what are now the `fast` profiles; `default` and
+`nortx` add the staging policies, the refitted averages and the decode split described above.
 
 ### Speed
 
@@ -378,9 +380,9 @@ From here on, speed is lil-bench's decode cell at the model card's sampling (tem
 | FX | final drafter with full-attention KV specs (instead of XBT) | 93.1 | 38.1 | |
 | FXJ15T | + resident caps (joint15), draft-side top-p | 99.8 | 40.4 | 0.0882 |
 | RF15T | + int8 latent down-projection | 101.7 | 41.0 | 0.0878 |
-| RF | release map (9,390 experts, sized by the prompt's peak), prompt kernels: the `default` profile | 103.4 | 41.1 | 0.0896 |
+| RF | release map (9,390 experts, sized by the prompt's peak), prompt kernels: now the `fast` profile | 103.4 | 41.1 | 0.0896 |
 | NF0T | without the RTX: the final drafter, staging table t92 for stage-all, fused DSA, int8 latent, top-p | 87.8 | 35.5 | 0.0892 |
-| NF | release map: the `nortx` profile | 86.4 | 35.6 | |
+| NF | release map: now the `fast-nortx` profile | 86.4 | 35.6 | |
 | NRC1 | + row caps 4,4,2,1,1 | 88.3 | 36.6 | 0.1006 |
 </details>
 
