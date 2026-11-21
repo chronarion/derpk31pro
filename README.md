@@ -1,7 +1,8 @@
 # derpk31pro
 
-Kimi K3.1 Pro on a single DGX Station GB300: over 100 tokens per second for one conversation (about 88 without the
-RTX PRO 6000), with next-token probabilities within 0.062 (KLD) of the official model.
+Kimi K3.1 Pro on a single DGX Station GB300, as close to the official model as GPQA Diamond can tell: TBD of 198
+answered right (average of three runs; Moonshot reports 94.2%, 186.5 of 198), at about 76 tokens per second for one
+conversation and 111 for four at once. A `fast` profile trades some of that closeness for over 100 tokens per second.
 
 ## What is derpk31pro
 
@@ -15,48 +16,59 @@ derpk31pro serves the model from one DGX Station anyway, by keeping each expert 
   changes as the conversation goes; experts move in from the drive in the background.
 - **The RTX PRO 6000** (the Station's second card) holds about 11,000 more experts in a compact 2-bit form and computes
   them at the same time as the GB300 computes its own.
-- **The CPU's memory** holds about 42,000 experts in 2-bit form. When a token strongly needs one of them, the GB300
-  copies it in for that step.
+- **The CPU's memory** holds about 42,000 experts in 2-bit form. When a token needs one of them, the GB300 copies it
+  in for that step.
 - **Everything else is a trade we measure.** Not every pick matters equally: some layers barely notice when an
   expert is approximated, others carry the error forward, and a token's strongest picks carry most of its weight.
-  derpk31pro's philosophy is to profile the impact of every shortcut, layer by layer and pick by pick, in KLD and in
-  time, and to write the result down as a policy: which picks are computed on the RTX, which are copied in from CPU
-  memory, and which get the expert's average output instead. Policies sit at different points between decode speed
-  and KLD; several are included, and you can write your own (see [Policies](#policies)).
+  derpk31pro's philosophy is to profile the impact of every shortcut, layer by layer and pick by pick, and to write
+  the result down as a policy: which picks are computed on the RTX, which are copied in from CPU memory, and which get
+  the expert's average output instead. Policies sit at different points between speed and closeness; several are
+  included, and you can write your own (see [Policies](#policies)).
 
 Everything is fed from one 4 TB NVMe drive. The engine runs inside vLLM's `kimi-k31` image and is built around
 MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in one launch.
 
 ## How fast and how close
 
-| profile | decode, 1 conversation | reading a prompt (32K / 128K tokens) | KLD: 512 samples / long context / prompts |
+| profile | decode, 1 / 2 / 4 conversations at once | reading a prompt (32K / 128K tokens) | GPQA Diamond (198 questions) |
 |---|---|---|---|
-| `default` (GB300 + RTX PRO 6000) | 105.1 tokens/s | 2,138 / 2,164 tokens/s | 0.0619 / 0.0240 / 0.0247 |
-| `nortx` (GB300 alone) | 88.5 tokens/s | 2,246 / 2,215 tokens/s | 0.0756 / TBD / TBD |
+| `default` (GB300 + RTX PRO 6000) | 76.2 / 95.5 / 111.0 tokens/s | 2,117 / 2,163 tokens/s | TBD (runs: 186, TBD, TBD) |
+| `nortx` (GB300 alone) | 75.9 / 90.2 / 108.4 tokens/s | 2,232 / 2,228 tokens/s | TBD (runs: 188, TBD, TBD) |
+| `fast` (GB300 + RTX PRO 6000) | 103.4 / not measured / not measured | 2,138 / 2,164 tokens/s | not measured |
+| `fast-nortx` (GB300 alone) | 88.3 / not measured / not measured | 2,246 / 2,215 tokens/s | not measured |
 
-Both profiles serve one conversation of up to 262,144 tokens (a 260,000-token prompt reads at about 2,000 tokens/s).
+Every profile serves up to four conversations of up to 262,144 tokens each (a 260,000-token prompt reads at about
+2,000 tokens/s).
 
-| benchmark (lil-bench) | derpk31pro (`default`) | for comparison |
-|---|---|---|
-| GPQA Diamond (`--test-profile gpqa-diamond`, all 198 questions) | TBD | 94.2 in Moonshot's model card (reasoning effort max, temperature 1, top-p 0.95); 93.97 for the official MXFP4 checkpoint in NVIDIA's evaluation (their own protocol) |
-| Tool calling (`--tool-eval`: tool-eval-bench, community leaderboard settings) | TBD | |
+| how close (lower is closer) | writing its own answers: distance from the official model, 1 / 4 conversations at once | near-impossible tokens per 1,000 (4 at once) | confident mistakes per 1,000 (4 at once) | long answers stuck in a loop (4 at once) | KLD on fixed text, 512 samples (1 at a time) |
+|---|---|---|---|---|---|
+| `default` | 0.082 / 0.094 | 1.24 | 0.66 | 0 of 72 | TBD |
+| `nortx` | 0.111 / 0.125 | 2.17 | 1.10 | 0 of 72 | TBD |
+| `fast` | 0.101 / 0.105 (science questions only) | 1.90 (science questions only) | not measured | not measured | 0.0619 |
+| `fast-nortx` | 0.118 / 0.121 (science questions only) | 2.39 (science questions only) | not measured | not measured | 0.0756 |
+| an early build of `fast` | 0.300 (4 at once) | 10.8 | 3.84 | 6 of 64 | 0.0619 |
+| the official model, for scale | 0.003 | under 0.01 on science questions, up to 0.8 on chat | 0 | | 0 |
 
-- **Speed:** [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) (lil-bench) 1.7.1,
-  standard profile. Decode is its single-conversation cell (a chat prompt, 2,048 generated tokens); reading a prompt
-  is the prompt's length divided by the time to the first token (its 32K and 128K prompts are 32,030 and 127,363
-  tokens). Sampling is the model card's: temperature 1, top-p 0.95, which is also the engine's default. The DSpark
-  drafter proposes 4 tokens per step; how many it gets right depends on the text it happens to sample, so one decode
-  run can land 4% either side of the average. The table shows the standard profile's own run; four separate runs of
-  the same decode cell averaged 103.4 tokens/s (`default`) and 88.3 (`nortx`).
-- **Benchmarks:** lil-bench's own GPQA Diamond and tool-calling runs, with their default settings, against the
-  same server. They check what KLD cannot fully see (below).
-- **KLD** (lower is closer): how far the next-token probabilities are from the official model's, measured on the
-  tokens a model generates. **512 samples:** 2,048-token samples of 11 kinds of text, each read as the engine serves
-  it (a short prompt, then one token at a time). **Long context:** 32 samples of 32,768 tokens, read as a prompt
-  up to their last 2,048-4,096 tokens, which are generated. **Prompts:** the generated-text rows inside those long
-  prompts, as the prompt path reads them (KLD on prefill). A short prompt read cold, before the tiers have adapted to
-  the text, scores higher: 1,024-token prompts on the 32-sample screen read 0.0942 (`default`) and TBD (`nortx`). See
-  [Measuring KLD](#measuring-kld).
+- **Speed:** [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) (lil-bench) 1.7.1.
+  Decode is its decode cell (a chat prompt, generated tokens counted over 30 s) with 1, 2 or 4 conversations at once,
+  the mean of four runs; reading a prompt is the standard profile's prompt length divided by the time to the first
+  token (32,030 and 127,363 tokens). Sampling is the model card's: temperature 1, top-p 0.95, which is also the
+  engine's default. The DSpark drafter proposes 4 tokens per step; how many it gets right depends on the text it
+  happens to sample, so one run can land 4% either side of the average.
+- **GPQA Diamond:** lil-bench's `--test-profile gpqa-diamond`, all 198 questions, at the model card's settings
+  (reasoning effort max, temperature 1, top-p 0.95), four questions at a time. One run can land about 3.5 questions
+  either side of a configuration's true score, so the table shows the average of three runs and the runs themselves.
+  No answer in any run ran out of room.
+- **Writing its own answers:** the engine answers 120 fixed prompts, alone and with four requests running at once, and
+  the official model then judges every token it wrote. This catches rare, confident mistakes and damage that only
+  appears under load, which KLD on fixed text does not see. The loop count comes from 72 longer answers (up to 32,768
+  tokens). The `fast` rows were measured on 48 science questions only, which read closer than the full set (the early
+  build: 0.22 on them against 0.30 on all 120). See [Measuring what the engine writes](#measuring-what-the-engine-writes).
+- **KLD on fixed text** (lower is closer): how far the next-token probabilities are from the official model's on text
+  the official model would write, read one conversation at a time. See [Measuring KLD](#measuring-kld).
+- **The early build** is `fast` before the decode split (see [Serving several conversations](#serving-several-conversations)):
+  it read well on fixed text, one conversation at a time, and fell apart with four. It is in the table because it is why
+  the second measurement exists.
 
 ## What you need
 
@@ -82,21 +94,26 @@ engine/store/run_build_store.sh      # the 2-bit records of every expert, ~1.4 T
 engine/k31.sh up                     # starts the server on 127.0.0.1:8113 (OpenAI-compatible API)
 ```
 
-Without an RTX PRO 6000, start the `nortx` profile instead: `engine/k31.sh up nortx`. The first start takes several minutes: it reads the resident experts and 388 GB of 2-bit records into memory and
-compiles kernels. `engine/k31.sh down` stops it; `engine/k31.sh logs` shows the log.
+Without an RTX PRO 6000, start the `nortx` profile instead: `engine/k31.sh up nortx`. For more speed and less
+closeness, start `fast` (or `fast-nortx`): the earlier settings, which stage fewer picks. The first start takes several
+minutes: it reads the resident experts and up to 418 GB of 2-bit records into memory and compiles kernels.
+`engine/k31.sh down` stops it; `engine/k31.sh logs` shows the log.
 
 <details>
 <summary>The average-output tables</summary>
 
 Skipped picks are replaced by each expert's average output, from tables measured on held-out text and published on
-Hugging Face ([chronarion/derpk31pro-means](https://huggingface.co/chronarion/derpk31pro-means), 591 MB):
+Hugging Face ([chronarion/derpk31pro-means](https://huggingface.co/chronarion/derpk31pro-means), 591 MB each).
+`default` and `nortx` use the refitted table (`k31-fmeans.safetensors`: each expert's average refitted on the picks
+that actually get it, weighted by how much each pick contributes to the layer's output; about 12% lower KLD in our
+reference runner); `fast` and `fast-nortx` use the first one (`k31-expert-means.safetensors`):
 
 ```bash
-hf download chronarion/derpk31pro-means k31-expert-means.safetensors --local-dir /models/k31-means
+hf download chronarion/derpk31pro-means k31-fmeans.safetensors k31-expert-means.safetensors --local-dir /models/k31-means
 ```
 
 and set `MEANS_DIR=/models/k31-means` in `config.env`. Without them, start with `K31_CUT_MEAN=` (empty): skipped
-picks then add nothing, which raises KLD. They can be rebuilt with the reference runner's means pass
+picks then add nothing, which raises KLD. The first table can be rebuilt with the reference runner's means pass
 (`tools/runner`, `--save-means`).
 </details>
 
@@ -154,6 +171,44 @@ Two more things make decoding fast: the dense parts of the model run in 8-bit fo
 FP8, MXFP4), and the DSpark drafter proposes 4 tokens per step that the model checks in one pass, so a step yields
 about 2.45 tokens on average at the model card's sampling (temperature 1, top-p 0.95).
 
+### Serving several conversations
+
+An earlier build had a serious problem we did not see at first, and it shaped how this engine is measured.
+
+**What went wrong.** Each decode step checks 5 rows per conversation: the next token and the drafter's 4 guesses.
+The engine's budgets (which picks go to the RTX, how many copies are staged from CPU memory, the caps per draft row,
+and the scores that decide which experts move into GPU memory) were all set per expert-layer call, and one call
+covered every conversation in the step. With four conversations a step carried 20 rows, and past 16 rows the engine
+fell back to a simpler path: the RTX was switched off, staging lost its per-row plan, rejected draft rows were scored
+as if they had been accepted, and the experts in GPU memory stopped following the conversations. One conversation at
+a time, everything was fine.
+
+**What it did.** With four conversations at once, the engine's answers drifted about three times as far from the
+official model as with one, it wrote tokens the official model would almost never write four to five times as
+often, and 3.4% of its answers fell into a repetition loop that ran until the answer was out of room. On GPQA
+Diamond, run four questions at a time, it scored 172 of 198 (the official model: 186.5).
+
+**Why our measurements missed it.** KLD on fixed text reads one conversation at a time, on text the official model
+wrote, and it read 0.062 for this build. A loop does not show in it either: once a model is repeating itself, the
+official model agrees that the next token is "more of the same". The damage sits in the few tokens where a loop
+starts, and an average over hundreds of thousands of tokens hides them.
+
+**How we found it.** GPQA answers that never finished led us to read the engine's own answers back through the
+official model. In 9 of 13 loops, the official model gave the token that started the loop under a 0.6% chance where
+the engine gave it 50-100%; and the damage appeared only when a step carried 20 rows (four conversations with four
+drafts each), not with 8 or 5.
+
+**The fix.** With more than 8 rows in a step, each conversation's rows now run through the one-conversation path as
+their own call (`K31_DECODE_SPLIT`), so every budget applies per conversation. Four at once are now as close to the
+official model as one (distance 0.105 against 0.101 for the `fast` settings). That made four conversations about 13%
+slower in total, so a joint path (`K31_DECODE_JOINT`) then shares what can be shared: the layer's dense parts and one
+MegaMoE launch for all conversations, while each keeps its own staging plan and RTX call. Its results are bit for bit
+those of the split; it brought four conversations of `default` from 94 to 111 tokens/s in total.
+
+The closer `default` and `nortx` profiles came out of the same work: with four conversations measured properly,
+staging more of each token's picks (ranks 0-7 instead of 0-3) and better average outputs paid for themselves in
+GPQA, at about 76 tokens/s for one conversation instead of about 103.
+
 ## Policies
 
 derpk31pro does not assume which shortcuts are safe: it measures them. A sensitivity study
@@ -178,14 +233,17 @@ Several policies are included, and we keep trying new ones:
 
 | policy | hardware | what it does | trade |
 |---|---|---|---|
-| `policy-joint15.json` (**`default` profile**) | GB300 + RTX | staged ranks and resident caps chosen together for about 1.5 ms less per step: in the least sensitive layers a token's weaker picks get the average even when their expert is in GPU memory | measured: +6% steps per second, KLD screen 0.0882 against 0.0702 without caps |
+| `policy-stage8.json` (**`default` profile**) | GB300 + RTX | a token's 8 strongest picks are staged whenever their expert has a 2-bit copy in CPU memory, in every layer; no resident caps; at most 8, 8, 4, 2, 2 staged ranks for the 5 rows of a verify block and 6 copies per call | measured: GPQA Diamond 186 of 198 (one run), distance 0.082 / 0.094 at 1 / 4 conversations; 76 tokens/s |
+| `policy-stage4.json` (`quality` profile) | GB300 + RTX | the same with the 4 strongest picks | priced in the reference runner, not measured on its own |
+| `policy-nortx-stage4.json` (**`nortx` profile**) | GB300 alone | a token's 4 strongest picks staged in every layer; at most 4, 4, 4, 2, 2 staged ranks per row and 6 copies per call | measured: GPQA Diamond 188 of 198 (one run), distance 0.111 / 0.125; 76 tokens/s |
+| `policy-joint15.json` (**`fast` profile**) | GB300 + RTX | staged ranks and resident caps chosen together for about 1.5 ms less per step: in the least sensitive layers a token's weaker picks get the average even when their expert is in GPU memory | measured: +6% steps per second, KLD screen 0.0882 against 0.0702 without caps |
 | `policy-joint12.json`, `policy-joint20.json` | GB300 + RTX | the same, for about 1.2 / 2.0 ms less | measured: joint20 +2% steps per second over joint15, KLD screen 0.1022 against 0.0882 (too far for the KLD target) |
 | `policy-caps06.json`, `policy-caps12.json` | GB300 + RTX | resident caps only, the default's staged ranks | measured: caps12's KLD screen 0.0846 against joint12's 0.0833 |
 | `policy-default.json` | GB300 + RTX | no caps; the strongest pick staged in most layers, the 2 strongest in layers 74, 76-80 and 83, the 4 strongest in 52-59 and 92, nothing in the 16 least sensitive layers | the base the others are compared with |
 | `policy-quality.json` | GB300 + RTX | more staging | simulated: about 0.5 ms more per forward pass, about 4.9% lower KLD |
 | `policy-balanced.json` | GB300 + RTX | as much staging as the default, placed by KLD per staged copy | simulated: same time, about 1.4% lower KLD |
 | `policy-fast.json` | GB300 + RTX | less staging | simulated: about 0.6 ms less per forward pass, about 4.6% higher KLD |
-| `policy-nortx-t92-allrows.json` (**`nortx` profile**) | GB300 alone | staged ranks placed by KLD per microsecond of staging: the 4 strongest picks in the most sensitive layers, the strongest in most others, none in the cheapest | |
+| `policy-nortx-t92-allrows.json` (**`fast-nortx` profile**) | GB300 alone | staged ranks placed by KLD per microsecond of staging: the 4 strongest picks in the most sensitive layers, the strongest in most others, none in the cheapest | |
 | `policy-nortx-joint03/06/09.json` | GB300 alone | resident caps without the RTX | measured: joint06 +2% steps per second, KLD screen 0.1005 against 0.0892 without caps |
 | `policy-nortx.json`, `policy-nortx-fast.json`, `policy-nortx-t92.json` | GB300 alone | earlier GB300-alone tables | |
 
@@ -194,11 +252,12 @@ the picks that are not staged. Choose a policy with `K31_POLICY`, for example
 `K31_POLICY=/engine/profiles/policy-fast.json engine/k31.sh up`. The file format is in `engine/POLICY.md`.
 
 Two settings change what every policy stages. A record staged for a token's strong pick also serves that expert's
-weaker picks and its picks in the other rows of the verify block (`K31_STAGE_ALL`, on in both profiles: the same
+weaker picks and its picks in the other rows of the verify block (`K31_STAGE_ALL`, on in every profile: the same
 copies, more picks served). And `K31_STAGE_ROWS` caps the staged ranks per row of the verify block, because a later
 draft row only counts when the drafts before it were accepted (about 69%, 43%, 24% and 14% of the time for rows 1-4):
 `K31_STAGE_ROWS=4,4,2,1,1` measured +2.8% steps per second without the RTX, KLD screen 0.1006 against 0.0892; it is
-the `nortx` profile's default (512-sample KLD 0.0756).
+the `fast-nortx` profile's default (512-sample KLD 0.0756). `K31_STAGE_CAP` caps the copies one call stages; the
+`default` and `nortx` profiles stage at most 6.
 
 ## What made it fast, and what kept it close
 
@@ -338,12 +397,14 @@ overridden when starting (`K31_X=... engine/k31.sh up`).
 | `K31_HBM_MAP` | `hbm-map-256k-final.json` | experts kept in GPU memory per layer (9,390 in all) |
 | `K31_BAND_N`, `K31_BAND_MAP` | 118, `band-map.json` | experts on the RTX per layer (10,856 in all); 0 turns the RTX off |
 | `K31_BANK_MAP` | `bank-map-256k.json` | 2-bit copies in CPU memory per layer (41,661; `bank-map-nortx.json`: 45,000 without the RTX; `bank-map.json`: 36,800 for hosts with less free memory) |
-| `K31_POLICY` | `policy-joint15.json` | staged ranks and resident caps per layer (see [Policies](#policies)) |
-| `K31_STAGE_ALL`, `K31_STAGE_ROWS` | on, none (`nortx`: 4,4,2,1,1) | a staged expert serves all of its picks; per-row staging caps |
+| `K31_POLICY` | `policy-stage8.json` (`nortx`: `policy-nortx-stage4.json`; `fast`: `policy-joint15.json`; `fast-nortx`: `policy-nortx-t92-allrows.json`) | staged ranks and resident caps per layer (see [Policies](#policies)) |
+| `K31_STAGE_ALL`, `K31_STAGE_ROWS` | on, 8,8,4,2,2 (`nortx`: 4,4,4,2,2; `fast`: none; `fast-nortx`: 4,4,2,1,1) | a staged expert serves all of its picks; per-row staging caps |
+| `K31_STAGE_CAP`, `K31_STAGE_SP`, `K31_STAGE_PRIOR` | 6, 8, 1,0.69,0.43,0.24,0.14 (`nortx`: 6, 4; `fast`: none) | at most this many copies staged per call; the ranks the staging plan considers; slots ordered by each row's chance of being accepted |
+| `K31_DECODE_SPLIT`, `K31_DECODE_JOINT` | on, 2 | several conversations: each one's rows keep the one-conversation budgets; shared dense parts and one MegaMoE launch for all of them (bit for bit the split's results) |
 | `K31_BAND_PRIOR` | 1,0.69,0.43,0.24,0.14 | the band's slots by each verify row's chance of being accepted |
 | `K31_PROMOTE`, `K31_BANK_PROMOTE` | 0.1, 0.08 | how fast GPU memory and the CPU-memory copies follow the conversation (per layer per token) |
 | `K31_HAND_FEED`, `K31_CREDIT_WEIGHTS` | 1, `credit-weights.json` | band slots refilled from CPU memory; adaptation speed weighted per layer |
-| `K31_CUT_MEAN` | `/means/k31-expert-means.safetensors` | the average substitute for skipped picks (empty: none) |
+| `K31_CUT_MEAN` | `/means/k31-fmeans.safetensors` (`fast`, `fast-nortx`: `k31-expert-means.safetensors`) | the average substitute for skipped picks (empty: none) |
 | `K31_DENSE_FMT` | int8 / FP8 / MXFP4 / W8A16 per layer kind | the dense layers' 8-bit forms |
 | `K31_DSA_FUSED` | on | the sparse-attention layers' small decode kernels fused (bit-exact) |
 | `K31_DRAFT_TOPP`, `K31_DRAFT_FULL_KV` | on, on | the request's top-p applied to the drafts; the drafter's KV as full attention |
@@ -402,6 +463,72 @@ SUBSET=rot32 HMODE=decode PROMPT=64 KLREF=/kl/ref-w4a8-rot32.npy KLD_FAST=1 \
 `$STATE/results`. For the full 512-sequence headline use `KLHIDDEN=/kl/hidden-512.npy` instead of `SUBSET` and `KLREF`;
 for prompt rows `PROMPT=1024`; for the long-context set `L32=1 L32_HIDDEN=/kl/l32/hidden-l32.npy
 L32_REF=/kl/l32/kld.pt` (its reference comes from the reference runner's long-sequence pass).
+</details>
+
+## Measuring what the engine writes
+
+KLD checks the engine on text that somebody else wrote, one conversation at a time. Real use is different: the engine
+writes its own answer, each token built on the ones before it, usually while other requests are running. A mistake
+there is not averaged away, because the rest of the answer continues from it. An early build of this engine scored
+well on KLD and still, with four requests running at once, sometimes wrote a token the official model would never
+have written, and then kept repeating itself until the answer ran out of room. KLD could not see it: once a model is
+inside such a loop, the official model agrees that the next token is "more of the same".
+
+So there is a second measurement that runs the other way round:
+
+1. The engine answers a fixed set of 120 prompts (science questions, math, code, chat, Japanese, a tool-using agent,
+   requests it should refuse), with the usual sampling settings, up to 1,024 tokens each. It does this once alone and
+   once with four requests running at the same time.
+2. The official model then reads every answer and reports, token by token, how likely it would have been to write
+   that same token at that point.
+
+Three numbers come out of it, each per in-flight count:
+
+- **Distance from the official model.** On average, how much more likely the engine thought its own tokens were than
+  the official model did. 0 means the two agree. This is the number to compare configurations by.
+- **Near-impossible tokens per 1,000.** How often the engine wrote a token to which the official model gave less than
+  a 1 in 1,000 chance. The official model, sampling the same way, almost never does this: less than once per 100,000
+  tokens on science questions and up to about once per 1,200 tokens on open-ended chat, where many continuations are
+  possible. The table shows that floor beside the engine's number.
+- **Confident mistakes per 1,000.** Tokens the engine was more than 50% sure of while the official model gave them
+  less than 1%. The official model cannot make this kind of mistake at all. In the looping answers we collected,
+  these were six times as frequent right where a loop began as elsewhere, so this is the number to watch for loops.
+
+The loops themselves are counted separately, on long answers (up to 32,768 tokens) with four requests at once, because
+most loops start later than the first 1,024 tokens.
+
+**How far to trust it.** These numbers say how closely the engine follows the official model, not whether an answer
+is right; the task benchmarks do that. The two counts are small numbers: a healthy configuration writes about one
+near-impossible token per 1,000, so one run of the 120 prompts can tell "twice as many" apart but not "10% more".
+Most near-impossible tokens are harmless (an unusual word, a different digit); we saw roughly one loop per 1,300 of
+them, and a few loops started with no such token at all. The prompts cover one language besides English and no long
+documents. And the measurement depends on how many requests run at once: we report 1 and 4, the most this
+configuration serves; more would need its own run.
+
+<details>
+<summary>Exact definitions, settings and files</summary>
+
+- Prompt set `tail-v1` (`tools/onpolicy/sets/tail-v1.json`: ids, seeds and hashes; the text is rebuilt locally and
+  verified): 48 GPQA Diamond questions as lil-bench sends them, and conversation openings from the Nemotron-SFT
+  sets (12 math, 12 code, 12 chat, 12 agentic, 12 multilingual, 6 science, 6 safety) that no KLD window uses.
+- Sampling: temperature 1, top-p 0.95, one fixed seed per prompt, `max_tokens` 1,024, 1 and 4 requests in flight
+  (`tools/onpolicy/tail_capture.sh`). The server returns the exact token ids and its log-probability of each.
+- Scoring (`tools/onpolicy/tail_score.sh`): the reference runner (`tools/runner`, the official MXFP4 checkpoint with
+  8-bit activations) reads prompt + answer and gives the official probability `p` of every sampled token and its full
+  distribution at every position.
+  - distance ("gap") = mean of `log q - log p` over the sampled tokens, `q` = the engine's own probability: a
+    one-sample estimate of the reverse KL divergence of the served engine against the official model.
+  - near-impossible = `p` < 0.1% (the score file also has < 1% and < 0.01%, tokens outside the official top-p
+    nucleus, and "excess surprise", which needs no engine probabilities). The floor is the exact rate at which the
+    official model, sampling from its own top-p 0.95 nucleus at the same positions, writes a token under the same
+    threshold (`tools/onpolicy/tailfloor.py`).
+  - confident mistake = `q` >= 50% and `p` < 1%.
+  - "the official model, for scale" = the official model in one arithmetic layout sampled, in another scored.
+- Intervals: 95% bootstrap over prompts; two configurations are compared on the same prompts and seeds
+  (`tools/onpolicy/tailscore.py compare`).
+- Loops: `tools/onpolicy/capture.sh` with a 32,768-token cap at 4 in flight; `capture.py` flags a stretch of at least
+  1,024 tokens that repeats with a fixed period.
+- Full specification: `docs/onpolicy-tail.md`.
 </details>
 
 ## Credits
