@@ -39,6 +39,15 @@ Two switches change what a treatment covers, not which ranks may use it:
   call, the 16 staging slots, `stage_cap`, the row caps) apply per request, not per step, and the residency scores
   come from accepted rows at any number of requests. Without it a step of 9-16 rows has no band and one call's
   slots, and a step of more than 16 rows takes a one-round fallback (no band, no row caps, scores from every row).
+- `K31_DECODE_JOINT=1|2` (off by default; with `K31_DECODE_SPLIT=1`): the requests of a decode step share the work
+  that does not depend on the request, and every request keeps its own plan, staged records and band call (the same
+  picks are computed, staged, sent to the band or given the mean as with the split alone). 1: the dense parts of a
+  MoE layer (router and top-k, latent down-projection, shared experts, norm and up-projection) run once per chunk
+  of whole verify blocks (`K31_DECODE_JOINT_DENSE` rows at most, default 16). 2: also one MegaMoE call per layer for
+  all requests: request j's records go to slot group (layer + j) mod 8, the band calls are sent ahead and finished
+  after the call, and a resident expert that several requests pick is read once. `K31_DECODE_JOINT_CHECK=n` runs
+  the first n start-up batches of every layer through the split and both levels and logs whether the outputs are
+  bit-equal.
 - `K31_BAND_PRIOR=p0,p1,...`: a call with more band experts than `band_cap` keeps those with the largest weight x
   their row's prior chance of being accepted (`p_i` for row i of a request's verify block: row 0 always, draft row i
   when drafts 1..i are accepted; e.g. the measured acceptance `1,0.64,0.36,0.19,0.09` at 4 drafts) instead of the

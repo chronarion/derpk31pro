@@ -280,6 +280,164 @@ def _split_call(one, hidden_states, idx: int = -1):
     finally:
         _SPLIT["sub"], _SPLIT["row0"] = False, 0
     return out
+
+
+# K31_DECODE_JOINT=1|2 (with K31_DECODE_SPLIT=1): a decode batch that the split runs as one MoE call per verify block
+# shares the work that does not depend on the request. Every request keeps its own plan (unitk with its row caps,
+# stage cap, slot group and accepted-row offsets), its own RTX band call and its own staged records, as in the split:
+# the same picks are computed, staged, sent to the band or given the mean.
+#   1: the dense parts of a MoE layer (router gate + top-k, latent down-projection, shared experts, RMSNorm +
+#      up-projection) run once per "dense chunk" (consecutive verify blocks of at most K31_DECODE_JOINT_DENSE rows in
+#      all, default 16 = the largest call of the decode-size kernels) instead of once per block; the MegaMoE section
+#      (plan, band send, stager, MegaMoE, band finish / mean) still runs per block. (The int8 GEMV takes 8 rows per
+#      launch: a 10-row chunk costs it two launches, as two 5-row blocks do; the router gate, top-k, the shared
+#      experts and the fused up-projection take a chunk in one. K31_DECODE_JOINT_DENSE=40 makes the batch one chunk:
+#      20 rows are then 3 int8 launches instead of 4, and the up-projection leaves its fused 16-row kernel.)
+#   2: as 1, and one MegaMoE call per layer for the whole batch: block j's plan addresses slot group (L + j) % 8, the
+#      blocks' records are staged one after another, their band calls are sent ahead (the mailbox holds 4) and
+#      finished after the one MegaMoE call, so a resident expert that several requests pick is read once per step and
+#      MegaMoE's fixed cost is paid once. Layers or batches it does not cover (more blocks than slot groups, more
+#      band calls than mailbox slots, a band without the fused v4 finish) take level 1.
+# K31_DECODE_JOINT_CHECK=n: the first n eager decode batches per layer run the split, level 1 and level 2 on the same
+# rows and log whether the outputs are bit-equal (start-up dummy runs; the batch then continues with the joint output).
+DECODE_JOINT = int(os.environ.get("K31_DECODE_JOINT", "0") or 0)
+JOINT_DENSE_ROWS = int(os.environ.get("K31_DECODE_JOINT_DENSE", "16") or 16)
+JOINT_CHECK = int(os.environ.get("K31_DECODE_JOINT_CHECK", "0") or 0)
+BAND_NSLOT = 4                      # band_mailbox.h NSLOT: calls the mailbox holds before one is finished
+_JT: dict = {"on": False, "r0": 0, "msum": None, "checks": {}, "seen": set(), "level": {}}
+
+
+def dense_chunks(blocks: list, rows: int = JOINT_DENSE_ROWS) -> list:
+    """Consecutive verify blocks grouped into dense chunks of at most `rows` rows: [(first row, end row, [blocks])].
+    The fewest chunks a greedy fill needs, then as even as whole blocks allow (20 rows of 5-row blocks at 16:
+    10 + 10, not 15 + 5). A block larger than `rows` is a chunk by itself."""
+    if not blocks:
+        return []
+    n, used = 1, 0
+    for a, b in blocks:                                  # the fewest chunks
+        if used and used + (b - a) > rows:
+            n, used = n + 1, 0
+        used += b - a
+    out, cur, left = [], [], n
+    total = blocks[-1][1] - blocks[0][0]
+    target = total / n
+    for i, (a, b) in enumerate(blocks):
+        size = (cur[-1][1] - cur[0][0]) if cur else 0
+        rest = len(blocks) - i                           # blocks not placed yet, this one included
+        if cur and (size + (b - a) > rows or (left > 1 and size >= target - 1e-9) or rest < left):
+            out.append((cur[0][0], cur[-1][1], cur))
+            cur, left = [], left - 1
+        cur.append((a, b))
+    out.append((cur[0][0], cur[-1][1], cur))
+    return out
+
+
+def _joint_level(st, blocks: list) -> int:
+    """The joint level this layer runs a batch of these blocks at (see K31_DECODE_JOINT)."""
+    if DECODE_JOINT < 2 or getattr(st, "jstagers", None) is None or len(blocks) > GROUPS or \
+            max(b - a for a, b in blocks) > ONE_ROWS:
+        return min(DECODE_JOINT, 1)
+    band_on = st.band_map is not None and getattr(st, "band_ok", True)
+    if band_on and not (TAIL1 and BAND_FIN_SIDE and BAND_SIDE and not BAND_HINT and _BAND.get("fused") is not None
+                        and getattr(st, "jtags", None) is not None and len(blocks) <= BAND_NSLOT
+                        and max(b - a for a, b in blocks) <= 8):
+        return 1
+    return 2
+
+
+def _joint_moe(self, st, chunks: list, fronts: list, lds: list):
+    """K31_DECODE_JOINT=2: the MegaMoE section of one layer for a decode batch, one MegaMoE call for all its rows.
+    fronts[c] = (latent rows, weights, ids, ...) of dense chunk c (the latent rows may be pending on the aux stream:
+    lds holds their events). Per verify block: unitk's plan into its own slot group, its band call (sent ahead,
+    its tag kept for the finish), its records staged; then one MegaMoE call; then per block the band finish (with the
+    cut picks' mean sum and the RMSNorm statistic, K31_TAIL1) or the mean substitution. Returns the routed latent sum
+    [T, LATENT]; the band finishes may be pending on the fin stream (_FIN, joined by the routed output transform)."""
+    from . import unitk
+    from . import defer as _dm
+    if st.row_map is None:
+        raise RuntimeError(f"K31 layer {st.idx}: experts not bound (load_model hook did not run)")
+    if _RES and st.idx == _FIRST_MOE[0]:                 # K31_RES_STREAM (as _forward): an eager step waits for the
+        _RES[0].join_eager()                             # tick's GPU work here
+    main = torch.cuda.current_stream()
+    band_on = st.band_map is not None and getattr(st, "band_ok", True)
+    tail = band_on and getattr(st, "msum", None) is not None
+    gb, fz = _BAND.get("gb"), _BAND.get("fused")
+    base_g = st.idx % GROUPS
+    blocks = []                                          # (a, b, chunk index, first row of the chunk)
+    for c, (ca, _cb, blks) in enumerate(chunks):
+        blocks += [(a, b, c, ca) for a, b in blks]
+    band_ev = None
+    if band_on:                                          # the sends, each block's rows and work list, on the band stream
+        if _BSIDE["stream"] is None:
+            _BSIDE["stream"] = torch.cuda.Stream(device=main.device)
+        bs = _BSIDE["stream"]
+        bs.wait_stream(main)
+        for ev in lds:                                   # the send quantizes the latent rows
+            bs.wait_event(ev)
+        with torch.cuda.stream(bs):
+            for j, (a, b, c, ca) in enumerate(blocks):
+                x, w, ids = fronts[c][:3]
+                _band_send(st, x[a - ca:b - ca], ids[a - ca:b - ca], w[a - ca:b - ca],
+                           served=st.jserved[j] if BAND_SERVED else None)
+                st.jtags[j:j + 1].copy_(gb.st[1:2])       # the call's tag (0: nothing sent) for its finish
+            band_ev = torch.cuda.Event()
+            band_ev.record(bs)
+    rows, served = [], []
+    for j, (a, b, c, ca) in enumerate(blocks):           # the plans: block j stages into slot group (L + j) % GROUPS
+        _x, w, ids = fronts[c][:3]
+        r, stage = unitk.plan(ids[a - ca:b - ca], w[a - ca:b - ca], st.row_map, st.bank_map, st.strong,
+                              SLOTS * ((base_g + j) % GROUPS), score=st.score, lam=LAM, stats=st.stats,
+                              pend=getattr(st, "pend", None), resmax=st.resmax, rowcap=_RCAP[0], cap=st.stage_cap,
+                              row0=a, rowprior=_RPRI[0])
+        rows.append((r, stage))
+        served.append(st.jserved[j] if (band_on and BAND_SERVED) else None)
+    fs = None
+    if tail:
+        if _FIN["stream"] is None:
+            _FIN["stream"] = torch.cuda.Stream(device=main.device)
+        fs = _FIN["stream"]
+        if st.cut_mean is not None:                      # the mean sums beside the stagers and MegaMoE
+            fs.wait_stream(main)                         # the plans' row ids
+            with torch.cuda.stream(fs):
+                fs.wait_event(band_ev)                   # the sends' served flags
+                for j, (a, b, c, ca) in enumerate(blocks):
+                    _x, w, ids = fronts[c][:3]
+                    sv = served[j]
+                    _dm.cut_mean_pre(_JT["msum"][a:b], rows[j][0], ids[a - ca:b - ca], w[a - ca:b - ca], st.cut_mean,
+                                     band=st.band_map if sv is None else None, served=sv)
+    for j in range(len(blocks)):
+        st.jstagers[(base_g + j) % GROUPS](st.bank_ptr, rows[j][1])
+    for ev in lds:                                       # prep and MegaMoE read the latent rows
+        main.wait_event(ev)
+    one = len(fronts) == 1
+    x = fronts[0][0] if one else torch.cat([f[0] for f in fronts])
+    w = fronts[0][1] if one else torch.cat([f[1] for f in fronts])
+    ids = fronts[0][2]
+    rall = rows[0][0] if len(rows) == 1 else torch.cat([r for r, _s in rows])
+    out = _orig["forward"](self, x, w, rall.to(ids.dtype), None)
+    if tail and out.dim() == 2 and out.is_contiguous() and out.dtype == torch.bfloat16:
+        if st.up_eps is None:
+            moe = _MOE.get(st.idx)
+            rot = getattr(moe, "routed_output_transform", None) if moe is not None else None
+            st.up_eps = float(getattr(getattr(rot, "norm", None), "variance_epsilon", 1e-6))
+        fs.wait_stream(main)                             # after MegaMoE
+        with torch.cuda.stream(fs):
+            fs.wait_event(band_ev)
+            for j, (a, b, c, ca) in enumerate(blocks):
+                gb.st[1:2].copy_(st.jtags[j:j + 1])       # this block's call
+                _band_finish(st, out[a:b], msum=_JT["msum"][a:b] if st.cut_mean is not None else None,
+                             rstd=st.jrstd[a:], eps=st.up_eps)
+            fev = torch.cuda.Event()
+            fev.record(fs)
+        _FIN["ev"] = fev                                 # joined in the routed output transform (_fin_join)
+        _FIN["keep"] = (rows, fronts, x, w, rall)        # referenced until the join
+        _JT["rstd"] = st.jrstd
+        return out
+    assert not band_on, "K31_DECODE_JOINT=2: a band layer without the fused tail finish must take level 1"
+    if st.cut_mean is not None:                          # one launch for the batch (the kernel works row by row)
+        _dm.cut_mean(out, rall, ids if one else torch.cat([f[2] for f in fronts]), w, st.cut_mean)
+    _JT["rstd"] = None
+    return out
 # K31_W8I_DRAFT=1: the drafter's linears and the FP8 head copy on the int8 GEMV (w8i.py) instead of W8A16 / Marlin
 W8I_DRAFT = os.environ.get("K31_W8I_DRAFT", "0") == "1"
 # K31_FORCE_DRAFTS=1: in forced decoding (force.py, the KLD harness) the
@@ -857,7 +1015,8 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
             with torch.cuda.stream(fs):
                 if band_ev is not None:
                     fs.wait_event(band_ev)
-                _band_finish(st, out, msum=st.msum[:T] if st.cut_mean is not None else None, rstd=st.rstd,
+                _band_finish(st, out, msum=st.msum[:T] if st.cut_mean is not None else None,
+                             rstd=st.rstd[_JT["r0"]:] if _JT["on"] else st.rstd,   # (joint: the row in its dense chunk)
                              eps=st.up_eps)
                 fev = torch.cuda.Event()
                 fev.record(fs)
@@ -1263,6 +1422,8 @@ def _bind(runner) -> None:
         cpupool.from_env([(i, s.bank_cpu, len(s.bank)) for i, s in sorted(LAYERS.items())], log=_LOG)
     if BAND_N:
         _bind_band(dev)
+    if DECODE_JOINT:
+        _bind_joint(dev, layout)
     if MODE == "staged":
         from .residency import Residency
         _RES.append(Residency(LAYERS, NATIVE, PROMOTE, PROMOTE_WORKERS, dev, _write_expert, HI2, layout,
@@ -1292,6 +1453,38 @@ def _bind(runner) -> None:
             _LOG("noprep: K31_MEGAMOE_NOPREP needs K31_SHARED_SIDE=3 (the hook computes the latent down there): off")
         else:
             _nop().bind(runner.model, dev, _LOG)
+
+
+def _bind_joint(dev, layout) -> None:
+    """K31_DECODE_JOINT: level 2's per-layer state: a stager per slot group (block j of a batch stages into group
+    (L + j) % GROUPS), and for band layers one served-flag buffer and one tag per block and the RMSNorm statistic of
+    the batch's rows; the cut picks' mean sums of a batch share one buffer (a layer's finishes read it before the
+    next layer's plans write it: both run on the fin stream)."""
+    if not DECODE_SPLIT or MODE != "staged" or not SHARED_SIDE:
+        raise RuntimeError("K31_DECODE_JOINT needs K31_DECODE_SPLIT=1, K31_MODE=staged and K31_SHARED_SIDE >= 1")
+    if DECODE_JOINT not in (1, 2) or not 1 <= JOINT_DENSE_ROWS <= SPLIT_MAX:
+        raise RuntimeError(f"K31_DECODE_JOINT={DECODE_JOINT} (1 or 2), K31_DECODE_JOINT_DENSE={JOINT_DENSE_ROWS} "
+                           f"(1..{SPLIT_MAX})")
+    nb = len(split_blocks(SPLIT_MAX, _SPLIT["block"], _SPLIT["rows"]))
+    if DECODE_JOINT >= 2:
+        from .stager import Stager
+        band = 0
+        for _idx, st in sorted(LAYERS.items()):
+            st.jstagers = [Stager(st.mod, SLOTS * g, layout, sms=STAGER_SMS) for g in range(GROUPS)]
+            if st.band_map is not None:
+                st.jserved = torch.zeros((BAND_NSLOT, 16 * 16), dtype=torch.int32, device=dev)
+                st.jtags = torch.zeros(BAND_NSLOT, dtype=torch.int64, device=dev)
+                st.jrstd = torch.zeros(PEND_ROWS, dtype=torch.float32, device=dev)
+                band += 1
+        if band and TAIL1:
+            _JT["msum"] = torch.zeros(SPLIT_MAX, LATENT, dtype=torch.float32, device=dev)
+    e4 = split_blocks(4 * _SPLIT["P"], _SPLIT["block"], _SPLIT["rows"])
+    _LOG(f"K31_DECODE_JOINT={DECODE_JOINT}: decode batches of {_SPLIT['rows'] + 1}..{SPLIT_MAX} rows share the dense "
+         f"parts of a MoE layer per chunk of <= {JOINT_DENSE_ROWS} rows"
+         + (f" and run one MegaMoE call per layer (up to {min(nb, GROUPS)} blocks, {BAND_NSLOT} with the RTX band; "
+            f"block j stages into slot group (layer + j) % {GROUPS})" if DECODE_JOINT >= 2 else "")
+         + f"; e.g. {4 * _SPLIT['P']} rows -> dense chunks of {[cb - ca for ca, cb, _ in dense_chunks(e4)]} rows"
+         + (f"; check of the first {JOINT_CHECK} eager batches per layer" if JOINT_CHECK else ""))
 
 
 def _rows_per_request(runner) -> int:
@@ -1424,17 +1617,19 @@ def _served(st, band_on: bool):
     return getattr(st, "band_served", None)
 
 
-def _band_send(st, x, topk_ids, topk_weights, hinted: bool = False) -> None:
+def _band_send(st, x, topk_ids, topk_weights, hinted: bool = False, served=False) -> None:
     """Before the call's staging and MegaMoE: its band work list and MXFP8 rows into the mailbox. hinted: the plan /
-    hint kernel has already written the served flags and stats (K31_BAND_HINT)."""
+    hint kernel has already written the served flags and stats (K31_BAND_HINT). served: another buffer for the
+    call's served flags than the layer's (K31_DECODE_JOINT=2: one per block; None = no flags)."""
     from . import band
     gb = _BAND["gb"]
     fz = _BAND.get("fused")
     if fz is not None:
+        sv = getattr(st, "band_served", None) if served is False else served
         fz.qsend((topk_ids if topk_ids.dtype == torch.int32 else topk_ids.int()).contiguous(),
                  (topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()).contiguous(),
                  st.row_map, st.band_map, x.contiguous(), None if hinted else st.band_stats, st.idx,
-                 cap=getattr(st, "band_cap", None), served=None if hinted else getattr(st, "band_served", None))
+                 cap=getattr(st, "band_cap", None), served=None if hinted else sv)
         return
     band.plan(topk_ids, topk_weights, st.row_map, st.band_map, st.band_call, st.band_stats)
     band.quant(x.contiguous(), gb.xq, gb.xs)
@@ -1931,7 +2126,8 @@ def _patch_model(module) -> None:
         left in _LD for _forward to join where the latent rows are read (the band send's branch, prep / MegaMoE)."""
         main = torch.cuda.current_stream()
         # (a block of a split batch takes its own events: the module's pair would be recorded once per block)
-        ev0, ev1 = (torch.cuda.Event(), torch.cuda.Event()) if _SPLIT["sub"] else moe._down_proj_events
+        ev0, ev1 = (torch.cuda.Event(), torch.cuda.Event()) if (_SPLIT["sub"] or _JT["on"]) \
+            else moe._down_proj_events
         ev0.record(main)                             # h is ready
         # router GEMV and top-k first, as vLLM orders them: the graph launches its parallel branches in capture order,
         # and a latent down captured first takes the SMs and delays the router (arm C / D 11-18: router + top-k
@@ -1957,10 +2153,10 @@ def _patch_model(module) -> None:
         _LD["ev"] = ev1
         return routed_h, w, ids
 
-    def moe_shared_side(self, hidden_states):
-        """KimiMoE.forward's MegaMoE branch with the shared experts forked onto a side stream."""
-        num_tokens, hidden_size = hidden_states.shape
-        h = hidden_states.view(-1, hidden_size)
+    def moe_front(self, h):
+        """The dense front of KimiMoE.forward's MegaMoE branch for the rows h: router gate + top-k, the latent
+        down-projection (pending on the aux stream in _LD on the deferred-join path) and the shared experts forked
+        onto the side stream. -> (latent rows, weights, ids, {"out": shared output, "ev": its event})."""
         main = torch.cuda.current_stream()
         if _SIDE["stream"] is None:
             _SIDE["stream"] = torch.cuda.Stream(device=main.device)
@@ -1973,7 +2169,9 @@ def _patch_model(module) -> None:
                 box["out"] = self.shared_experts(h)
                 box["ev"] = torch.cuda.Event()
                 box["ev"].record(side)
-        if SHARED_SIDE_MODE == 3 and h.shape[0] <= 16 and getattr(self, "_down_proj_stream", None) is not None \
+        # (a dense chunk of a joint decode batch may hold more than 16 rows: K31_DECODE_JOINT_DENSE)
+        if SHARED_SIDE_MODE == 3 and h.shape[0] <= (max(16, JOINT_DENSE_ROWS) if _JT["on"] else 16) \
+                and getattr(self, "_down_proj_stream", None) is not None \
                 and self.routed_expert_down_proj is not None and getattr(self, "use_mega_moe", False) \
                 and not _breakable_capture():
             routed_h, router_output, topk_ids = _router_down_nojoin(self, h, fork if SHARED_EARLY else None)
@@ -1991,19 +2189,116 @@ def _patch_model(module) -> None:
                  f"{torch.cuda.is_current_stream_capturing()}")
         if "out" not in box:                         # h is ready; the fork after the router, latent down and top-k
             fork()
-        shared_output, ev = box["out"], box["ev"]
         if SHARED_SIDE_MODE < 2:
             routed_h, router_output, topk_ids = self._maybe_overlap_router_and_down_proj(h)
+        return routed_h, router_output, topk_ids, box
+
+    def moe_shared_side(self, hidden_states):
+        """KimiMoE.forward's MegaMoE branch with the shared experts forked onto a side stream."""
+        num_tokens, hidden_size = hidden_states.shape
+        h = hidden_states.view(-1, hidden_size)
+        main = torch.cuda.current_stream()
+        routed_h, router_output, topk_ids, box = moe_front(self, h)
         final = self.experts(routed_h, router_output, topk_ids)
-        main.wait_event(ev)                          # the join: the shared output is complete
-        final = self.routed_output_transform(final, residual=shared_output)
+        main.wait_event(box["ev"])                   # the join: the shared output is complete
+        final = self.routed_output_transform(final, residual=box["out"])
         return final.view(num_tokens, hidden_size)
+
+    def joint_ok(self, st) -> bool:
+        return bool(DECODE_JOINT) and SHARED_SIDE and getattr(self, "use_mega_moe", False) and \
+            self.shared_experts is not None and self.routed_output_transform is not None
+
+    def joint_forward(self, st, hidden_states, level=None):
+        """K31_DECODE_JOINT: a decode batch of several verify blocks through one MoE layer (see the flag's note)."""
+        T, hidden_size = hidden_states.shape
+        h = hidden_states.view(-1, hidden_size)
+        blocks = split_blocks(T, _SPLIT["block"], _SPLIT["rows"])
+        chunks = dense_chunks(blocks, JOINT_DENSE_ROWS)
+        lv = _joint_level(st, blocks)
+        lv = lv if level is None else min(lv, level)
+        if (T, lv) not in _JT["seen"]:
+            _JT["seen"].add((T, lv))
+            _LOG(f"decode joint: a batch of {T} rows at level {lv}: MoE calls of {[b - a for a, b in blocks]} rows"
+                 f"{' as one MegaMoE call' if lv == 2 else ''}, dense chunks of {[cb - ca for ca, cb, _ in chunks]} "
+                 f"rows (first seen in layer {st.idx}, capturing {torch.cuda.is_current_stream_capturing()})")
+        _JT["level"][lv] = _JT["level"].get(lv, 0) + 1
+        main = torch.cuda.current_stream()
+        outs = []
+        _JT["on"] = True
+        try:
+            if lv >= 2:
+                fronts, lds = [], []
+                for ca, cb, _blks in chunks:
+                    fronts.append(moe_front(self, h[ca:cb]))
+                    if _LD["ev"] is not None:        # this chunk's latent down, pending on the aux stream
+                        lds.append(_LD["ev"])
+                        _LD["ev"] = None
+                routed = _joint_moe(self.experts, st, chunks, fronts, lds)
+                rstd = _JT.pop("rstd", None)
+                for (ca, cb, _blks), f in zip(chunks, fronts):
+                    main.wait_event(f[3]["ev"])      # the join: this chunk's shared output is complete
+                    if rstd is not None:
+                        _FIN["rstd"] = rstd[ca:cb]   # the finishes wrote the statistic of these rows (K31_TAIL1)
+                    outs.append(self.routed_output_transform(routed[ca:cb], residual=f[3]["out"]))
+            else:
+                for ca, cb, blks in chunks:
+                    routed_h, w, ids, box = moe_front(self, h[ca:cb])
+                    ys = []
+                    _SPLIT["sub"] = True
+                    try:
+                        for a, b in blks:
+                            _SPLIT["row0"], _JT["r0"] = a, a - ca
+                            with _PadRows(a, b):
+                                y = self.experts(routed_h[a - ca:b - ca], w[a - ca:b - ca], ids[a - ca:b - ca])
+                            if _FIN.get("ev") is not None:   # the block's finish branch, as the split joins it
+                                main.wait_event(_FIN["ev"])  # before its routed output transform
+                                _FIN["ev"] = None
+                                _FIN["keep"] = None
+                            ys.append(y)
+                    finally:
+                        _SPLIT["sub"], _SPLIT["row0"], _JT["r0"] = False, 0, 0
+                    if len({int(y.data_ptr()) for y in ys}) != len(ys):
+                        raise RuntimeError("K31_DECODE_JOINT: MegaMoE returned one buffer for two calls of a layer")
+                    final = ys[0] if len(ys) == 1 else torch.cat(ys)
+                    main.wait_event(box["ev"])       # the join: this chunk's shared output is complete
+                    outs.append(self.routed_output_transform(final, residual=box["out"]))
+        finally:
+            _JT["on"], _JT["r0"] = False, 0
+        out = outs[0] if len(outs) == 1 else torch.cat(outs)
+        return out.view(T, hidden_size)
+
+    def joint_check(self, st, hidden_states):
+        """K31_DECODE_JOINT_CHECK: the split twice, then level 1 and the configured level on the same rows."""
+        _JT["checks"][st.idx] = _JT["checks"].get(st.idx, 0) + 1
+        split = lambda: _split_call(lambda rows: one_forward(self, st, rows), hidden_states, st.idx)   # noqa: E731
+        r1 = split().clone()
+        r2 = split().clone()
+        y1 = joint_forward(self, st, hidden_states, level=1).clone()
+        y = joint_forward(self, st, hidden_states)
+        torch.cuda.synchronize()
+
+        def cmp(u, v):
+            if torch.equal(u, v):
+                return "bit-equal"
+            d = (u.float() - v.float())
+            return f"DIFFERS (max abs {float(d.abs().max()):.3e}, relative L2 " \
+                   f"{float(d.norm() / v.float().norm().clamp_min(1e-30)):.3e}, " \
+                   f"{int((u != v).any(dim=-1).sum())} of {u.shape[0]} rows)"
+        _LOG(f"decode joint check layer {st.idx} ({hidden_states.shape[0]} rows, call {_JT['checks'][st.idx]}): "
+             f"split twice {cmp(r2, r1)}; level 1 vs split {cmp(y1, r1)}; level "
+             f"{_joint_level(st, split_blocks(hidden_states.shape[0], _SPLIT['block'], _SPLIT['rows']))} vs level 1 "
+             f"{cmp(y, y1)}")
+        return y
 
     def forward(self, hidden_states):
         st = getattr(getattr(self, "experts", None), "_k31", None)
         if st is not None:
             _MOE[st.idx] = self
         if st is not None and _split_wanted(hidden_states):      # K31_DECODE_SPLIT: one call per verify block
+            if joint_ok(self, st):                               # K31_DECODE_JOINT: with the shared work done once
+                if JOINT_CHECK > _JT["checks"].get(st.idx, 0) and not torch.cuda.is_current_stream_capturing():
+                    return joint_check(self, st, hidden_states)
+                return joint_forward(self, st, hidden_states)
             return _split_call(lambda rows: one_forward(self, st, rows), hidden_states, st.idx)
         return one_forward(self, st, hidden_states)
 
