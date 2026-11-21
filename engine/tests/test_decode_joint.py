@@ -453,5 +453,23 @@ line = [m for m in logs if m.startswith("decode joint check")]
 check("K31_DECODE_JOINT_CHECK: one check line for the layer's first eager batch, all three comparisons bit-equal",
       len(line) == 1 and line[0].count("bit-equal") == 3 and torch.equal(ya, yb), f"({line[:1]})")
 
+# ------------------------------------------------------------------------------------------------ 7. the counters
+set_band(False)
+rng, g = random.Random(41), torch.Generator().manual_seed(41)
+st, moe = make_layer(rng, g, 17, 4, 16, None, False, True)
+x = torch.randn(20, H, generator=g).to(torch.bfloat16).to(dev)
+x[5:10] = x[0:5]                                              # the second block repeats the first block's rows
+y0, s0, _c, _p = run(moe, x, 0)
+hook.JOINT_STAT = True
+hook._JT["stat"] = None
+ys, ss, _c, _p = run(moe, x, 2)
+hook.JOINT_STAT = False
+n = [int(v) for v in hook._JT["stat"].tolist()]
+rec = sum(1 for lst in s0 for v in lst if v >= 0)
+first = sum(1 for v in s0[0] if v >= 0)
+check("K31_DECODE_JOINT_STAT: the counters of one call (4 blocks, records staged; a repeated block's records all "
+      "counted as staged twice) and an unchanged output",
+      torch.equal(ys, y0) and n[:3] == [1, 4, rec] and n[3] >= first > 0 and 0 < n[5] < n[4], f"({n}, first block {first})")
+
 print("DECODE JOINT: " + ("PASS" if not fails else f"FAIL ({len(fails)}: {'; '.join(fails)})"))
 sys.exit(1 if fails else 0)

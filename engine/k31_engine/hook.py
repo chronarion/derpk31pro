@@ -303,6 +303,10 @@ def _split_call(one, hidden_states, idx: int = -1):
 DECODE_JOINT = int(os.environ.get("K31_DECODE_JOINT", "0") or 0)
 JOINT_DENSE_ROWS = int(os.environ.get("K31_DECODE_JOINT_DENSE", "16") or 16)
 JOINT_CHECK = int(os.environ.get("K31_DECODE_JOINT_CHECK", "0") or 0)
+# K31_DECODE_JOINT_STAT=1 (a counting run, not a speed run: ~15 small launches per layer): level 2 counts, per joint
+# call, the records staged, the records another block of the call stages too, and the distinct rows MegaMoE reads
+# against the sum of the blocks' own; logged every 2,000 steps.
+JOINT_STAT = os.environ.get("K31_DECODE_JOINT_STAT", "0") == "1"
 BAND_NSLOT = 4                      # band_mailbox.h NSLOT: calls the mailbox holds before one is finished
 _JT: dict = {"on": False, "r0": 0, "msum": None, "checks": {}, "seen": set(), "level": {}}
 
@@ -343,6 +347,29 @@ def _joint_level(st, blocks: list) -> int:
                         and max(b - a for a, b in blocks) <= 8):
         return 1
     return 2
+
+
+def _joint_stat(rows: list) -> None:
+    """K31_DECODE_JOINT_STAT: [calls, blocks, records staged, records staged by an earlier block too, rows read by the
+    blocks one by one, distinct rows of the call] += this call's (device counters, no host sync)."""
+    dev = rows[0][0].device
+    if _JT.get("stat") is None:
+        _JT["stat"] = torch.zeros(6, dtype=torch.int64, device=dev)
+    c = _JT["stat"]
+    sl = torch.stack([sg for _r, sg in rows]).long()                     # [B, SLOTS] bank indices, -1 = none
+    live = sl >= 0
+    B = sl.shape[0]
+    flat = sl.reshape(-1)
+    same = (flat[:, None] == flat[None, :]) & live.reshape(-1)[:, None] & live.reshape(-1)[None, :]
+    blk = torch.arange(B, device=dev).repeat_interleave(sl.shape[1])
+    dup = (same & (blk[None, :] < blk[:, None])).any(1).sum()            # staged by an earlier block as well
+    own = torch.zeros(B, 2048, dtype=torch.int64, device=dev)
+    for j, (r, _sg) in enumerate(rows):
+        ok = r >= 0
+        own[j].scatter_(0, r.long().clamp_min(0).reshape(-1), ok.reshape(-1).long())
+    # (staged rows of different blocks are different rows, so only resident rows can coincide)
+    c += torch.stack([torch.ones((), dtype=torch.int64, device=dev), torch.full((), B, dtype=torch.int64, device=dev),
+                      live.sum(), dup, (own > 0).sum(), (own.sum(0) > 0).sum()])
 
 
 def _joint_moe(self, st, chunks: list, fronts: list, lds: list):
@@ -405,6 +432,8 @@ def _joint_moe(self, st, chunks: list, fronts: list, lds: list):
                     sv = served[j]
                     _dm.cut_mean_pre(_JT["msum"][a:b], rows[j][0], ids[a - ca:b - ca], w[a - ca:b - ca], st.cut_mean,
                                      band=st.band_map if sv is None else None, served=sv)
+    if JOINT_STAT:
+        _joint_stat(rows)
     for j in range(len(blocks)):
         st.jstagers[(base_g + j) % GROUPS](st.bank_ptr, rows[j][1])
     for ev in lds:                                       # prep and MegaMoE read the latent rows
@@ -1854,6 +1883,13 @@ def _patch_runner(module) -> None:
         if MEM_PEAK:
             mempeak.step_end()
         _STEPS[0] += 1
+        if JOINT_STAT and _STEPS[0] % 2000 == 0 and _JT.get("stat") is not None:
+            n = [int(v) for v in _JT["stat"].tolist()]
+            _LOG(f"decode joint stat after {_STEPS[0]} steps: {n[0]} joint calls of {n[1] / max(1, n[0]):.2f} blocks; "
+                 f"records staged {n[2]} ({n[2] / max(1, n[1]):.2f} per block), {n[3]} of them "
+                 f"({100.0 * n[3] / max(1, n[2]):.1f}%) staged by another block of the call too; MegaMoE rows read "
+                 f"block by block {n[4]} ({n[4] / max(1, n[1]):.1f} per block), distinct per call {n[5]} "
+                 f"({100.0 * n[5] / max(1, n[4]):.1f}%)")
         if _LT[0] is not None:
             _LT[0].tick()                                        # K31_LATE: its counters every K31_LATE_LOG_S
         if _RES:
