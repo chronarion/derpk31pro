@@ -33,6 +33,7 @@ MERGE_BLOCKS = int(os.environ.get("K31_MERGE_BLOCKS", "152"))     # the merge ru
 # 1216 blocks, byte-identical output; both grid-stride loops hold one 16 B load per thread in flight)
 EXTRACT_BLOCKS = int(os.environ.get("K31_EXTRACT_BLOCKS", "152"))
 BANK_FLIGHT = int(os.environ.get("K31_BANK_FLIGHT", "32"))        # bank refills in flight over all layers
+LOG_S = float(os.environ.get("K31_RES_LOG_S", "30"))              # seconds between the residency's log lines
 # RTX band swaps (K31_BAND_SWAP=1): a band expert promoted to a native row hands its band slot to the evicted native
 # expert; the sidecar enters that record (~1 ms each, one at a time) and the band map changes when it acks
 BAND_SWAP = os.environ.get("K31_BAND_SWAP", "0") == "1"
@@ -603,7 +604,7 @@ class Residency:
             self.ring_ev[slot] = ev2
             self.ring_head += 1
         self._lap("d2h", t)
-        if time.time() - self.t_log > 30:
+        if time.time() - self.t_log > LOG_S:
             self._log()
 
     def join_eager(self) -> None:

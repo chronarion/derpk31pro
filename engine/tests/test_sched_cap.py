@@ -255,6 +255,34 @@ check("runtime values: cap on, off, and a 40-row scout chunk for prompts of more
       a_[:2] == [4096, 8192] and b_[0] == 8192 and c_ == [40, 920, 64] and d_ == [192, 8],
       f"({a_[:3]} / {b_[:2]} / {c_} / {d_})")
 
+# 8b. K31_PROMPT_FIRST_FREE: the steps after the first only where they cost no forward
+two = ((4096, 4096), (4096, 8192))
+on = sched.wrap(ORIG, *two, 0, free=lambda: True)
+a_ = sizes(read(on, scheduler(), 12288, rid="f1"))           # two capped chunks would cost a forward: one
+b_ = sizes(read(on, scheduler(), 28672, rid="f2"))           # the same count either way: two
+c_ = sizes(read(on, scheduler(), 13000, rid="f3"))
+d_ = sizes(read(sched.wrap(ORIG, *two, 0), scheduler(), 12288, rid="f4"))       # without the option: both steps
+bad, worse, kept, n_free = [], 0, 0, 0
+for _ in range(1500):
+    n = rng.choice([rng.randint(1, 9000), rng.randint(8000, 17000), rng.randint(9000, 70000)])
+    hit = rng.choice([0, 0, rng.randrange(0, n, 64) if n > 64 else 0])
+    hit = min(hit, (n - 1) // 64 * 64)
+    got = sizes(read(sched.wrap(ORIG, *two, 0, free=lambda: True), scheduler(), n, hit))
+    one = sizes(read(sched.wrap(ORIG, 4096, 4096), scheduler(), n, hit))
+    both = sizes(read(sched.wrap(ORIG, *two, 0), scheduler(), n, hit))
+    n_free += 1
+    worse += len(got) > len(one)
+    kept += got == both
+    if got != (both if len(both) <= len(one) else one) or sum(got) != n - hit:
+        bad.append(f"n {n} hit {hit}: {got[:6]} one {one[:6]} both {both[:6]}")
+    if sched.plan(n, hit, 8192, *two, 64, 16384) != both or sched.plan(n, hit, 8192, 4096, 4096, 64, 16384) != one:
+        bad.append(f"n {n} hit {hit}: the count ahead differs from the rule")
+check(f"steps only where free ({n_free} prompts): never a forward more than the first step alone, both steps "
+      f"wherever they cost none ({kept} prompts), the count ahead equals the rule's chunks",
+      not bad and worse == 0 and a_ == [4096, 8128, 64] and b_ == [4096, 4096, 8192, 8192, 4032, 64]
+      and c_ == [4096, 4096, 4800, 8] and d_ == [4096, 4096, 4032, 64],
+      f"({a_} / {b_} / {c_} / {d_}; {worse} worse; {len(bad)} differ: {'; '.join(bad[:2])})")
+
 # 9. runtime values that do not fit: the last good ones stay, said once, and the prompt is read to its end
 said = []
 sched._LOG = lambda m: said.append(m)
