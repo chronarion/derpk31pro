@@ -2582,7 +2582,8 @@ PATCHES = {TARGET: _patch_moe, "vllm.third_party.deep_gemm.utils.mlopart": _patc
            # K31_PROMPT_FIRST_CHUNK (sched.py): a request's first prompt chunks capped, in the scheduler's split rule
            **({"vllm.v1.core.sched.scheduler": lambda m: __import__(
                "k31_engine.sched", fromlist=["patch"]).patch(m)}
-              if int(os.environ.get("K31_PROMPT_FIRST_CHUNK", "0") or 0) > 0 else {}),
+              if any(int(x) > 0 for x in str(os.environ.get("K31_PROMPT_FIRST_CHUNK", "0") or "0").split(",")
+                     if x.strip()) else {}),
            **{r: _patch_runner for r in RUNNERS}}
 
 
