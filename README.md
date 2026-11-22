@@ -5,8 +5,11 @@ answered right (average of three runs; Moonshot reports 94.2%, 186.5 of 198), at
 conversation and 111 for four at once, reading prompts at 3,200 to 4,000 tokens per second. A `fast` profile trades
 some of that closeness for over 100 tokens per second.
 
-**New in 1.1:** prompts read 1.5 to 1.9 times as fast as in 1.0, and without the RTX the GB300 keeps 262 more experts
-in its memory (see [Reading prompts](#reading-prompts)). Decode speed is unchanged.
+**New in 1.2:** the experts' scale factors are stored packed. That changes no computed bit but frees memory: about
+4,200 experts that used to get their average output now have a 2-bit copy or a place in GPU memory (see
+[Packed scale factors](#packed-scale-factors)). Upgrading from 1.1 needs a one-time conversion of the record store,
+which takes minutes on XFS or Btrfs. **1.1** made prompts read 1.5 to 1.9 times as fast as 1.0 (see
+[Reading prompts](#reading-prompts)).
 
 ## What is derpk31pro
 
@@ -37,7 +40,7 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 | profile | decode, 1 / 2 / 4 conversations at once | reading a prompt (32K / 128K tokens) | GPQA Diamond (198 questions) |
 |---|---|---|---|
 | `default` (GB300 + RTX PRO 6000) | 76.2 / 95.5 / 111.0 tokens/s | 3,237 / 3,587 tokens/s (1.0: 2,117 / 2,163) | 186.3 (runs: 186, 185, 188) |
-| `nortx` (GB300 alone) | 75.9 / 90.2 / 108.4 tokens/s | 3,400 / 4,007 tokens/s on our prompt bench (1.0: 2,069 / 2,162) | 183 (one run of 1.1; 1.0: 187.0, runs 188, 186) |
+| `nortx` (GB300 alone) | 70.8 / 87.9 / 108.8 tokens/s (1.2) | 3,678 / 3,039 tokens/s (1.2) | 183 (one run of 1.1; 1.0: 187.0, runs 188, 186); 1.2: 3 of 3 long-reasoning spot checks |
 | `fast` (GB300 + RTX PRO 6000) | 103.4 / not measured / not measured | 2,138 / 2,164 tokens/s | not measured |
 | `fast-nortx` (GB300 alone) | 88.3 / not measured / not measured | 2,246 / 2,215 tokens/s | not measured |
 
@@ -53,6 +56,15 @@ Every profile serves up to four conversations of up to 262,144 tokens each (a 26
 | an early build of `fast` | 0.300 (4 at once) | 10.8 | 3.84 | 6 of 64 | 0.0896 / 0.0619 |
 | the official model, for scale | 0.003 | under 0.01 on science questions, up to 0.8 on chat | 0 | | 0 / 0 |
 
+- **What 1.2 re-measured:** the packed forms are checked byte for byte and bit for bit (unit tests on the GB300 and
+  the RTX; MegaMoE on packed rows at decode and prompt sizes). `nortx` ran lil-bench: prompts 3,678 / 3,039 tokens/s
+  at 32K / 128K (the 128K number is being compared with 1.1 on the same bench) and decode 70.8 / 87.9 / 108.8 tokens/s
+  at 1 / 2 / 4 conversations (three runs for one conversation, two for the others; steps per second 1-3% below 1.1's,
+  and the drafter's acceptance came out low in two of the three runs). It also answered three long-reasoning GPQA
+  questions that 1.0 usually gets right (9,600 to 32,900 tokens each, picked at random): all three right, none looped,
+  including the one 1.1's run left at the token limit. On the development tree the packed scale factors lowered KLD
+  on the fixed-text screen to x0.927 (`nortx`) and x0.953 (`default`), paired. `default`'s own answers with four
+  conversations at once are being measured; its speed numbers are 1.1's.
 - **What 1.1 re-measured:** `default` changes only how prompts are read, so its decode, GPQA and closeness numbers
   are 1.0's; its prompt numbers are 1.1's (lil-bench, where the GB300 now reaches its power limit while reading). The
   new prompt settings were checked for closeness on `nortx`: writing its own answers, every difference from 1.0 is within the noise (paired on the same 120 prompts, 0 loops in 240 answers); on
@@ -60,8 +72,8 @@ Every profile serves up to four conversations of up to 262,144 tokens each (a 26
   higher, most of it from one sequence of pretraining text. The 262 more experts lowered `nortx`'s KLD on fixed text
   from 0.0616 to 0.0598 (decode rows, paired: -2.8%). Its one GPQA run of 1.1 scored 183: one run can land about 3.5
   questions either side of the true score, and 13 of its 15 misses were questions 1.0 also missed in at least one of
-  its five runs. `nortx`'s prompt numbers come from our own prompt bench (cold 32,768- and 131,072-token prompts,
-  where 1.0 read 2,069 / 2,162: x1.64 / x1.85), not lil-bench; its decode numbers are 1.0's (1.1's checks at one
+  its five runs. 1.1 measured `nortx`'s prompts on our own prompt bench (cold 32,768- and 131,072-token prompts,
+  where 1.0 read 2,069 / 2,162: x1.64 / x1.85), not lil-bench, and kept 1.0's decode numbers (1.1's checks at one
   conversation read the same, 72-77 tokens/s). In the long-answer check, 0 of 72 answers looped and none ran out of
   room.
 - **Speed:** [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) (lil-bench) 1.7.1.
@@ -90,7 +102,7 @@ Every profile serves up to four conversations of up to 262,144 tokens each (a 26
 
 - A DGX Station GB300 (GB300 + Grace, 512 GB of CPU memory). The RTX PRO 6000 Blackwell is optional: the `nortx`
   profile runs on the GB300 alone, slower and less close to the official model (below).
-- One fast 4 TB NVMe drive for the model data (~3.1 TB: the official checkpoint, a stripped copy, and the 2-bit
+- One fast 4 TB NVMe drive for the model data (~3.0 TB: the official checkpoint, a stripped copy, and the 2-bit
   records). Its read speed is part of the engine's speed: while decoding, the engine reads 9.4 to 10.2 GB/s from it
   (about 400 experts a second moving into GPU memory, and nearly as many 2-bit copies refreshed in CPU memory), and we
   have seen it keep the drive fully busy at 13.7 GB/s. Every number here was measured on a **WD_BLACK SN8100 4 TB**
@@ -106,9 +118,21 @@ cp config.example.env config.env     # then set the paths in it
 ./build.sh                           # builds the engine's and the sidecar's GPU libraries inside the vLLM image
 docker build -t derpk31pro-runner tools/runner/docker
 engine/store/run_kstrip.sh           # the stripped checkpoint (everything but the experts), ~107 GB
-engine/store/run_build_store.sh      # the 2-bit records of every expert, ~1.4 TB
+engine/store/run_build_store.sh --format hi2-k2   # the 2-bit records of every expert, packed scales, ~1.3 TB
 engine/k31.sh up                     # starts the server on 127.0.0.1:8113 (OpenAI-compatible API)
 ```
+
+**Upgrading from 1.1:** 1.2's `default` and `nortx` read a record store with packed scale factors (`hi2-k2`). Convert
+yours once; on XFS or Btrfs the new store shares the code bytes with the old one, so it takes minutes and about 22 GB:
+
+```bash
+docker run --rm --network none -v "$PWD/engine":/engine:ro -v /models/k31-hi2:/src:ro -v /models/k31-hi2-k2:/dst \
+  --user "$(id -u):$(id -g)" --entrypoint python3 derpk31pro-runner /engine/store/convert_store.py /src /dst
+# then set HI2_DIR=/models/k31-hi2-k2 in config.env and run ./build.sh again (the RTX's packed-scale libraries)
+```
+
+Without reflinks the conversion copies the code bytes and needs about 650 GB more free space (`--require-reflink`
+stops instead of copying). The `fast` profiles read either store.
 
 Without an RTX PRO 6000, start the `nortx` profile instead: `engine/k31.sh up nortx`. For more speed and less
 closeness, start `fast` (or `fast-nortx`): the earlier settings, which stage fewer picks. The first start takes several
@@ -225,33 +249,29 @@ The closer `default` and `nortx` profiles came out of the same work: with four c
 staging more of each token's picks (ranks 0-7 instead of 0-3) and better average outputs paid for themselves in
 GPQA, at about 76 tokens/s for one conversation instead of about 103.
 
-### Packed scale factors (profiles `default-k2` and `nortx-k2`)
+### Packed scale factors
 
-Every 32 of an expert's weights share a one-byte scale factor, a power of two. In this model the scale factors of
-one row of a weight matrix almost always take two or three neighbouring values, so they can be stored in far fewer
-bits without changing a single result:
+Since 1.2, `default` and `nortx` store the experts' scale factors packed. Every 32 of an expert's weights share a
+one-byte scale factor, a power of two. In this model the scale factors of one row of a weight matrix almost always
+take two or three neighbouring values, so they can be stored in far fewer bits without changing a single result:
 
 - A 2-bit copy keeps one base byte per row and 2 bits per scale factor; the 46 scale factors of the whole model that
   do not fit are listed exactly. A copy shrinks from 9.29 MB to 8.53 MB, so the same CPU memory holds 45,382 of them
   instead of 41,661 (49,020 instead of 45,000 without the RTX), and the RTX holds 11,170 instead of 10,856.
 - An expert in GPU memory keeps 6 bits per scale factor, which the GB300 unpacks by itself while it loads them
   (the method of our sibling project [Derpseek](https://github.com/chronarion/derpseek)): 9,530 experts fit where
-  9,390 did.
+  9,390 did (`nortx`: 9,792 where 9,652 did).
 
-Every expert that is computed gives exactly the bits it gives in the default profiles; about 4,200 experts that
-used to be skipped now have a place. To use it, convert the record store once (minutes, about 22 GB on a drive with
-reflinks, the old store stays usable) and start the profile:
+Every expert that is computed gives exactly the bits it gave before; about 4,200 experts that used to get their
+average output now have a 2-bit copy or a place in GPU memory. The kernels that read the packed forms are checked
+byte for byte and bit for bit against the unpacked ones (`engine/tests/test_stager2.py`,
+`engine/tests/test_celane_pool_k2.py`, `sidecar/tests/test_band_k2.py`, `engine/tests/fork/sf6_rows_test.py`, the
+last also at the 4,096-row calls of the prompt path). MegaMoE takes the same time on the packed rows at decode sizes
+and about 2% longer on prompt chunks.
 
-```bash
-docker run --rm --network none -v "$PWD/engine":/engine:ro -v /models/k31-hi2:/src:ro -v /models/k31-hi2-k2:/dst \
-  --user "$(id -u):$(id -g)" --entrypoint python3 derpk31pro-runner /engine/store/convert_store.py /src /dst
-# set HI2_DIR=/models/k31-hi2-k2 in config.env, then
-engine/k31.sh up default-k2          # or nortx-k2
-```
-
-The kernels that read the packed forms are checked byte for byte and bit for bit against the unpacked ones
-(`engine/tests/test_stager2.py`, `sidecar/tests/test_band_k2.py`, `engine/tests/fork/sf6_rows_test.py`). Speed and
-KLD of these two profiles on the full system have not been measured yet.
+Measured in 1.2 (see [How fast and how close](#how-fast-and-how-close)): on the development tree, KLD on the
+fixed-text screen x0.927 for `nortx` and x0.953 for `default`, paired against the same settings on the unpacked store;
+`nortx` decodes 1-3% fewer steps per second than 1.1 and answered three long-reasoning GPQA questions right.
 
 ## Policies
 
@@ -443,9 +463,10 @@ overridden when starting (`K31_X=... engine/k31.sh up`).
 |---|---|---|
 | `DRAFT` (config.env), `DRAFTS` | the final DSpark drafter, 4 | the drafter and its draft tokens per step |
 | `KV_BYTES`, `MAXLEN` | 16 GiB, 262,144 | KV cache size and the longest conversation (one request at full length) |
-| `K31_HBM_MAP` | `hbm-map-256k-final.json` (`nortx`: `hbm-map-256k-final-nortx-plus262.json`, 9,652) | experts kept in GPU memory per layer (9,390 in all) |
-| `K31_BAND_N`, `K31_BAND_MAP` | 118, `band-map.json` | experts on the RTX per layer (10,856 in all); 0 turns the RTX off |
-| `K31_BANK_MAP` | `bank-map-256k.json` | 2-bit copies in CPU memory per layer (41,661; `bank-map-nortx.json`: 45,000 without the RTX; `bank-map.json`: 36,800 for hosts with less free memory) |
+| `K31_REC_FMT`, `K31_SF6` | `hi2-k2`, on (`fast`: unset, off) | packed scale factors: the record store's format the maps are sized for (the engine refuses another), 6-bit scale codes for the experts in GPU memory |
+| `K31_HBM_MAP` | `hbm-map-256k-final-sf6.json` (`nortx`: `hbm-map-256k-final-sf6-nortx-plus262.json`; `fast`: `hbm-map-256k-final.json`; `fast-nortx`: `hbm-map-256k-final-nortx.json`) | experts kept in GPU memory per layer (9,530 in all; `nortx` 9,792; `fast`, `fast-nortx` 9,390) |
+| `K31_BAND_N`, `K31_BAND_MAP` | 118, `band-map-k2.json` (`fast`: `band-map.json`) | experts on the RTX per layer (11,170 in all; `fast` 10,856); 0 turns the RTX off |
+| `K31_BANK_MAP` | `bank-map-256k-k2-sf6.json` (`nortx`: `bank-map-nortx-k2-sf6.json`; `fast`: `bank-map-256k.json`; `fast-nortx`: `bank-map-nortx.json`) | 2-bit copies in CPU memory per layer (45,382; `nortx` 49,020; `fast` 41,661; `fast-nortx` 45,000; `bank-map.json`: 36,800 for hosts with less free memory) |
 | `K31_POLICY` | `policy-stage8.json` (`nortx`: `policy-nortx-stage4.json`; `fast`: `policy-joint15.json`; `fast-nortx`: `policy-nortx-t92-allrows.json`) | staged ranks and resident caps per layer (see [Policies](#policies)) |
 | `K31_STAGE_ALL`, `K31_STAGE_ROWS` | on, 8,8,4,2,2 (`nortx`: 4,4,4,2,2; `fast`: none; `fast-nortx`: 4,4,2,1,1) | a staged expert serves all of its picks; per-row staging caps |
 | `K31_STAGE_CAP`, `K31_STAGE_SP`, `K31_STAGE_PRIOR` | 6, 8, 1,0.69,0.43,0.24,0.14 (`nortx`: 6, 4; `fast`: none) | at most this many copies staged per call; the ranks the staging plan considers; slots ordered by each row's chance of being accepted |
@@ -617,7 +638,7 @@ Papers behind what ships:
 - Judging a compressed model by how far its token probabilities move, not only by accuracy: Dutta et al., [Accuracy
   is Not All You Need](https://arxiv.org/abs/2407.09141).
 
-Storing the experts' scale factors in fewer bits without loss (profiles `default-k2`, `nortx-k2`) is the idea of
+Storing the experts' scale factors in fewer bits without loss ([Packed scale factors](#packed-scale-factors), 1.2) is the idea of
 MXFP4-CSF in Local Inference Lab's
 [b12x](https://github.com/local-inference-lab/b12x/blob/2cc7f66aaef76a9c7cbb660a1efb865cf3f26c88/docs/lossless-scale-compression.md)
 (Luke Alonso and Martin Vit; now part of [FlashInfer](https://github.com/flashinfer-ai/flashinfer/pull/5767)): a
