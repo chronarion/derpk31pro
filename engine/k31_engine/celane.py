@@ -287,6 +287,25 @@ def bank_base(st) -> int:
 _DST: dict = {}
 
 
+def expand_map(lane, base: int, slots: list, rows: list, mod) -> None:
+    """Records at base + slot x R (device memory) -> the module's rows `rows`, in the record format of lane.layout.
+    hi2-k1 records into plain rows: celane's map kernel, one launch. hi2-k2 records or 6-bit scale rows: stager2's
+    expand, one launch per run of consecutive slots and rows (the pool hands out free slots in order, so runs are
+    long). The pool's copies ahead land here (Pool.land)."""
+    from . import stager2
+    if stager2.active(lane.layout, mod):
+        i, n = 0, len(slots)
+        while i < n:
+            j = i + 1
+            while j < n and slots[j] == slots[i] + (j - i) and rows[j] == rows[i] + (j - i):
+                j += 1
+            stager2.expand(base + slots[i] * lane.R, lane.R, j - i, mod, rows[i], lane.layout, lane.xblocks)
+            i = j
+        return
+    bases, strides = dst_of(mod)
+    lane.m.expand_map(base, lane.R, list(slots), list(rows), bases, strides, lane.segs, lane.lut, lane.xblocks)
+
+
 def dst_of(mod):
     """Row 0 of the module's four kernel tensors and their row strides in bytes (the shared staging rows are rows
     0 .. 127), computed as stager.Stager does; cached by the four tensors' addresses and row strides."""
@@ -626,9 +645,7 @@ class Pool:
                 waits[id(ev)] = ev
         for ev in waits.values():
             cur.wait_event(ev)
-        bases, strides = dst_of(mod)
-        lane.m.expand_map(self.base, self.R, [p for p, _ in mapping], [row for _, row in mapping], bases, strides,
-                          lane.segs, lane.lut, lane.xblocks)
+        expand_map(lane, self.base, [p for p, _ in mapping], [row for _, row in mapping], mod)
         ev = torch.cuda.Event()
         ev.record(cur)
         for p, _ in mapping:
