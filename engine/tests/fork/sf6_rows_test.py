@@ -44,7 +44,10 @@ print(f"device {torch.cuda.get_device_name(0)}; headers: {desc}; nvidia-smi befo
 group = c.init_group(29593)
 from vllm.model_executor.layers.fused_moe.prepare_megamoe import prepare_megamoe_inputs  # noqa: E402
 
-exp = c.make_experts(E, g, TMAX, "sf6rows.experts")
+# scales over four values per row (120..123): a hi2-k2 record stores a row base and 2-bit offsets, and the official
+# checkpoint needs exception entries in 28 of 82,432 records; the common default of five values (119..123) would put
+# a fifth of the synthetic scales into exceptions and no record would fit (part 2 stages k2 records)
+exp = c.make_experts(E, g, TMAX, "sf6rows.experts", scale_lo=120, scale_hi=123)
 b4 = c.bank(exp)                                    # w13 codes, w13 scales, w2 codes, w2 scales (uncoded)
 symm = dg.get_symm_buffer_for_mega_moe(group, E, TMAX, c.K, c.H, c.I, activation="situ", mma_type="fp8xfp4")
 
