@@ -327,7 +327,7 @@ def part2():
                     failed.append(f"reference case {ci} rate {rate} seed {seed}: {ref_bad[0]}")
                     continue
                 cfgs = [(0.75, 2, 2, True), (0.75, 1, 2, False), (0.5, 2, 1, True), (1.0, 1, 3, True),
-                        (0.25, 2, 2, False), (0.625, 2, 3, False)]
+                        (0.25, 2, 2, False), (0.625, 2, 3, False), (1.0, 2, 1, True), (1.0, 2, 2, True)]
                 for share, lanes, bufs, xside in cfgs:
                     n += 1
                     try:

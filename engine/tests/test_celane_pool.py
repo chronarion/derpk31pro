@@ -300,7 +300,7 @@ def same(a, b):
 
 
 CFGS = [(0.75, 2, 2, True, True), (0.75, 1, 2, False, True), (0.75, 2, 1, True, True), (1.0, 1, 3, True, True),
-        (0.5, 2, 3, False, True), (0.25, 2, 2, True, True)]
+        (0.5, 2, 3, False, True), (0.25, 2, 2, True, True), (1.0, 2, 1, True, True), (1.0, 2, 2, True, True)]
 for T in (1024, 48):
     ref = run(None, T)
     ref2 = run(None, T)
@@ -380,7 +380,11 @@ try:
         for _ in range(n_busy):
             busy @ busy
 
-    for name, cfg in (("lane, no pool", (0.75, 2, 2, True, False)), ("pool", (0.75, 2, 2, True, True))):
+    for name, cfg in (("lane, no pool", (0.75, 2, 2, True, False)), ("pool", (0.75, 2, 2, True, True)),
+                      ("lane of whole units, no pool", (1.0, 2, 2, True, False)),
+                      ("pool, whole units, 1 buffer", (1.0, 2, 1, True, True)),
+                      ("pool, whole units, 2 buffers", (1.0, 2, 2, True, True)),
+                      ("pool, share 0.75, 1 buffer", (0.75, 2, 1, True, True))):
         share, lanes, bufs, xside, spec = cfg
         setflag("K31_PROMPT_CELANE_XSIDE", int(xside))
         setflag("K31_PROMPT_CELANE", share)

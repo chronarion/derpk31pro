@@ -184,9 +184,11 @@ def forward_prompt(mod, st, hidden_states, topk_weights, topk_ids, shared_expert
     if prof:
         pprof.mark(st.idx, 1)
     n_bank = int(getattr(st, "bank_n", 0) or len(st.bank))            # record slots of this layer's bank
-    if st.stagers is None:
+    # K31_STAGER_SMS_EAGER (a runtime flag here): thread blocks per stager launch on prompt chunks; unset or 0 = the
+    # decode setting (K31_STAGER_SMS, 24). The stagers are rebuilt when it changes (they hold no GPU memory).
+    sms = int(flags.num("K31_STAGER_SMS_EAGER", 0)) or int(os.environ.get("K31_STAGER_SMS", "24"))
+    if st.stagers is None or getattr(st.stagers[0], "sms", sms) != sms:
         from .stager import Stager
-        sms = int(os.environ.get("K31_STAGER_SMS_EAGER", "0")) or int(os.environ.get("K31_STAGER_SMS", "24"))
         st.stagers = [Stager(st.mod, SLOTS * g, st.layout, sms=sms) for g in range(GROUPS)]
     kept, n_keep, place, nat, is_band, cut = plan_rounds(topk_ids, topk_weights, st.row_map, st.bank_map,
                                                          st.band_map if getattr(st, "band_ok", True) else None,

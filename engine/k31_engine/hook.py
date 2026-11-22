@@ -1892,6 +1892,12 @@ def _patch_runner(module) -> None:
             mempeak.step_end()
         if prof is not None:
             prof.step_end()
+        # K31_PROMPT_EMPTY_CACHE=1 (runtime flag; off by default): after a prompt step torch's cached blocks go back
+        # to the device, so the next step's peak holds only what that step needs (blocks cached for other step
+        # shapes are not reused by it: 3-5 GiB stay reserved beside the peak allocation otherwise). Measurement
+        # switch: the timer's line of the next step then shows the device's free memory at a peak without history.
+        if ntok > 16 and _flags.on("K31_PROMPT_EMPTY_CACHE"):
+            torch.cuda.empty_cache()
         _STEPS[0] += 1
         if JOINT_STAT and _STEPS[0] % 2000 == 0 and _JT.get("stat") is not None:
             n = [int(v) for v in _JT["stat"].tolist()]
@@ -2549,6 +2555,10 @@ PATCHES = {TARGET: _patch_moe, "vllm.third_party.deep_gemm.utils.mlopart": _patc
                "k31_engine.force", fromlist=["patch_prompt_kl"]).patch_prompt_kl(m),
            **({"vllm.v1.worker.gpu.spec_decode.dspark.speculator": lambda m: __import__(
                "k31_engine.drafttopp", fromlist=["patch"]).patch(m)} if DRAFT_TOPP or DRAFT_ARGMAX else {}),
+           # K31_PROMPT_FIRST_CHUNK (sched.py): a request's first prompt chunks capped, in the scheduler's split rule
+           **({"vllm.v1.core.sched.scheduler": lambda m: __import__(
+               "k31_engine.sched", fromlist=["patch"]).patch(m)}
+              if int(os.environ.get("K31_PROMPT_FIRST_CHUNK", "0") or 0) > 0 else {}),
            **{r: _patch_runner for r in RUNNERS}}
 
 
