@@ -39,7 +39,7 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 
 | profile | decode, 1 / 2 / 4 conversations at once | reading a prompt (32K / 128K tokens) | GPQA Diamond (198 questions) |
 |---|---|---|---|
-| `default` (GB300 + RTX PRO 6000) | 76.2 / 95.5 / 111.0 tokens/s | 3,237 / 3,587 tokens/s (1.0: 2,117 / 2,163) | 186.3 (runs: 186, 185, 188) |
+| `default` (GB300 + RTX PRO 6000) | 75.0 / 93.0 / 109.9 tokens/s (1.2) | 3,282 / 3,211 tokens/s (1.2) | 186.3 (runs: 186, 185, 188; 1.0) |
 | `nortx` (GB300 alone) | 71.6 / 86.8 / 108.8 tokens/s (1.2) | 3,696 / 4,049 tokens/s (1.2) | 183 (one run of 1.1; 1.0: 187.0, runs 188, 186); 1.2: 3 of 3 long-reasoning spot checks |
 | `fast` (GB300 + RTX PRO 6000) | 103.4 / not measured / not measured | 2,138 / 2,164 tokens/s | not measured |
 | `fast-nortx` (GB300 alone) | 88.3 / not measured / not measured | 2,246 / 2,215 tokens/s | not measured |
@@ -66,7 +66,9 @@ Every profile serves up to four conversations of up to 262,144 tokens each (a 26
   three right on `nortx`, none looped, including the one 1.1's run left at the token limit. `default`'s own answers
   with four conversations at once, paired against 1.0 on the same 120 prompts: every difference within the noise
   (distance 0.0906 against 0.0919, near-impossible tokens 1.10 against 1.23 per 1,000, confident mistakes 0.73
-  against 0.63), no loops. `default`'s speed numbers are 1.1's until its lil-bench run is in.
+  against 0.63), no loops. `default` on lil-bench: decode 75.0 / 93.0 / 109.9 tokens/s at 1 / 2 / 4 conversations
+  (1.0: 76.2 / 95.5 / 111.0), prompts 3,282 / 3,211 tokens/s at 32K / 128K (1.1: 3,237 / 3,587; one run each, and
+  `nortx`'s first 1.2 run read low at 128K too, while its second did not).
 - **What 1.1 re-measured:** `default` changes only how prompts are read, so its decode, GPQA and closeness numbers
   are 1.0's; its prompt numbers are 1.1's (lil-bench, where the GB300 now reaches its power limit while reading). The
   new prompt settings were checked for closeness on `nortx`: writing its own answers, every difference from 1.0 is within the noise (paired on the same 120 prompts, 0 loops in 240 answers); on
