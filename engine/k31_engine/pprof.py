@@ -12,7 +12,8 @@ and the step's first and last points. At the end of the step the stream is synch
 line is logged per step:
   rows, the step's time on the stream, and its split: dense (point 4 of one layer to point 0 of the next: the previous
   layer's tail, this layer's attention and dense front), tick (0 -> 1), plan (1 -> 2), rounds (2 -> 3), tail (3 -> 4);
-  the layers' rounds and staged records; the host's wall time since the previous prompt step began.
+  the layers' rounds and staged records; the host's wall time since the previous prompt step began; the step's peak
+  of torch's allocator (allocated, reserved) and the device's free memory after it.
 Every K31_PROMPT_PROF_SUM steps (default 0 = never) a summary by layer class is logged too: layers with a tick, DSA
 layers, the rest.
 The marks cost one event record each (about 460 per forward); the synchronize at the end of a step is the mode's only
@@ -46,15 +47,23 @@ def step_begin(rows: int) -> None:
     _S["rows"] = rows
     _S["rounds"] = _S["records"] = 0
     _S["t0"] = time.perf_counter()
-    ev = torch.cuda.Event(enable_timing=True)
-    ev.record(torch.cuda.current_stream())
-    _S["first"] = ev
+    try:
+        torch.cuda.reset_peak_memory_stats()             # the step's own peak (torch's allocator)
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record(torch.cuda.current_stream())
+        _S["first"] = ev
+    except Exception as ex:                              # noqa: BLE001  (a timer must never stop a step)
+        _S["on"] = False
+        _LOG(f"prompt prof: off for this step ({type(ex).__name__}: {ex})")
 
 
 def mark(layer: int, point: int) -> None:
-    ev = torch.cuda.Event(enable_timing=True)
-    ev.record(torch.cuda.current_stream())
-    _S["marks"].append((layer, point, ev))
+    try:
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record(torch.cuda.current_stream())
+        _S["marks"].append((layer, point, ev))
+    except Exception:                                    # noqa: BLE001
+        _S["on"] = False
 
 
 def count(rounds: int, records: int) -> None:
@@ -62,11 +71,29 @@ def count(rounds: int, records: int) -> None:
     _S["records"] += records
 
 
+def _memory() -> str:
+    """The step's memory: torch's peak allocated and reserved, and what the device has free now, in MiB."""
+    try:
+        free, total = torch.cuda.mem_get_info()
+        m = 2 ** 20
+        return (f"; memory MiB: torch peak allocated {torch.cuda.max_memory_allocated() / m:.0f}, peak reserved "
+                f"{torch.cuda.max_memory_reserved() / m:.0f}, device free now {free / m:.0f} of {total / m:.0f}")
+    except Exception:                                    # noqa: BLE001
+        return ""
+
+
 def step_end() -> None:
-    """After the step's forward: wait for the stream, read the marks, log the step's line."""
+    """After the step's forward: wait for the stream, read the marks, log the step's line. Never raises."""
     if not _S["on"]:
         return
     _S["on"] = False
+    try:
+        _step_end()
+    except Exception as ex:                              # noqa: BLE001  (a timer must never stop a step)
+        _LOG(f"prompt prof: this step's line is lost ({type(ex).__name__}: {ex})")
+
+
+def _step_end() -> None:
     marks = _S["marks"]
     if not marks:
         return
@@ -102,7 +129,7 @@ def step_end() -> None:
          f"{tot['tick']:.1f} + plan {tot['plan']:.1f} + rounds {tot['rounds']:.1f} + tail {tot['tail']:.1f} + after "
          f"the last layer {closing:.1f}; {len(per)} layers, {_S['rounds']} rounds, {_S['records']} records; host: "
          f"forward returned after {1e3 * (t_host - _S['t0']):.1f} ms"
-         + (f", {wall:.1f} ms since the previous prompt step began" if wall is not None else ""))
+         + (f", {wall:.1f} ms since the previous prompt step began" if wall is not None else "") + _memory())
     every = flags.num("K31_PROMPT_PROF_SUM", 0)
     if every > 0:
         acc = _S["sum"]
