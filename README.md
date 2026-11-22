@@ -47,7 +47,7 @@ Every profile serves up to four conversations of up to 262,144 tokens each (a 26
 | how close (lower is closer) | writing its own answers: distance from the official model, 1 / 4 conversations at once | near-impossible tokens per 1,000 (4 at once) | confident mistakes per 1,000 (4 at once) | long answers stuck in a loop (4 at once) | KLD on fixed text, 32 / 512 samples (1 at a time) |
 |---|---|---|---|---|---|
 | `default` | 0.082 / 0.094 | 1.24 | 0.66 | 0 of 72 | 0.0452 / not measured yet, expected below `fast`'s 0.0619 |
-| `nortx` | 0.109 / 0.122 | 2.06 | 0.99 | 0 of 72 (1.0) | 0.0598 (1.0: 0.0616) / not measured yet, expected below `fast-nortx`'s 0.0756 |
+| `nortx` | 0.109 / 0.122 | 2.06 | 0.99 | 0 of 72 | 0.0598 (1.0: 0.0616) / not measured yet, expected below `fast-nortx`'s 0.0756 |
 | `fast` | 0.101 / 0.105 (science questions only) | 1.90 (science questions only) | not measured | not measured | 0.0896 / 0.0619 |
 | `fast-nortx` | 0.118 / 0.121 (science questions only) | 2.39 (science questions only) | not measured | not measured | 0.1006 / 0.0756 |
 | an early build of `fast` | 0.300 (4 at once) | 10.8 | 3.84 | 6 of 64 | 0.0896 / 0.0619 |
@@ -62,7 +62,8 @@ Every profile serves up to four conversations of up to 262,144 tokens each (a 26
   questions either side of the true score, and 13 of its 15 misses were questions 1.0 also missed in at least one of
   its five runs. `nortx`'s prompt numbers come from our own prompt bench (cold 32,768- and 131,072-token prompts,
   where 1.0 read 2,069 / 2,162: x1.64 / x1.85), not lil-bench; its decode numbers are 1.0's (1.1's checks at one
-  conversation read the same, 72-77 tokens/s). The long-answer loop check of 1.1 was still running at release.
+  conversation read the same, 72-77 tokens/s). In the long-answer check, 0 of 72 answers looped and none ran out of
+  room.
 - **Speed:** [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) (lil-bench) 1.7.1.
   Decode is its decode cell (a chat prompt, generated tokens counted over 30 s) with 1, 2 or 4 conversations at once,
   the mean of four runs; reading a prompt is the standard profile's prompt length divided by the time to the first
