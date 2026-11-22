@@ -26,8 +26,10 @@ between steps):
   K31_PROMPT_CELANE_XSIDE=1 (rounds without K31_PROMPT_AHEAD only) the expand on its own stream, beside the stager's
                             launches of the same round instead of after them
   K31_PROMPT_CELANE_XBLOCKS expand kernel blocks (default 608, four per SM)
-  K31_PROMPT_CELANE_CHECK=1 the first lane unit of each layer: every lane row compared with the same record staged by
-                            the stager into the same row, byte for byte (logged; a difference raises)
+  K31_PROMPT_CELANE_CHECK=n the first n lane units of each layer since the start (a runtime flag: raise it to check
+                            more units later, e.g. under mixed traffic): every lane row compared with the same
+                            record staged by the stager into the same row, byte for byte (logged; a difference
+                            raises)
   K31_PROMPT_SPEC=1         (rounds without K31_PROMPT_AHEAD only; off by default) the scratch as a pool with copies
                             ahead of the plan: while a layer's dense phase runs, the next layer's first lane records
                             cross the link (class Pool). Same rows, same MegaMoE calls: bit-identical output
@@ -413,7 +415,7 @@ def get(st, dev, share: float):
         _LOG(f"prompt path copy-engine lane: share {share} of every staging unit, {lane.lanes} copy stream(s), "
              f"{lane.bufs} scratch buffer(s) of {lane.cap} records ({lane.scratch_bytes() / 2**20:.0f} MiB of HBM)"
              + (", expand beside the stager" if flags.on("K31_PROMPT_CELANE_XSIDE") else "")
-             + (", byte check on" if flags.on("K31_PROMPT_CELANE_CHECK") else ""))
+             + (", byte check on" if flags.num("K31_PROMPT_CELANE_CHECK", 0) > 0 else ""))
     _LANE[0].xblocks = xblocks
     return _LANE[0]
 
@@ -468,9 +470,10 @@ def check_rows(st, kept: torch.Tensor, p0: int, q0: int, a: int, b: int) -> int:
 
 
 def _check(st, kept, p0, q0, h, m) -> None:
-    if m <= h or _CHECKED.get(st.idx, 0) >= 1 or not flags.on("K31_PROMPT_CELANE_CHECK"):
+    budget = flags.num("K31_PROMPT_CELANE_CHECK", 0)     # lane units checked per layer since the start (1: the first)
+    if m <= h or budget <= 0 or _CHECKED.get(st.idx, 0) >= budget:
         return
-    _CHECKED[st.idx] = 1
+    _CHECKED[st.idx] = _CHECKED.get(st.idx, 0) + 1
     bad = check_rows(st, kept, p0, q0, h, m)
     _LOG(f"celane check layer {st.idx}: {m - h - bad} of {m - h} lane rows equal to the stager's")
     if bad:
