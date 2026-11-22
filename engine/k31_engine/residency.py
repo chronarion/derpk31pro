@@ -125,6 +125,9 @@ class Residency:
             for e in np.nonzero(self.bank_slot[j] >= 0)[0]:
                 self.bank_owner[j, self.bank_slot[j, e]] = e
         self.bank_ref = np.zeros((n, max(self.G, 1)), dtype=np.int64)       # promotions reading a slot
+        # counts the times a slot was mapped to a record (after a refill or a write-back landed): a reader that
+        # copied a slot's record ahead of its use (celane's pool, K31_PROMPT_SPEC) checks owner and count again
+        self.bank_gen = np.zeros((n, max(self.G, 1)), dtype=np.int64)
         self.bank_busy = np.zeros((n, max(self.G, 1)), dtype=bool)          # slots being refilled
         for j in range(n):                       # a smaller layer's padding: busy for good, never a victim or target
             self.bank_busy[j, self.Gl[j]:] = True
@@ -391,6 +394,7 @@ class Residency:
             bupd.append((j, e, slot))
             self.bank_slot[j, e] = slot
             self.bank_owner[j, slot] = e
+            self.bank_gen[j, slot] += 1
             self.bank_busy[j, slot] = False
             self.bank_coming[j, e] = False
             self.n_bank += 1
@@ -483,6 +487,7 @@ class Residency:
             else:
                 self.bank_slot[j, v] = slot
                 self.bank_owner[j, slot] = v
+                self.bank_gen[j, slot] += 1
                 bupd.append((j, v, slot))
                 self.n_wb += 1
             self.wb_free.append(wb)

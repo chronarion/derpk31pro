@@ -12,6 +12,8 @@ import os
 
 import torch
 
+from . import flags
+
 CHUNK = 16384
 STAGES = 6
 SLOTS = 16
@@ -353,14 +355,36 @@ class RingStager(Stager):
                       self.chunks, self.lut, self.sms)
 
 
+_GEO: dict = {}
+
+
+def _geometry(mod):
+    """(row-0 addresses, bytes per row) of the module's four kernel tensors. Cached per module and checked against
+    the tensors' addresses: `t[0]` builds a view per call, and merge / extract_hi2 run once per promotion inside the
+    residency's tick (48 per tick while a prompt is read), on the engine thread."""
+    ts = (mod.w13_weight, mod.w2_weight, mod.w13_weight_scale, mod.w2_weight_scale)
+    key = (ts[0].data_ptr(), ts[1].data_ptr(), ts[2].data_ptr(), ts[3].data_ptr())
+    g = _GEO.get(id(mod))
+    if g is None or g[0] != key:
+        g = (key, tuple(t[0].numel() * t.element_size() for t in ts))
+        _GEO[id(mod)] = g
+    return g
+
+
+def _row_bases(mod, row: int) -> list:
+    """The addresses of row `row` in the module's four kernel tensors. K31_TICK_FAST=1 (runtime flag; off by default)
+    takes them from the cached geometry: the same addresses, without four tensor views per call."""
+    if flags.on("K31_TICK_FAST"):
+        base, rb = _geometry(mod)
+        return [base[0] + row * rb[0], base[1] + row * rb[1], base[2] + row * rb[2], base[3] + row * rb[3]]
+    ts = [mod.w13_weight, mod.w2_weight, mod.w13_weight_scale, mod.w2_weight_scale]
+    return [t.data_ptr() + row * (t[0].numel() * t.element_size()) for t in ts]
+
+
 def merge(hi_ptr: int, lo_ptr: int, mod, row: int, layout: dict, blocks: int = 32) -> None:
     """Rebuild expert row `row` of the module's four kernel tensors from its hi2 and lo2 records (device-visible
     addresses; host memory is fine), on the current stream."""
-    ts = [mod.w13_weight, mod.w2_weight, mod.w13_weight_scale, mod.w2_weight_scale]
-    bases = []
-    for t in ts:
-        rb = t[0].numel() * t.element_size()
-        bases.append(t.data_ptr() + row * rb)
+    bases = _row_bases(mod, row)
     nb = layout["native_bytes"]
     _module().merge(hi_ptr, lo_ptr, bases, [nb["w13"] // 2, nb["w2"] // 2, nb["w13s"], nb["w2s"]], blocks)
 
@@ -373,8 +397,7 @@ def _row_bytes(t: torch.Tensor, row: int) -> torch.Tensor:
 
 def extract_hi2(mod, row: int, layout: dict, out: torch.Tensor, blocks: int = 152) -> None:
     """extract_record(.., low=False) as one kernel (the inverse of merge for the hi2 half): ~27 MB of HBM traffic."""
-    ts = [mod.w13_weight, mod.w2_weight, mod.w13_weight_scale, mod.w2_weight_scale]
-    bases = [t.data_ptr() + row * (t[0].numel() * t.element_size()) for t in ts]
+    bases = _row_bases(mod, row)
     nb = layout["native_bytes"]
     _module().extract(out.data_ptr(), bases, [nb["w13"] // 2, nb["w2"] // 2, nb["w13s"], nb["w2s"]], blocks)
 

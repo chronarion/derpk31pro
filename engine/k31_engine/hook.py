@@ -1121,10 +1121,14 @@ def _forward(self, hidden_states, topk_weights, topk_ids, shared_experts=None):
         from . import defer as _dm
         bulk = _BULK[0]
         bulk = bulk if bulk is not None and bulk.mode and T <= bulk.max_rows else None
+        nxt = LAYERS.get(st.idx + 1)                 # K31_PROMPT_SPEC: the layer whose first records are copied ahead
+        if nxt is None:                              # (after the last layer: the first, for the next prompt step)
+            nxt = LAYERS.get(min(LAYERS))
         y = prompt_path.forward_prompt(self, st, hidden_states, topk_weights, topk_ids, shared_experts,
                                        orig=_orig["forward"], res=_RES if _IN_EXEC[0] else None,
                                        band_eager=_band_eager,
-                                       cut_mean=_dm.cut_mean, band_bulk=bulk, first_layer=min(LAYERS))
+                                       cut_mean=_dm.cut_mean, band_bulk=bulk, first_layer=min(LAYERS),
+                                       resv=_RES, next_st=nxt)
         if _flags.on("K31_PROMPT_SELFCHECK") and _SELFCHECK.get(st.idx, 0) < 2:   # the same inputs, older branch
             _SELFCHECK[st.idx] = _SELFCHECK.get(st.idx, 0) + 1
             y_old = _eager_legacy(self, st, hidden_states, topk_weights, topk_ids, shared_experts, picks, native,
@@ -1867,6 +1871,10 @@ def _patch_runner(module) -> None:
         if MEM_PEAK:
             from . import mempeak
             mempeak.step_begin(ntok)
+        prof = None
+        if _flags.on("K31_PROMPT_PROF"):                         # a prompt step's phases on the GPU's clock (pprof.py)
+            from . import pprof as prof
+            prof.step_begin(ntok)
         if DECODE_SPLIT:                                         # a decode-only step: no request brings more rows
             nst = getattr(so, "num_scheduled_tokens", None)      # than a verify block (eager calls split only then)
             try:
@@ -1882,6 +1890,8 @@ def _patch_runner(module) -> None:
             _SPLIT["decode"] = False
         if MEM_PEAK:
             mempeak.step_end()
+        if prof is not None:
+            prof.step_end()
         _STEPS[0] += 1
         if JOINT_STAT and _STEPS[0] % 2000 == 0 and _JT.get("stat") is not None:
             n = [int(v) for v in _JT["stat"].tolist()]

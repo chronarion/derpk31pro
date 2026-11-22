@@ -16,7 +16,10 @@ A record's place in the staging order is its shared row (place // 128 = round, p
 one host sync per layer (the number of rounds). MegaMoE runs in row slices of K31_PROMPT_SUB rows when set (0 = the
 whole chunk). K31_PROMPT_AHEAD=1 stages the next half-round on its own stream while MegaMoE reads the other half.
 K31_PROMPT_CELANE=<share> lands the last share of every round's (half-round's) records through the copy engines and an
-HBM-side expand instead of the stager (celane.py; same rows, same bytes, same MegaMoE calls).
+HBM-side expand instead of the stager (celane.py; same rows, same bytes, same MegaMoE calls). K31_PROMPT_SPEC=1 lets
+those copies run ahead of the plan: the next layer's first lane records cross the link during this layer's tail and
+the next layer's attention and dense work (celane.Pool; bit-identical output). K31_PROMPT_PROF=1 logs each prompt
+step's phases on the GPU's clock (pprof.py).
 Reference model of the plan: tests/prompt_plan_model.py; tests/test_prompt_path.py compares plan_rounds with it.
 """
 import math
@@ -28,6 +31,7 @@ E, K = 896, 16
 SLOTS, GROUPS = 16, 8
 STAGE_ROWS = SLOTS * GROUPS
 from . import flags                       # every setting is read per call (runtime flags, flags.py)
+from . import pprof                       # K31_PROMPT_PROF: the step's phases on the GPU's clock (off: one dict read)
 _LANE_ON = [False]                        # the copy-engine lane (K31_PROMPT_CELANE) holds its scratch
 N_MOE = 92
 # the study's pick amplitude by rank (sensitivity/data/model2.json "a"): what a cut pick of that rank costs, relative
@@ -156,11 +160,18 @@ def _tick(st, T, res, first_layer: int):
 
 def forward_prompt(mod, st, hidden_states, topk_weights, topk_ids, shared_experts, native=None, bank=None,
                    valid=None, nat_ids=None, orig=None, res=None, band_eager=None, cut_mean=None, band_bulk=None,
-                   first_layer: int = 1):
-    """A prompt chunk (T > 16 rows, not capturing) through one MoE layer -> the routed latent sum [T, 3584]."""
+                   first_layer: int = 1, resv=None, next_st=None):
+    """A prompt chunk (T > 16 rows, not capturing) through one MoE layer -> the routed latent sum [T, 3584].
+    resv: the residency list as the hook holds it (also when `res` is None because ticks are not allowed in this
+    forward), next_st: the next MoE layer's state; both only for K31_PROMPT_SPEC (celane.Pool)."""
     T, Kk = topk_ids.shape
     dev = topk_ids.device
+    prof = pprof.on()
+    if prof:
+        pprof.mark(st.idx, 0)
     _tick(st, T, res, first_layer)
+    if prof:
+        pprof.mark(st.idx, 1)
     n_bank = int(getattr(st, "bank_n", 0) or len(st.bank))            # record slots of this layer's bank
     if st.stagers is None:
         from .stager import Stager
@@ -188,13 +199,22 @@ def forward_prompt(mod, st, hidden_states, topk_weights, topk_ids, shared_expert
             celane.release()
             _LANE_ON[0] = False
     rounds = max(1, -(-n_kept // STAGE_ROWS))
+    if prof:
+        pprof.mark(st.idx, 2)
+        pprof.count(rounds, n_kept)
     rnd = torch.div(place, STAGE_ROWS, rounding_mode="floor")
     pos = place - rnd * STAGE_ROWS
     y = None
     ahead = flags.on("K31_PROMPT_AHEAD") and rounds > 1
     if lane is not None:
-        y = celane.rounds(orig, mod, st, hidden_states, topk_weights, shared_experts, kept, kept_h, place, nat, n_kept,
-                          topk_ids.dtype, share, ahead=ahead, lane=lane)
+        spec = flags.on("K31_PROMPT_SPEC") and not flags.on("K31_PROMPT_AHEAD")
+        celane.set_mode(lane, spec)
+        if spec:                                         # the scratch as a pool with copies ahead of the plan
+            y = celane.rounds_pool(orig, mod, st, hidden_states, topk_weights, shared_experts, kept, kept_h, place,
+                                   nat, n_kept, topk_ids.dtype, lane, resv=resv, next_st=next_st)
+        else:
+            y = celane.rounds(orig, mod, st, hidden_states, topk_weights, shared_experts, kept, kept_h, place, nat,
+                              n_kept, topk_ids.dtype, share, ahead=ahead, lane=lane)
     elif ahead:
         y = _rounds_ahead(orig, mod, st, hidden_states, topk_weights, shared_experts, kept, place, nat, n_kept,
                           topk_ids.dtype)
@@ -205,6 +225,8 @@ def forward_prompt(mod, st, hidden_states, topk_weights, topk_ids, shared_expert
             out = _megamoe(orig, mod, hidden_states, topk_weights, ids, shared_experts if r == 0 else None,
                            topk_ids.dtype)
             y = out if y is None else y + out           # out of place: a round's output may be MegaMoE's own buffer
+    if prof:
+        pprof.mark(st.idx, 3)
     if use_band:
         if band_bulk is not None:
             band_bulk.finish(st, y)
@@ -214,6 +236,8 @@ def forward_prompt(mod, st, hidden_states, topk_weights, topk_ids, shared_expert
         served = ~cut
         cut_mean(y, torch.where(served, 0, -1).to(torch.int32), topk_ids, topk_weights, st.cut_mean,
                  band=st.band_map if use_band else None)
+    if prof:
+        pprof.mark(st.idx, 4)
     return y
 
 

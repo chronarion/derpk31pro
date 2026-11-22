@@ -28,6 +28,9 @@ between steps):
   K31_PROMPT_CELANE_XBLOCKS expand kernel blocks (default 608, four per SM)
   K31_PROMPT_CELANE_CHECK=1 the first lane unit of each layer: every lane row compared with the same record staged by
                             the stager into the same row, byte for byte (logged; a difference raises)
+  K31_PROMPT_SPEC=1         (rounds without K31_PROMPT_AHEAD only; off by default) the scratch as a pool with copies
+                            ahead of the plan: while a layer's dense phase runs, the next layer's first lane records
+                            cross the link (class Pool). Same rows, same MegaMoE calls: bit-identical output
 HBM: BUFS x floor(share x 128 + 1/2) records of 9.29 MB (share 0.25: 297 MB per buffer), allocated at the first chunk
 that uses the lane. A change of the share, LANES or BUFS rebuilds the lane (after a device sync); switching the lane
 off (share 0) frees it (prompt_path.forward_prompt calls release()).
@@ -123,6 +126,80 @@ void expand(int64_t src, int64_t rec_bytes, int64_t n, std::vector<int64_t> base
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// expand_kernel with a table: record j of the launch is read at scratch slot map.src[j] (src + map.src[j] * rec_bytes)
+// and written to row map.dst[j]. The pool (K31_PROMPT_SPEC) expands a unit whose records sit anywhere in the scratch:
+// copied ahead of the layer's plan, or into whatever slots were free. Same arithmetic, same bytes per row.
+struct Map { uint16_t src[128]; uint16_t dst[128]; };
+
+__global__ void __launch_bounds__(THREADS) expand_map_kernel(const uint8_t* __restrict__ src, long long rec_bytes,
+    Dst dst, Map map, long long c13, long long c2, long long s13, long long s2, const uint16_t* __restrict__ lut_g) {
+  __shared__ uint16_t lut[256];
+  for (int i = threadIdx.x; i < 256; i += THREADS) lut[i] = lut_g[i];
+  __syncthreads();
+  const long long row = map.dst[blockIdx.y];
+  const uint4* rec = reinterpret_cast<const uint4*>(src + (long long)map.src[blockIdx.y] * rec_bytes);
+  const long long codes = c13 + c2, n16 = (codes + s13 + s2) >> 4, step = (long long)gridDim.x * THREADS;
+  uint8_t* const o13 = dst.base[0] + row * dst.stride[0];
+  uint8_t* const o2 = dst.base[1] + row * dst.stride[1];
+  uint8_t* const os13 = dst.base[2] + row * dst.stride[2];
+  uint8_t* const os2 = dst.base[3] + row * dst.stride[3];
+  for (long long u0 = (long long)blockIdx.x * THREADS + threadIdx.x; u0 < n16; u0 += UNROLL * step) {
+    uint4 v[UNROLL];
+#pragma unroll
+    for (int q = 0; q < UNROLL; q++) {
+      const long long u = u0 + q * step;
+      v[q] = u < n16 ? __ldcs(rec + u) : make_uint4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int q = 0; q < UNROLL; q++) {
+      const long long u = u0 + q * step;
+      if (u >= n16) break;
+      const long long off = u << 4;
+      if (off < codes) {
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(&v[q]);
+        uint4 w0, w1;
+        uint16_t* p0 = reinterpret_cast<uint16_t*>(&w0);
+        uint16_t* p1 = reinterpret_cast<uint16_t*>(&w1);
+#pragma unroll
+        for (int k = 0; k < 8; k++) { p0[k] = lut[b[k]]; p1[k] = lut[b[8 + k]]; }
+        uint4* d = reinterpret_cast<uint4*>(off < c13 ? o13 + 2 * off : o2 + 2 * (off - c13));
+        d[0] = w0; d[1] = w1;
+      } else {
+        const long long so = off - codes;
+        *reinterpret_cast<uint4*>(so < s13 ? os13 + so : os2 + (so - s13)) = v[q];
+      }
+    }
+  }
+}
+
+void expand_map(int64_t src, int64_t rec_bytes, std::vector<int64_t> src_idx, std::vector<int64_t> dst_row,
+                std::vector<int64_t> bases, std::vector<int64_t> strides, std::vector<int64_t> segs,
+                torch::Tensor lut, int64_t blocks) {
+  const int64_t n = (int64_t)src_idx.size();
+  if (n <= 0) return;
+  TORCH_CHECK(n <= 128 && (int64_t)dst_row.size() == n, "at most 128 records per launch, one row each");
+  TORCH_CHECK(bases.size() == 4 && strides.size() == 4 && segs.size() == 4);
+  TORCH_CHECK(lut.is_cuda() && lut.numel() == 512, "the stager's table: 256 x uint16 as 512 bytes");
+  TORCH_CHECK(src % 16 == 0 && rec_bytes % 16 == 0, "records must be 16-byte aligned");
+  for (int i = 0; i < 4; i++) {
+    TORCH_CHECK(segs[i] % 16 == 0 && strides[i] % 16 == 0 && bases[i] % 16 == 0, "16-byte units");
+  }
+  TORCH_CHECK(segs[0] + segs[1] + segs[2] + segs[3] <= rec_bytes, "segments exceed the record");
+  Map m;
+  for (int64_t i = 0; i < n; i++) {
+    TORCH_CHECK(src_idx[i] >= 0 && src_idx[i] < 65536 && dst_row[i] >= 0 && dst_row[i] < 65536, "table entry");
+    m.src[i] = (uint16_t)src_idx[i]; m.dst[i] = (uint16_t)dst_row[i];
+  }
+  for (int64_t i = n; i < 128; i++) { m.src[i] = 0; m.dst[i] = 0; }
+  Dst d;
+  for (int i = 0; i < 4; i++) { d.base[i] = reinterpret_cast<uint8_t*>(bases[i]); d.stride[i] = strides[i]; }
+  const int64_t bx = std::max<int64_t>(1, (blocks + n - 1) / n);
+  expand_map_kernel<<<dim3((unsigned)bx, (unsigned)n), THREADS, 0, c10::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const uint8_t*>(src), (long long)rec_bytes, d, m, (long long)segs[0], (long long)segs[1],
+      (long long)segs[2], (long long)segs[3], reinterpret_cast<const uint16_t*>(lut.data_ptr()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // One cudaMemcpyAsync on the current stream per (dst offset, src offset, bytes) triple: the copy engines. src is
 // pinned host memory (registered, UVA), dst device memory. Returns the number of copies.
 int64_t copy(int64_t dst, int64_t src, std::vector<int64_t> triples) {
@@ -143,7 +220,9 @@ int64_t attr(int64_t a) {
   return v;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("expand", &expand); m.def("copy", &copy); m.def("attr", &attr); }
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("expand", &expand); m.def("expand_map", &expand_map); m.def("copy", &copy); m.def("attr", &attr);
+}
 """
 _MOD = []
 
@@ -447,6 +526,269 @@ def rounds(orig, mod, st, x, w, shared_experts, kept, kept_h, place, nat, n_kept
         ids = torch.where((place >= 0) & (rnd == r), pos, nat if r == 0 else torch.full_like(nat, -1))
         out = pp._megamoe(orig, mod, x, w, ids, shared_experts if r == 0 else None, dtype)
         y = out if y is None else y + out             # out of place: a round's output may be MegaMoE's own buffer
+    return y
+
+
+# ------------------------------------------------------------------------------------------------ the pool
+class Pool:
+    """K31_PROMPT_SPEC=1: the lane's scratch as one pool of N = bufs x cap record slots, so that copies can run ahead
+    of a layer's plan.
+
+    Without it the link idles through every layer's dense phase (attention, norms, dense GEMMs, the residency's
+    tick): the lane's copies of a layer are issued after that layer's plan. With the pool, once a layer's last units
+    are queued, the next layer's first lane records are copied into the slots those units free, on the guess that the
+    next plan stages every record that is mapped now, in slot order. When that plan arrives, a record copied ahead is
+    used only if (1) it is a lane record of one of the layer's first `bufs` units and (2) the residency has neither
+    unmapped nor remapped its bank slot since the copy was issued (owner and generation as they were). Every other
+    lane record is copied as before, into slots whose content is not needed. The staging order, the rows and the
+    MegaMoE calls are those of the lane without the pool: only where a record's bytes wait changes, so a layer's
+    output is bit-identical.
+
+    A slot's life: a copy fills it (its `ready` event), an expand reads it (its `reader` event), then the next copy
+    into it waits for both. A unit's expand names each record's slot and row in a table (expand_map). A slot named by
+    a unit that has not been expanded yet is `live` and never given to a copy."""
+
+    def __init__(self, lane):
+        self.lane = lane
+        self.N = lane.bufs * max(lane.cap, 1)
+        self.R = lane.R
+        self.base = lane.scratch.data_ptr()          # slot p at base + p x R: the [bufs, cap, R] scratch is one block
+        self.ready = [None] * self.N
+        self.reader = [None] * self.N
+        self.live = set()
+        self.spec = None
+        self.n = {"layers": 0, "lane": 0, "ahead": 0, "used": 0, "stale": 0}
+        self.logged = 0
+
+    # -- copies
+    def _copy(self, src: int, pairs: list) -> None:
+        """Copies of (pool slot, bank slot) pairs, in order, split between the copy streams as the lane splits a
+        unit; one cudaMemcpyAsync per run of consecutive pool slots and bank slots. Each stream first waits for the
+        events of the slots it writes: the expand that last read them, a copy still filling them."""
+        lane = self.lane
+        for s, (a, e) in zip(lane.streams, parts(len(pairs), lane.lanes)):
+            if a == e:
+                continue
+            part = pairs[a:e]
+            waits = {}
+            for p, _ in part:
+                for ev in (self.reader[p], self.ready[p]):
+                    if ev is not None:
+                        waits[id(ev)] = ev
+            for ev in waits.values():
+                s.wait_event(ev)
+            with torch.cuda.stream(s):
+                lane.n_copies += lane.m.copy(self.base, src, pair_runs(part, self.R))
+                ev = torch.cuda.Event()
+                ev.record(s)
+            for p, _ in part:
+                self.ready[p] = ev
+        lane.n_records += len(pairs)
+
+    def fill(self, src: int, recs: list) -> list:
+        """Fresh copies of the records [(bank slot, row)] into free slots -> [(pool slot, row)]."""
+        if not recs:
+            return []
+        free = [p for p in range(self.N) if p not in self.live][:len(recs)]
+        assert len(free) == len(recs), f"K31 celane pool: {len(recs)} records for {len(free)} free slots"
+        self._copy(src, [(p, b) for p, (b, _) in zip(free, recs)])
+        self.live.update(free)
+        return [(p, row) for p, (_, row) in zip(free, recs)]
+
+    # -- the expand of a unit
+    def land(self, mod, mapping: list) -> int:
+        """On the current stream: wait for the copies of the unit's records [(pool slot, row)] and expand them into
+        their rows of the module's four kernel tensors. Returns the number of records."""
+        n = len(mapping)
+        if n == 0:
+            return 0
+        lane = self.lane
+        cur = torch.cuda.current_stream(lane.dev)
+        waits = {}
+        for p, _ in mapping:
+            ev = self.ready[p]
+            if ev is not None:
+                waits[id(ev)] = ev
+        for ev in waits.values():
+            cur.wait_event(ev)
+        bases, strides = dst_of(mod)
+        lane.m.expand_map(self.base, self.R, [p for p, _ in mapping], [row for _, row in mapping], bases, strides,
+                          lane.segs, lane.lut, lane.xblocks)
+        ev = torch.cuda.Event()
+        ev.record(cur)
+        for p, _ in mapping:
+            self.reader[p] = ev
+            self.live.discard(p)
+        lane.n_units += 1
+        return n
+
+    # -- ahead of the plan
+    def speculate(self, st, resv) -> None:
+        """Copy layer st's first lane records ahead of its plan: the lane records of its first `bufs` units if every
+        record mapped now is staged, in slot order. Called once the current layer's last unit is queued: every slot is
+        free after its reader."""
+        lane = self.lane
+        G = int(getattr(st, "bank_n", 0) or len(st.bank))
+        if G <= 0 or self.live:
+            return
+        r = resv[0] if resv else None
+        j = None
+        if r is not None:
+            j = _layer_j(r, st.idx)
+            if j is None or getattr(r, "bank_gen", None) is None:
+                return
+            cand = _np().nonzero(r.bank_owner[j, :G] >= 0)[0]
+        else:
+            cand = _np().arange(G)
+        n = int(cand.shape[0])
+        slots = []
+        for u in range(lane.bufs):
+            m = max(0, min(UNIT, n - u * UNIT))
+            slots.extend(cand[u * UNIT + m - take(lane.share, m):u * UNIT + m].tolist())
+        slots = slots[:self.N]
+        if not slots:
+            return
+        src = bank_base(st)
+        self._copy(src, list(enumerate(slots)))
+        arr = _np().asarray(slots, dtype=_np().int64)
+        self.spec = {"idx": st.idx, "src": src, "slots": slots, "arr": arr, "res": r, "j": j,
+                     "owner": None if r is None else r.bank_owner[j, arr].copy(),
+                     "gen": None if r is None else r.bank_gen[j, arr].copy()}
+        self.n["ahead"] += len(slots)
+
+    def claim(self, st, resv) -> dict:
+        """{bank slot: pool slot} of the records copied ahead for layer st that are still what the bank holds."""
+        sp, self.spec = self.spec, None
+        if sp is None or sp["idx"] != st.idx or sp["src"] != bank_base(st):
+            return {}
+        r = resv[0] if resv else None
+        if sp["res"] is not r:                       # issued under another residency (or none): cannot be checked
+            return {}
+        if r is None:
+            return {b: p for p, b in enumerate(sp["slots"])}
+        ok = (r.bank_owner[sp["j"], sp["arr"]] == sp["owner"]) & (r.bank_gen[sp["j"], sp["arr"]] == sp["gen"])
+        self.n["stale"] += int(ok.size - ok.sum())
+        return {b: p for p, (b, o) in enumerate(zip(sp["slots"], ok.tolist())) if o}
+
+    def log(self, every: int = 920) -> None:
+        self.n["layers"] += 1
+        if self.n["layers"] - self.logged >= every:
+            self.logged = self.n["layers"]
+            n = self.n
+            _LOG(f"prompt path pool (K31_PROMPT_SPEC): {n['layers']} layer calls; of {n['lane']} lane records "
+                 f"{n['used']} ({100.0 * n['used'] / max(1, n['lane']):.1f}%) were copied ahead of their plan; "
+                 f"{n['ahead']} records copied ahead in all, {n['stale']} of them dropped because the bank slot "
+                 f"changed")
+
+
+def _np():
+    import numpy
+    return numpy
+
+
+_J: dict = {}
+
+
+def _layer_j(r, idx: int):
+    """The residency's row index of layer idx (its tables are [layers, ...] in the order of r.idx)."""
+    m = _J.get(id(r))
+    if m is None or m[0] is not r:
+        m = _J[id(r)] = (r, {v: k for k, v in enumerate(r.idx)})
+    return m[1].get(idx)
+
+
+def pair_runs(pairs: list, rec_bytes: int) -> list:
+    """(pool slot, bank slot) pairs -> flat (dst offset, src offset, bytes) triples, one per run in which both the
+    pool slots and the bank slots are consecutive."""
+    out = []
+    i, n = 0, len(pairs)
+    while i < n:
+        j = i
+        while j + 1 < n and pairs[j + 1][0] == pairs[j][0] + 1 and pairs[j + 1][1] == pairs[j][1] + 1:
+            j += 1
+        out += [pairs[i][0] * rec_bytes, pairs[i][1] * rec_bytes, (j - i + 1) * rec_bytes]
+        i = j + 1
+    return out
+
+
+def set_mode(lane, pool: bool) -> None:
+    """The lane's scratch is driven either by its buffers (rounds) or as a pool (rounds_pool). A change of mode
+    waits for everything queued and starts from an empty scratch."""
+    if getattr(lane, "pool_mode", False) == pool:
+        return
+    torch.cuda.synchronize()
+    lane.free = [None] * lane.bufs
+    lane.copied = {}
+    lane.pool = Pool(lane) if pool else None
+    lane.pool_mode = pool
+    _LOG(f"prompt path copy-engine lane: {'pool with copies ahead of the plan (K31_PROMPT_SPEC)' if pool else 'buffers per unit'}")
+
+
+def rounds_pool(orig, mod, st, x, w, shared_experts, kept, kept_h, place, nat, n_kept, dtype, lane, resv=None,
+                next_st=None):
+    """rounds() with the scratch as a pool: the same rounds, rows and MegaMoE calls; lane records copied ahead of this
+    layer's plan are expanded from where they are, the others copied as in rounds(); then the next layer's first
+    lane records are copied ahead (next_st: its layer state, or None)."""
+    from . import prompt_path as pp
+    R = pp.STAGE_ROWS
+    pool = lane.pool
+    n_rounds = max(1, -(-n_kept // R))
+    rnd = torch.div(place, R, rounding_mode="floor")
+    pos = place - rnd * R
+    src = bank_base(st)
+
+    def unit(r):
+        m = max(0, min(R, n_kept - r * R))
+        return m, m - take(lane.share, m)
+
+    def recs(r):                                      # the unit's lane records: (bank slot, row)
+        m, h = unit(r)
+        return [(kept_h[r * R + k], k) for k in range(h, m)]
+
+    held = pool.claim(st, resv)
+    first = min(lane.bufs, n_rounds)
+    maps, miss = {}, {}
+    for r in range(first):
+        mp, ms = [], []
+        for b, row in recs(r):
+            p = held.get(b)
+            if p is not None:
+                mp.append((p, row))
+            else:
+                ms.append((b, row))
+        maps[r], miss[r] = mp, ms
+        pool.n["used"] += len(mp)
+    pool.live = {p for r in range(first) for p, _ in maps[r]}     # every other slot is free (after its reader)
+    lane.begin()
+    for r in range(first):
+        maps[r] += pool.fill(src, miss[r])
+    xside = flags.on("K31_PROMPT_CELANE_XSIDE")
+    main = torch.cuda.current_stream() if xside else None
+    xs = _xside(main) if xside else None
+    y = None
+    for r in range(n_rounds):
+        m, h = unit(r)
+        pool.n["lane"] += m - h
+        if xs is not None:                            # the expand beside the stager's launches, both after call r - 1
+            xs.wait_stream(main)
+            with torch.cuda.stream(xs):
+                pool.land(st.mod, maps.pop(r))
+                ev = torch.cuda.Event()
+                ev.record(xs)
+            stage_head(st, kept, r * R, h, 0)
+            main.wait_event(ev)
+        else:
+            stage_head(st, kept, r * R, h, 0)
+            pool.land(st.mod, maps.pop(r))
+        _check(st, kept, r * R, 0, h, m)
+        if r + lane.bufs < n_rounds:                  # into the slots this round's expand has just read
+            maps[r + lane.bufs] = pool.fill(src, recs(r + lane.bufs))
+        ids = torch.where((place >= 0) & (rnd == r), pos, nat if r == 0 else torch.full_like(nat, -1))
+        out = pp._megamoe(orig, mod, x, w, ids, shared_experts if r == 0 else None, dtype)
+        y = out if y is None else y + out             # out of place: a round's output may be MegaMoE's own buffer
+    if next_st is not None:
+        pool.speculate(next_st, resv)
+    pool.log()
     return y
 
 
