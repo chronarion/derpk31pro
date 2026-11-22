@@ -2,7 +2,11 @@
 
 Kimi K3.1 Pro on a single DGX Station GB300, as close to the official model as GPQA Diamond can tell: 186.3 of 198
 answered right (average of three runs; Moonshot reports 94.2%, 186.5 of 198), at about 76 tokens per second for one
-conversation and 111 for four at once. A `fast` profile trades some of that closeness for over 100 tokens per second.
+conversation and 111 for four at once, reading prompts at 3,200 to 4,000 tokens per second. A `fast` profile trades
+some of that closeness for over 100 tokens per second.
+
+**New in 1.1:** prompts read 1.5 to 1.9 times as fast as in 1.0, and without the RTX the GB300 keeps 262 more experts
+in its memory (see [Reading prompts](#reading-prompts)). Decode speed is unchanged.
 
 ## What is derpk31pro
 
@@ -32,23 +36,33 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 
 | profile | decode, 1 / 2 / 4 conversations at once | reading a prompt (32K / 128K tokens) | GPQA Diamond (198 questions) |
 |---|---|---|---|
-| `default` (GB300 + RTX PRO 6000) | 76.2 / 95.5 / 111.0 tokens/s | 2,117 / 2,163 tokens/s | 186.3 (runs: 186, 185, 188) |
-| `nortx` (GB300 alone) | 75.9 / 90.2 / 108.4 tokens/s | 2,232 / 2,228 tokens/s | 187.0 (runs: 188, 186) |
+| `default` (GB300 + RTX PRO 6000) | 76.2 / 95.5 / 111.0 tokens/s | 3,237 / 3,587 tokens/s (1.0: 2,117 / 2,163) | 186.3 (runs: 186, 185, 188) |
+| `nortx` (GB300 alone) | 75.9 / 90.2 / 108.4 tokens/s | 3,400 / 4,007 tokens/s on our prompt bench (1.0: 2,069 / 2,162) | 183 (one run of 1.1; 1.0: 187.0, runs 188, 186) |
 | `fast` (GB300 + RTX PRO 6000) | 103.4 / not measured / not measured | 2,138 / 2,164 tokens/s | not measured |
 | `fast-nortx` (GB300 alone) | 88.3 / not measured / not measured | 2,246 / 2,215 tokens/s | not measured |
 
 Every profile serves up to four conversations of up to 262,144 tokens each (a 260,000-token prompt reads at about
-2,000 tokens/s).
+2,000 tokens/s with `fast`, and at over 3,300 with 1.1's prompt path on `nortx`).
 
 | how close (lower is closer) | writing its own answers: distance from the official model, 1 / 4 conversations at once | near-impossible tokens per 1,000 (4 at once) | confident mistakes per 1,000 (4 at once) | long answers stuck in a loop (4 at once) | KLD on fixed text, 32 / 512 samples (1 at a time) |
 |---|---|---|---|---|---|
 | `default` | 0.082 / 0.094 | 1.24 | 0.66 | 0 of 72 | 0.0452 / not measured yet, expected below `fast`'s 0.0619 |
-| `nortx` | 0.111 / 0.125 | 2.17 | 1.10 | 0 of 72 | 0.0616 / not measured yet, expected below `fast-nortx`'s 0.0756 |
+| `nortx` | 0.109 / 0.122 | 2.06 | 0.99 | 0 of 72 (1.0) | 0.0598 (1.0: 0.0616) / not measured yet, expected below `fast-nortx`'s 0.0756 |
 | `fast` | 0.101 / 0.105 (science questions only) | 1.90 (science questions only) | not measured | not measured | 0.0896 / 0.0619 |
 | `fast-nortx` | 0.118 / 0.121 (science questions only) | 2.39 (science questions only) | not measured | not measured | 0.1006 / 0.0756 |
 | an early build of `fast` | 0.300 (4 at once) | 10.8 | 3.84 | 6 of 64 | 0.0896 / 0.0619 |
 | the official model, for scale | 0.003 | under 0.01 on science questions, up to 0.8 on chat | 0 | | 0 / 0 |
 
+- **What 1.1 re-measured:** `default` changes only how prompts are read, so its decode, GPQA and closeness numbers
+  are 1.0's; its prompt numbers are 1.1's (lil-bench, where the GB300 now reaches its power limit while reading). The
+  new prompt settings were checked for closeness on `nortx`: writing its own answers, every difference from 1.0 is within the noise (paired on the same 120 prompts, 0 loops in 240 answers); on
+  32K-token prompts the KLD of the text after the prompt is the same (x0.995), while the prompt's own rows read 2.7%
+  higher, most of it from one sequence of pretraining text. The 262 more experts lowered `nortx`'s KLD on fixed text
+  from 0.0616 to 0.0598 (decode rows, paired: -2.8%). Its one GPQA run of 1.1 scored 183: one run can land about 3.5
+  questions either side of the true score, and 13 of its 15 misses were questions 1.0 also missed in at least one of
+  its five runs. `nortx`'s prompt numbers come from our own prompt bench (cold 32,768- and 131,072-token prompts,
+  where 1.0 read 2,069 / 2,162: x1.64 / x1.85), not lil-bench; its decode numbers are 1.0's (1.1's checks at one
+  conversation read the same, 72-77 tokens/s). The long-answer loop check of 1.1 was still running at release.
 - **Speed:** [llm-inference-bench](https://github.com/local-inference-lab/llm-inference-bench) (lil-bench) 1.7.1.
   Decode is its decode cell (a chat prompt, generated tokens counted over 30 s) with 1, 2 or 4 conversations at once,
   the mean of four runs; reading a prompt is the standard profile's prompt length divided by the time to the first
@@ -302,6 +316,9 @@ compared only within one protocol. Most of this history built what are now the `
 | **A copy-engine lane** | Each chunk's CPU-memory records are copied by the GPU's copy engines into a scratch buffer while MegaMoE runs, instead of by the stager kernel (`K31_PROMPT_CELANE`). | With the big-row kernels, on 16K prompts: 1,600 to 1,808 tokens/s (+13%), and 1,585 to 1,904 (+20%) without the RTX. |
 | **Row slices for sparse attention** | A chunk's sparse attention in slices of 2,048 rows (`K31_DSA_ROW_SLICE`), bit-identical. | No speed cost (1,816 tokens/s); a smaller peak. |
 | **GPU memory sized by the prompt's peak** | The memory peak of a 4,096-token chunk was measured per step (`K31_MEM_PEAK`); it does not grow with the context, so the resident experts fill what the KV cache, that peak and 2 GiB leave. | A 260,000-token prompt reads at about 2,000 tokens/s; 2.8 GiB stay free at the peak. |
+| **A memory allocator that reuses its blocks (1.1)** | PyTorch's expandable segments (`ALLOC_CONF=expandable_segments:True`): freed memory of any size is merged and reused. The default allocator kept blocks cached for one chunk shape that other shapes could not use. A load that returns PyTorch's cache every 32 layers keeps the start-up from running the GPU full. | 3.4 GiB more free memory at a prompt chunk's peak, which pays for everything below. |
+| **Copies ahead of the plan (1.1)** | Each layer's expert copies all go over the copy engine, two buffers deep, and the next layer's first copies start before its plan is known (`K31_PROMPT_SPEC`, `K31_PROMPT_CELANE=1.0`); changes in the meantime are caught when a copy's slot is claimed. | Together with the next row, below. Bit-identical output. |
+| **8,192-token chunks (1.1)** | Prompts in chunks of 8,192 tokens (`MAX_BATCHED`), with MegaMoE run in two 4,096-row slices so its buffer stays the same size (`K31_MEGAMOE_ROWS`). A new prompt's first chunk stays at 4,096 tokens, and its second too where that costs no extra pass (`K31_PROMPT_FIRST_CHUNK`), because the experts in GPU memory follow a prompt only at chunk boundaries: its first chunk runs on what the previous request left. | `default` 2,117 to 3,237 tokens/s at 32K and 2,163 to 3,587 at 128K (lil-bench, x1.53 / x1.66); `nortx` x1.64 / x1.85 on our prompt bench. Decode speed unchanged; on 32K-token prompts the KLD after the prompt x0.995, on the prompt's own rows x1.027. |
 
 ### KLD
 
@@ -314,6 +331,7 @@ compared only within one protocol. Most of this history built what are now the `
 | **Rows per layer** | GPU memory split between layers by how much one more resident expert lowers KLD (56 to 378 per layer instead of 105 each). | 0.1158 to 0.0973 (paired -0.0117, the largest single KLD step). |
 | **No hand-offs, weighted credit** | A band expert promoted to GPU memory frees its slot for the best expert in CPU memory, instead of handing it to the expert it replaced; each layer's adaptation speed weighted by its sensitivity. | 0.0973 to 0.0854 (paired -0.0045). |
 | **Band and CPU-memory sizes per layer** | The RTX band and the CPU-memory copies split between layers the same way, and 5,000 more CPU-memory copies. | 0.0854 to 0.0797 (paired -0.0050); predicted 512-sequence headline 0.061. |
+| **262 more experts without the RTX (1.1)** | The memory the allocator frees beyond what 8,192-token chunks need holds 262 more resident experts on `nortx` (9,652), sized so the lowest free memory at a prompt chunk stays near 1.0's 1.5 GiB over a one-hour soak extrapolated to 72 hours. | 0.0616 to 0.0598 on the KLD screen (decode rows, paired -2.8%). |
 | **Staged experts serve every row** | A record staged for a token's strong pick also serves that expert's other picks in the verify block (`K31_STAGE_ALL`), and the band's 8 slots per call go to the experts whose rows are most likely to be accepted (`K31_BAND_PRIOR`). | 0.0752 to 0.0702 at the same speed. |
 
 Two choices raise the KLD we report on purpose: the engine learns which experts matter only from tokens the model
@@ -396,7 +414,7 @@ overridden when starting (`K31_X=... engine/k31.sh up`).
 |---|---|---|
 | `DRAFT` (config.env), `DRAFTS` | the final DSpark drafter, 4 | the drafter and its draft tokens per step |
 | `KV_BYTES`, `MAXLEN` | 16 GiB, 262,144 | KV cache size and the longest conversation (one request at full length) |
-| `K31_HBM_MAP` | `hbm-map-256k-final.json` | experts kept in GPU memory per layer (9,390 in all) |
+| `K31_HBM_MAP` | `hbm-map-256k-final.json` (`nortx`: `hbm-map-256k-final-nortx-plus262.json`, 9,652) | experts kept in GPU memory per layer (9,390 in all) |
 | `K31_BAND_N`, `K31_BAND_MAP` | 118, `band-map.json` | experts on the RTX per layer (10,856 in all); 0 turns the RTX off |
 | `K31_BANK_MAP` | `bank-map-256k.json` | 2-bit copies in CPU memory per layer (41,661; `bank-map-nortx.json`: 45,000 without the RTX; `bank-map.json`: 36,800 for hosts with less free memory) |
 | `K31_POLICY` | `policy-stage8.json` (`nortx`: `policy-nortx-stage4.json`; `fast`: `policy-joint15.json`; `fast-nortx`: `policy-nortx-t92-allrows.json`) | staged ranks and resident caps per layer (see [Policies](#policies)) |
@@ -410,11 +428,17 @@ overridden when starting (`K31_X=... engine/k31.sh up`).
 | `K31_DENSE_FMT` | int8 / FP8 / MXFP4 / W8A16 per layer kind | the dense layers' 8-bit forms |
 | `K31_DSA_FUSED` | on | the sparse-attention layers' small decode kernels fused (bit-exact) |
 | `K31_DRAFT_TOPP`, `K31_DRAFT_FULL_KV` | on, on | the request's top-p applied to the drafts; the drafter's KV as full attention |
-| `K31_I8_BIG_M_KERNEL`, `K31_W8A16_BIG_M`, `K31_PROMPT_CELANE`, `K31_DSA_ROW_SLICE` | on | the prompt path's big-row kernels, copy-engine lane and row slices (runtime flags: `engine/k31_engine/flags.py`) |
+| `K31_I8_BIG_M_KERNEL`, `K31_W8A16_BIG_M`, `K31_PROMPT_CELANE`, `K31_DSA_ROW_SLICE` | on, on, 1.0 (`fast`: 0.75), on | the prompt path's big-row kernels, copy-engine lane and row slices (runtime flags: `engine/k31_engine/flags.py`) |
+| `MAX_BATCHED`, `K31_MEGAMOE_ROWS` | 8,192, 4,096 (`fast`: 4,096, off) | the prompt chunk; MegaMoE's rows per call (larger chunks run in slices) |
+| `ALLOC_CONF` | `expandable_segments:True` (`fast`: PyTorch's default) | PyTorch's GPU memory allocator settings |
+| `K31_PROMPT_SPEC`, `K31_PROMPT_EMPTY_CACHE` | on, on (`fast`: off) | copies ahead of the plan; PyTorch's cached blocks returned after each prompt chunk |
+| `K31_PROMPT_FIRST_CHUNK`, `K31_PROMPT_FIRST_ROWS`, `K31_PROMPT_FIRST_FREE` | 4096,4096, 4096,8192, on (`fast`: off) | a new prompt's first two chunks at 4,096 tokens, the second only where it costs no extra pass |
+| `K31_BAND_BULK_ROWS` | 8,192 (`fast`: 4,096) | the RTX's prompt calls, in rows |
 
 Other `K31_*` switches in `engine/k31_engine` (deferral, the CPU-memory ring for band entries, other dense formats,
 pre-staging, the Grace pool, timing and checks) are experiments left off by default; each is described where it is
-read. The `nortx` profile (`engine/profiles/nortx.env`) changes the band, bank, map and policy settings above.
+read. The `nortx` profile (`engine/profiles/nortx.env`) changes the band, bank, map and policy settings above. The
+1.1 prompt settings live in `engine/profiles/prompt8k.env`, which `default` and `nortx` include.
 </details>
 
 ## Measuring KLD
