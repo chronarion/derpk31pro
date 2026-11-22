@@ -526,6 +526,8 @@ def rounds(orig, mod, st, x, w, shared_experts, kept, kept_h, place, nat, n_kept
         ids = torch.where((place >= 0) & (rnd == r), pos, nat if r == 0 else torch.full_like(nat, -1))
         out = pp._megamoe(orig, mod, x, w, ids, shared_experts if r == 0 else None, dtype)
         y = out if y is None else y + out             # out of place: a round's output may be MegaMoE's own buffer
+        if pp.pprof.on():
+            pp.pprof.round_mark(st.idx, r)
     return y
 
 
@@ -724,11 +726,18 @@ def set_mode(lane, pool: bool) -> None:
     _LOG(f"prompt path copy-engine lane: {'pool with copies ahead of the plan (K31_PROMPT_SPEC)' if pool else 'buffers per unit'}")
 
 
-def rounds_pool(orig, mod, st, x, w, shared_experts, kept, kept_h, place, nat, n_kept, dtype, lane, resv=None,
-                next_st=None):
+def speculate(lane, next_st, resv=None) -> None:
+    """After a layer's rounds are queued (rounds_pool): copy the next layer's first lane records ahead of its plan
+    (next_st: its layer state, or None)."""
+    pool = getattr(lane, "pool", None)
+    if pool is not None and next_st is not None:
+        pool.speculate(next_st, resv)
+
+
+def rounds_pool(orig, mod, st, x, w, shared_experts, kept, kept_h, place, nat, n_kept, dtype, lane, resv=None):
     """rounds() with the scratch as a pool: the same rounds, rows and MegaMoE calls; lane records copied ahead of this
-    layer's plan are expanded from where they are, the others copied as in rounds(); then the next layer's first
-    lane records are copied ahead (next_st: its layer state, or None)."""
+    layer's plan are expanded from where they are, the others copied as in rounds(). The caller then calls
+    speculate() for the next layer."""
     from . import prompt_path as pp
     R = pp.STAGE_ROWS
     pool = lane.pool
@@ -786,8 +795,8 @@ def rounds_pool(orig, mod, st, x, w, shared_experts, kept, kept_h, place, nat, n
         ids = torch.where((place >= 0) & (rnd == r), pos, nat if r == 0 else torch.full_like(nat, -1))
         out = pp._megamoe(orig, mod, x, w, ids, shared_experts if r == 0 else None, dtype)
         y = out if y is None else y + out             # out of place: a round's output may be MegaMoE's own buffer
-    if next_st is not None:
-        pool.speculate(next_st, resv)
+        if pp.pprof.on():
+            pp.pprof.round_mark(st.idx, r)
     pool.log()
     return y
 

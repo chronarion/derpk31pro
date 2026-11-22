@@ -325,7 +325,10 @@ def main():
     torch.save({"kl": per.float(), "kl_topk": torch.stack(coarse_all).float(), "top1": torch.stack(top1_all),
                 "cover": torch.stack(cover_all), "exact": bool(a.kl_ref or a.kl_hidden),
                 "eng_ids": eng_ids, "eng_lp": eng_lp, "sel": sel_list, "mode": a.mode, "prompt": a.prompt,
-                "kinds": kinds[:n_use] if kinds is not None else None},
+                "kinds": kinds[:n_use] if kinds is not None else None,
+                # exact KL of every prompt row [sequences, prompt - 1] when the server scored them (decode mode)
+                "prompt_exact": (torch.stack(prompt_exact_all).float() if n_use and len(prompt_exact_all) == n_use
+                                 else None)},
                a.out.replace(".json", "") + ".tokens.pt")
     json.dump(res, open(a.out, "w"), indent=1)
     print(json.dumps(res, indent=1))

@@ -12,8 +12,12 @@ and the step's first and last points. At the end of the step the stream is synch
 line is logged per step:
   rows, the step's time on the stream, and its split: dense (point 4 of one layer to point 0 of the next: the previous
   layer's tail, this layer's attention and dense front), tick (0 -> 1), plan (1 -> 2), rounds (2 -> 3), tail (3 -> 4);
-  the layers' rounds and staged records; the host's wall time since the previous prompt step began; the step's peak
-  of torch's allocator (allocated, reserved) and the device's free memory after it.
+  the layers' rounds and staged records; the host's wall time since the previous prompt step began; the mean time of
+  a layer's first, second and later rounds (plan's end or previous round's end to the round's MegaMoE call's end) on
+  the stream and on the host (the time the host took to queue the round); the host's clock between the phase points
+  (when it queued them: where the host's total is far below the stream's, the host runs ahead and the GPU or the link
+  sets the pace; where they agree, the host does); the step's peak of torch's allocator (allocated, reserved) and the
+  device's free memory after it.
 Every K31_PROMPT_PROF_SUM steps (default 0 = never) a summary by layer class is logged too: layers with a tick, DSA
 layers, the rest.
 The marks cost one event record each (about 460 per forward); the synchronize at the end of a step is the mode's only
@@ -44,6 +48,7 @@ def step_begin(rows: int) -> None:
         _S["prev_t0"] = None
         return
     _S["marks"] = []
+    _S["rmarks"] = []
     _S["rows"] = rows
     _S["rounds"] = _S["records"] = 0
     _S["t0"] = time.perf_counter()
@@ -61,7 +66,17 @@ def mark(layer: int, point: int) -> None:
     try:
         ev = torch.cuda.Event(enable_timing=True)
         ev.record(torch.cuda.current_stream())
-        _S["marks"].append((layer, point, ev))
+        _S["marks"].append((layer, point, ev, time.perf_counter()))
+    except Exception:                                    # noqa: BLE001
+        _S["on"] = False
+
+
+def round_mark(layer: int, r: int) -> None:
+    """After round r's MegaMoE call of a layer is queued: the round's end on the stream."""
+    try:
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record(torch.cuda.current_stream())
+        _S["rmarks"].append((layer, r, ev, time.perf_counter()))
     except Exception:                                    # noqa: BLE001
         _S["on"] = False
 
@@ -102,24 +117,47 @@ def _step_end() -> None:
     last.record(s)
     last.synchronize()
     t_host = time.perf_counter()
-    by = {}
-    for layer, point, ev in marks:
+    by, byh = {}, {}
+    for layer, point, ev, th in marks:
         by.setdefault(layer, {})[point] = ev
+        byh.setdefault(layer, {})[point] = th
     layers = sorted(by)
     tot = dict.fromkeys(("dense",) + NAMES, 0.0)
-    per = []
-    prev_end = _S["first"]
+    hst = dict.fromkeys(("dense",) + NAMES, 0.0)         # the host's clock between the same points (when it QUEUED
+    per = []                                             # them): far below the stream's = the host runs ahead
+    prev_end, prev_h = _S["first"], _S["t0"]
     for L in layers:
-        p = by[L]
+        p, h = by[L], byh[L]
         if len(p) < 5:
             continue
         d = prev_end.elapsed_time(p[0])
         seg = [p[i].elapsed_time(p[i + 1]) for i in range(4)]
         tot["dense"] += d
-        for n, v in zip(NAMES, seg):
+        hst["dense"] += 1e3 * (h[0] - prev_h)
+        for i, (n, v) in enumerate(zip(NAMES, seg)):
             tot[n] += v
+            hst[n] += 1e3 * (h[i + 1] - h[i])
         per.append((L, d, seg))
-        prev_end = p[4]
+        prev_end, prev_h = p[4], h[4]
+    # rounds by position in their layer: from the plan's end (point 2) or the previous round's end to the round's end
+    rsum, rcnt, hsum = [0.0, 0.0, 0.0], [0, 0, 0], [0.0, 0.0, 0.0]
+    prev_r = {}
+    for layer, r, ev, th in _S.get("rmarks", ()):
+        start = (by.get(layer, {}).get(2), byh.get(layer, {}).get(2)) if r == 0 else prev_r.get(layer)
+        prev_r[layer] = (ev, th)
+        if start is None or start[0] is None:
+            continue
+        k = min(r, 2)
+        rsum[k] += start[0].elapsed_time(ev)
+        hsum[k] += 1e3 * (th - start[1])
+        rcnt[k] += 1
+    f2 = lambda a, k: f"{a[k] / rcnt[k]:.2f}" if rcnt[k] else "-"      # noqa: E731
+    rtxt = ""
+    if sum(rcnt):
+        rtxt = (f"; ms per round on the stream: first {f2(rsum, 0)}, second {f2(rsum, 1)}, later {f2(rsum, 2)}; "
+                f"on the host: first {f2(hsum, 0)}, second {f2(hsum, 1)}, later {f2(hsum, 2)}")
+    rtxt += (f"; host ms between the same points: dense {hst['dense']:.1f} + tick {hst['tick']:.1f} + plan "
+             f"{hst['plan']:.1f} + rounds {hst['rounds']:.1f} + tail {hst['tail']:.1f}")
     total = _S["first"].elapsed_time(last)
     closing = prev_end.elapsed_time(last)
     wall = None if _S["prev_t0"] is None else 1e3 * (_S["t0"] - _S["prev_t0"])
@@ -129,7 +167,7 @@ def _step_end() -> None:
          f"{tot['tick']:.1f} + plan {tot['plan']:.1f} + rounds {tot['rounds']:.1f} + tail {tot['tail']:.1f} + after "
          f"the last layer {closing:.1f}; {len(per)} layers, {_S['rounds']} rounds, {_S['records']} records; host: "
          f"forward returned after {1e3 * (t_host - _S['t0']):.1f} ms"
-         + (f", {wall:.1f} ms since the previous prompt step began" if wall is not None else "") + _memory())
+         + (f", {wall:.1f} ms since the previous prompt step began" if wall is not None else "") + rtxt + _memory())
     every = flags.num("K31_PROMPT_PROF_SUM", 0)
     if every > 0:
         acc = _S["sum"]

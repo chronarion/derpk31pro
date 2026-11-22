@@ -18,8 +18,9 @@ whole chunk). K31_PROMPT_AHEAD=1 stages the next half-round on its own stream wh
 K31_PROMPT_CELANE=<share> lands the last share of every round's (half-round's) records through the copy engines and an
 HBM-side expand instead of the stager (celane.py; same rows, same bytes, same MegaMoE calls). K31_PROMPT_SPEC=1 lets
 those copies run ahead of the plan: the next layer's first lane records cross the link during this layer's tail and
-the next layer's attention and dense work (celane.Pool; bit-identical output). K31_PROMPT_PROF=1 logs each prompt
-step's phases on the GPU's clock (pprof.py).
+the next layer's attention and dense work (celane.Pool; bit-identical output). K31_PROMPT_TICK_LATE=1 runs the
+residency's in-forward tick after a layer's rounds are queued instead of before its plan. K31_PROMPT_PROF=1 logs each
+prompt step's phases on the GPU's clock (pprof.py).
 Reference model of the plan: tests/prompt_plan_model.py; tests/test_prompt_path.py compares plan_rounds with it.
 """
 import math
@@ -84,7 +85,10 @@ def plan_rounds(topk_ids, topk_weights, row_map, bank_map, band_map, n_bank: int
     else:
         order = torch.argsort((~hit).to(torch.uint8), stable=True)      # hit records first, in slot order
         cap = G
-    n_keep = torch.minimum(hit.sum(), torch.tensor(cap, device=dev))
+    if flags.on("K31_PROMPT_SPEC"):                      # the same value without a scalar copied from the host: with
+        n_keep = hit.sum().clamp(max=cap)                # copies ahead in flight that copy waits behind them
+    else:
+        n_keep = torch.minimum(hit.sum(), torch.tensor(cap, device=dev))
     pos = ar[:G]
     kept = torch.where(pos < n_keep, order, torch.full_like(order, -1))
     place_of = torch.full((G,), -1, dtype=torch.long, device=dev)
@@ -169,7 +173,14 @@ def forward_prompt(mod, st, hidden_states, topk_weights, topk_ids, shared_expert
     prof = pprof.on()
     if prof:
         pprof.mark(st.idx, 0)
-    _tick(st, T, res, first_layer)
+    # K31_PROMPT_TICK_LATE=1: the tick's host work (10-12 ms: landed promotions merged, maps written, refills and
+    # write-backs issued) runs at the end of this call, once the layer's rounds and tail are queued, while the GPU
+    # and the link work through them, instead of before the plan with the main stream idle. Its GPU work follows
+    # this layer's kernels in stream order, so the whole expert step reads the maps as the plan read them; the next
+    # layer sees the tick's changes.
+    late = flags.on("K31_PROMPT_TICK_LATE")
+    if not late:
+        _tick(st, T, res, first_layer)
     if prof:
         pprof.mark(st.idx, 1)
     n_bank = int(getattr(st, "bank_n", 0) or len(st.bank))            # record slots of this layer's bank
@@ -211,7 +222,13 @@ def forward_prompt(mod, st, hidden_states, topk_weights, topk_ids, shared_expert
         celane.set_mode(lane, spec)
         if spec:                                         # the scratch as a pool with copies ahead of the plan
             y = celane.rounds_pool(orig, mod, st, hidden_states, topk_weights, shared_experts, kept, kept_h, place,
-                                   nat, n_kept, topk_ids.dtype, lane, resv=resv, next_st=next_st)
+                                   nat, n_kept, topk_ids.dtype, lane, resv=resv)
+            # the next layer's first units ahead of its plan (before a late tick: the copies start as slots free
+            # up; what the tick changes in the bank is caught at the claim). Only when this forward has enough rows
+            # to pick most of a layer's records (K31_PROMPT_SPEC_ROWS, default 256): a short forward needs a third
+            # of them, and what it does need would queue behind the copies made ahead.
+            if T >= flags.num("K31_PROMPT_SPEC_ROWS", 256):
+                celane.speculate(lane, next_st, resv)
         else:
             y = celane.rounds(orig, mod, st, hidden_states, topk_weights, shared_experts, kept, kept_h, place, nat,
                               n_kept, topk_ids.dtype, share, ahead=ahead, lane=lane)
@@ -225,6 +242,8 @@ def forward_prompt(mod, st, hidden_states, topk_weights, topk_ids, shared_expert
             out = _megamoe(orig, mod, hidden_states, topk_weights, ids, shared_experts if r == 0 else None,
                            topk_ids.dtype)
             y = out if y is None else y + out           # out of place: a round's output may be MegaMoE's own buffer
+            if prof:
+                pprof.round_mark(st.idx, r)
     if prof:
         pprof.mark(st.idx, 3)
     if use_band:
@@ -238,6 +257,8 @@ def forward_prompt(mod, st, hidden_states, topk_weights, topk_ids, shared_expert
                  band=st.band_map if use_band else None)
     if prof:
         pprof.mark(st.idx, 4)
+    if late:                                             # after every kernel of this layer's expert step is queued:
+        _tick(st, T, res, first_layer)                   # they all read the maps the plan read (band map, row map)
     return y
 
 

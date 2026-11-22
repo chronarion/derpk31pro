@@ -207,7 +207,7 @@ def tick(world, st, rate, sim):
 
 
 def run_seq(seed, sizes, T_list, H, share, lanes, bufs, xside, spec, rate, forwards=3, between=4,
-            break_claim=False):
+            break_claim=False, spec_rows=0):
     """`forwards` prompt forwards over the layers -> [(layer, rows read, read list, ids)] per MegaMoE call, pool."""
     rng = random.Random(seed * 7919 + 13)
     world = World(rng, sizes, H)
@@ -258,7 +258,8 @@ def run_seq(seed, sizes, T_list, H, share, lanes, bufs, xside, spec, rate, forwa
     base.setflag("K31_PROMPT_CELANE_LANES", lanes)
     base.setflag("K31_PROMPT_CELANE_BUFS", bufs)
     base.setflag("K31_PROMPT_SPEC", int(spec))
-    order = sorted(world.layers)
+    base.setflag("K31_PROMPT_SPEC_ROWS", spec_rows)      # 0: copies ahead whatever the forward's rows (the cases
+    order = sorted(world.layers)                         # here have 12-200 rows; the default is 256)
     bad = []
     try:
         for f in range(forwards):
@@ -367,6 +368,80 @@ def part4():
         detail.append(f"bufs {bufs}: {st.get('used', 0)} of {st.get('lane', 0)} lane records ahead (want {want})")
     check("every record hit, no rewrites: the first units' lane records come from copies made ahead", ok,
           "(" + "; ".join(detail) + ")")
+    # K31_PROMPT_SPEC_ROWS: a forward under the threshold copies nothing ahead (and so claims nothing); at the
+    # threshold it does
+    sizes = (640, 640, 640, 640)
+    _, bad_lo, lo = run_seq(1, sizes, (255,), 20, 0.75, 2, 2, True, True, 0.0, forwards=2, between=0, spec_rows=256)
+    _, bad_hi, hi = run_seq(1, sizes, (256,), 20, 0.75, 2, 2, True, True, 0.0, forwards=2, between=0, spec_rows=256)
+    check("K31_PROMPT_SPEC_ROWS=256: no copies ahead in forwards of 255 rows, copies ahead at 256 rows",
+          not bad_lo and not bad_hi and lo.get("ahead", 0) == 0 and lo.get("used", 0) == 0 and hi.get("ahead", 0) > 0
+          and hi.get("used", 0) > 0,
+          f"(255 rows: {lo.get('ahead', 0)} copied ahead, {lo.get('used', 0)} used; 256 rows: {hi.get('ahead', 0)} "
+          f"copied ahead, {hi.get('used', 0)} used)")
+
+
+def part5():
+    """K31_PROMPT_TICK_LATE: where the residency's in-forward tick falls in a layer's expert step (host order).
+    Off: before the plan's first staging launch, as before. On: after the last MegaMoE call and the cut picks' mean
+    (the tail), once per eligible layer; the same credit either way; never in a layer that is not a tick layer."""
+    import contextlib
+    torch.cuda.current_stream = lambda device=None: base._MAIN
+    torch.cuda.Stream = lambda device=None, **kw: base._Stream()
+    torch.cuda.Event = lambda **kw: base._Event()
+    torch.cuda.stream = lambda s_: contextlib.nullcontext()
+    torch.cuda.synchronize = lambda device=None: None
+    rng = random.Random(4)
+    ok, detail = True, []
+    for late in (0, 1):
+        for idx, want_tick in ((1, False), (5, True), (6, False), (9, True)):
+            ev = []
+
+            class Res:
+                accepted = True
+                eager_tokens = 0
+
+                def tick(self, n):
+                    ev.append("tick")
+            res = Res()
+            case = base.make_case(rng, 64, 50, 200)
+            ids, w, row_map, bank_map = case
+            G = int((bank_map >= 0).sum())
+
+            def stager(g):
+                def f(bank_ptr, lst):
+                    ev.append("stage")
+                return f
+
+            def orig(mod, x, w_, ids_, shared):
+                ev.append("moe")
+                return torch.zeros(x.shape[0], 4, dtype=torch.float64)
+
+            def cut_mean(y, served, tid, tw, table, band=None):
+                ev.append("mean")
+            st = types.SimpleNamespace(idx=idx, mod=None, row_map=row_map, bank_map=bank_map, band_map=None,
+                                       band_ok=True, bank_n=G, bank=list(range(G)), strong=1,
+                                       stagers=[stager(g) for g in range(pp.GROUPS)], bank_ptr=4096, bank_cpu=None,
+                                       layout={"record_bytes": 9289728}, cut_mean=object())
+            base.setflag("K31_PROMPT_CELANE", 0)
+            base.setflag("K31_PROMPT_SPEC", 0)
+            base.setflag("K31_PROMPT_AHEAD", 0)
+            base.setflag("K31_PROMPT_TICK_LATE", late)
+            pp._LANE_ON[0] = False
+            celane._LANE.clear()
+            pp.forward_prompt(None, st, torch.zeros(64, 4), w, ids, None, orig=orig, res=[res], cut_mean=cut_mean,
+                              first_layer=1)
+            n_tick = ev.count("tick")
+            good = n_tick == (1 if want_tick else 0) and res.eager_tokens == (max(1, round(64 * 4 / 92))
+                                                                              if (idx - 1) % 4 == 0 else 0)
+            if want_tick:
+                good &= (ev[-1] == "tick" and ev.index("tick") > max(i for i, e in enumerate(ev) if e != "tick")) \
+                    if late else ev[0] == "tick"
+            ok &= good
+            if not good:
+                detail.append(f"late {late} layer {idx}: {ev[:3]}..{ev[-3:]} credit {res.eager_tokens}")
+    base.setflag("K31_PROMPT_TICK_LATE")
+    check("the in-forward tick: before the plan (off) or after the layer's last kernel is queued (on), once per tick "
+          "layer, the same credit", ok, "(" + "; ".join(detail) + ")" if detail else "")
 
 
 def main():
@@ -376,6 +451,7 @@ def main():
     part2()
     part3()
     part4()
+    part5()
     print(f"CELANE POOL CPU: {'PASS' if not fails else f'FAIL ({len(fails)} checks, first: ' + '; '.join(fails[:3]) + ')'}")
     sys.exit(0 if not fails else 1)
 
