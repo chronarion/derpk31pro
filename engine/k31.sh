@@ -11,7 +11,7 @@ D=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$D/.." && pwd)
 # Settings passed in the environment win over config.env and the profile (every variable can be overridden from the
 # environment): snapshot them before sourcing, re-apply after
-_caller=$(export -p | grep -E '^declare -x (K31_[A-Z0-9_]*|DRAFT|DRAFT_FINAL|DRAFTS|DRAFT_REJECT|SPEC_EXTRA|KV_BYTES|MAXLEN|MAX_SEQS|MAX_BATCHED|GPU_UTIL|CPUS|BAND_CPUS|MEM_LIMIT|MEGAMOE_FORK|GEN_DEFAULTS|PREFIX_UNIT)=' || true)
+_caller=$(export -p | grep -E '^declare -x (K31_[A-Z0-9_]*|DRAFT|DRAFT_FINAL|DRAFTS|DRAFT_REJECT|SPEC_EXTRA|KV_BYTES|MAXLEN|MAX_SEQS|MAX_BATCHED|GPU_UTIL|CPUS|BAND_CPUS|MEM_LIMIT|MEGAMOE_FORK|GEN_DEFAULTS|PREFIX_UNIT|ALLOC_CONF)=' || true)
 [ -f "$REPO/config.env" ] && . "$REPO/config.env"
 PROFILE=${2:-default}
 [ -f "$D/profiles/$PROFILE.env" ] && . "$D/profiles/$PROFILE.env"
@@ -116,6 +116,9 @@ up() {
   # PREFIX_UNIT: prefix-cache hits land on multiples of this many tokens (vLLM --prefix-match-unit); without it they land
   # on the hybrid KV blocks (16,384 tokens here), so a repeated long prompt recomputes up to 16K tokens
   PREFIX_UNIT=${PREFIX_UNIT-64}
+  # ALLOC_CONF: PyTorch's CUDA allocator settings for the engine (PYTORCH_CUDA_ALLOC_CONF; unset = PyTorch's defaults).
+  # ALLOC_CONF=expandable_segments:True lets freed blocks of any size be merged and reused: the default allocator
+  # keeps blocks cached for one step shape that other shapes cannot use (3.4 GiB at a prompt chunk's peak)
   # GEN_DEFAULTS: the sampling a request gets when it sets none (vLLM --override-generation-config): temperature 1.0,
   # top-p 0.95, the model card's evaluation setting and the benchmarks' (requests may still send any value); empty =
   # vLLM's own defaults (top-p 1.0)
@@ -143,6 +146,7 @@ up() {
     -e PYTHONPATH=/engine/hook:/engine -e K31_ENGINE=1 -e K31_MODE=${K31_MODE:-hbm} -e K31_NATIVE=/native \
     -e K31_RANK=${K31_RANK:-/rank/rank-native.json} -e K31_HBM=${K31_HBM:-115} ${K31_ROWMAP:+-e K31_ROWMAP=$K31_ROWMAP} \
     -e HF_HUB_OFFLINE=1 -e VLLM_LOGGING_LEVEL=INFO -e PYTHONUNBUFFERED=1 ${EXTRA:-} \
+    ${ALLOC_CONF:+-e PYTORCH_CUDA_ALLOC_CONF=$ALLOC_CONF} \
     $(env | grep -o "^K31_[A-Z0-9_]*" | grep -vxE "K31_(MODE|NATIVE|RANK|HBM|ROWMAP|HI2|BANK|STRONG|PROMOTE|HALFLIFE|DG_SMS|MERGE_BLOCKS|TIMING)" | sed "s/^/-e /" | tr "\n" " ") \
     --entrypoint /usr/bin/numactl $IMG --membind=0 \
     vllm serve /model --served-model-name kimi-k3.1-pro derpk31pro --trust-remote-code --language-model-only \

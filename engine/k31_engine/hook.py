@@ -1372,6 +1372,12 @@ def _bind(runner) -> None:
     _FIRST_MOE[0] = first
     if WINDOW_TEST:
         _WIN["buf"] = torch.zeros(1, dtype=torch.int64, device=dev)
+    # The rows below are mapped outside torch's allocator (vmm.py), and a failed mapping there cannot make torch give
+    # its cached blocks back: return them first. (After the checkpoint's shards are loaded torch's cache can hold
+    # much of the device, most of all with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.)
+    torch.cuda.empty_cache()
+    if os.environ.get("K31_MEM_REPORT", "0") == "1":
+        _mem_report("before the rows are bound")
     shared = None
     for idx, st in sorted(LAYERS.items()):
         keep, bank_keep = {}, {}

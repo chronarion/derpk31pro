@@ -230,7 +230,22 @@ def install(log) -> None:
             y = y + bias
         return y.reshape(*lead, N)
 
-    cls.process_weights_after_loading = process_weights_after_loading
+    # The checkpoint's shards pass through the GPU while the dense weights are converted, and what each conversion
+    # frees stays in torch's cache. With PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True that cache grows until a
+    # mapping fails with the device full (the allocator then releases it and retries: a warning with ~17 MB free,
+    # twice per load). K31_LOAD_TRIM=n (default 32; 0 = off) returns the cache to the device every n converted
+    # layers, so a load never runs the device full.
+    trim = int(os.environ.get("K31_LOAD_TRIM", "32") or 0)
+    calls = [0]
+
+    def process_weights_trim(self, layer):
+        out = process_weights_after_loading(self, layer)
+        calls[0] += 1
+        if trim > 0 and calls[0] % trim == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return out
+
+    cls.process_weights_after_loading = process_weights_trim
     cls.apply = apply
     cls._k31_fp6 = True
     log("Humming dense (W*A16): " + (os.environ.get("K31_DENSE_FMT") or
