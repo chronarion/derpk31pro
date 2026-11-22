@@ -193,6 +193,8 @@ def forward_prompt(mod, st, hidden_states, topk_weights, topk_ids, shared_expert
     kept, n_keep, place, nat, is_band, cut = plan_rounds(topk_ids, topk_weights, st.row_map, st.bank_map,
                                                          st.band_map if getattr(st, "band_ok", True) else None,
                                                          n_bank, st.strong)
+    if prof and pprof.tiers_on():                                    # K31_PROMPT_PROF_TIERS: picks by serving tier
+        pprof.tiers(topk_weights, nat, place, is_band, cut)
     use_band = st.band_map is not None and getattr(st, "band_ok", True)
     if use_band and band_bulk is not None:                           # the RTX starts on the chunk's band picks now
         band_bulk.send(st, hidden_states, topk_ids, topk_weights)

@@ -69,8 +69,14 @@ def expect(n, hit, biggest, cap, rows, unit=64, block=16384, least=0):
     hash boundary."""
     tail = (n - 1) // unit * unit
     out, start = [], hit
+    caps, bounds = (cap, rows) if isinstance(cap, tuple) else ((cap,), (rows,))
     while start < n:
-        size = biggest if (cap <= 0 or start - hit >= rows or n - hit <= least) else min(biggest, cap)
+        size = biggest
+        if n - hit > least:
+            for c, r in zip(caps, bounds):
+                if c > 0 and start - hit < r:
+                    size = min(biggest, c)
+                    break
         end = min(start + size, n)
         for stop in ((start // block + 1) * block, tail):
             if start < stop < end:
@@ -128,6 +134,30 @@ check(f"the cap only for requests with more rows than K31_PROMPT_FIRST_MIN ({n_m
       not bad and a_ == [3968, 32] and b_ == [1024, 4928, 48] and len(b_) == len(c_),
       f"({a_} / {b_} / {c_}; {len(bad)} differ: {'; '.join(bad[:2])})")
 
+# 2c. several steps: the documented ramp, and lists against the independent model
+ramp = ((1024, 3072, 4096), (1024, 4096, 8192))
+a_ = sizes(read(sched.wrap(ORIG, *ramp, 4096), scheduler(), 28672))
+b_ = sizes(read(sched.wrap(ORIG, 4096, 8192), scheduler(), 28672))
+c_ = sizes(read(sched.wrap(ORIG, *ramp, 4096), scheduler(), 4000))
+d_ = sizes(read(sched.wrap(ORIG, (1024, 4096), (1024, 8192)), scheduler(), 28672))
+bad, n_ramp = [], 0
+for caps, bounds, least in (ramp + (4096,), ramp + (0,), ((1024, 4096), (1024, 8192), 0), ((40, 4056), (40, 4096), 256),
+                            ((2048, 2048, 4096), (2048, 4096, 16384), 0)):
+    for _ in range(300):
+        n = rng.choice([rng.randint(1, 4200), rng.randint(4000, 9000), rng.randint(9000, 70000)])
+        hit = rng.choice([0, 0, rng.randrange(0, n, 64) if n > 64 else 0])
+        hit = min(hit, (n - 1) // 64 * 64)
+        got = sizes(read(sched.wrap(ORIG, caps, bounds, least), scheduler(), n, hit))
+        want = expect(n, hit, 8192, caps, bounds, least=least)
+        n_ramp += 1
+        if got != want:
+            bad.append(f"n {n} hit {hit} steps {caps}/{bounds} min {least}: {got[:7]} want {want[:7]}")
+check(f"several steps ({n_ramp} prompts equal the model): a 28,672-token prompt as 1,024 / 3,072 / 4,096 and then the "
+      f"two-chunk cap's boundaries; a 4,000-token prompt in one chunk",
+      not bad and a_ == [1024, 3072, 4096, 8192, 8192, 4032, 64] and b_ == [4096, 4096, 8192, 8192, 4032, 64]
+      and a_[3:] == b_[2:] and c_ == [3968, 32] and d_ == [1024, 4096, 4096, 7168, 8192, 4032, 64],
+      f"({a_} / {b_} / {c_} / {d_}; {len(bad)} differ: {'; '.join(bad[:2])})")
+
 # 3. with a shared budget (other requests take rows): every chunk is what the rule itself gives for some offer, the
 #    prompt is read to its end, no chunk under the cap's reach is larger than the cap
 bad = []
@@ -184,6 +214,23 @@ check("settings: off without the variable, rows default to the cap",
       and sched.settings({"K31_PROMPT_FIRST_CHUNK": "4096", "K31_PROMPT_FIRST_ROWS": "8192"}) == (4096, 8192, 0)
       and sched.settings({"K31_PROMPT_FIRST_CHUNK": "1024", "K31_PROMPT_FIRST_MIN": "4096"}) == (1024, 1024, 4096)
       and sched.settings({"K31_PROMPT_FIRST_ROWS": "8192"}) == (0, 0, 0))
+L = {"K31_PROMPT_FIRST_CHUNK": "1024,3072,4096", "K31_PROMPT_FIRST_ROWS": "1024,4096,8192", "K31_PROMPT_FIRST_MIN": "4096"}
+raised = []
+for env in ({"K31_PROMPT_FIRST_CHUNK": "1024,4096", "K31_PROMPT_FIRST_ROWS": "8192"},
+            {"K31_PROMPT_FIRST_CHUNK": "1024,4096", "K31_PROMPT_FIRST_ROWS": "4096,4096"},
+            {"K31_PROMPT_FIRST_CHUNK": "1024,x"}):
+    try:
+        sched.settings(env)
+        raised.append(False)
+    except ValueError:
+        raised.append(True)
+check("settings, several steps: two lists of one length; without the rows list each step holds for one chunk; lists "
+      "that do not fit raise; a zero in the list is off",
+      sched.settings(L) == ((1024, 3072, 4096), (1024, 4096, 8192), 4096)
+      and sched.settings({"K31_PROMPT_FIRST_CHUNK": "1024,4096"}) == ((1024, 4096), (1024, 5120), 0)
+      and sched.settings({"K31_PROMPT_FIRST_CHUNK": "[1024, 4096]", "K31_PROMPT_FIRST_ROWS": "[1024, 8192]"})
+      == ((1024, 4096), (1024, 8192), 0)
+      and sched.settings({"K31_PROMPT_FIRST_CHUNK": "1024,0"}) == (0, 0, 0) and all(raised), f"({raised})")
 mod = types.SimpleNamespace(Scheduler=type("Scheduler", (), {"_mamba_block_aligned_split": ORIG}))
 os.environ.pop("K31_PROMPT_FIRST_CHUNK", None)
 sched.patch(mod)
@@ -194,6 +241,33 @@ once = mod.Scheduler._mamba_block_aligned_split
 sched.patch(mod)
 check("patch: nothing without the setting, one wrapper with it", untouched and once is not ORIG
       and mod.Scheduler._mamba_block_aligned_split is once)
+
+# 8. the values as runtime flags: a live reader switches the cap between calls
+state = {"v": (4096, 4096, 0)}
+split = sched.wrap(ORIG, 0, 0, 0, live=lambda: state["v"])
+a_ = sizes(read(split, scheduler(), 40000))
+state["v"] = (0, 0, 0)
+b_ = sizes(read(split, scheduler(), 40000, rid="r2"))
+state["v"] = (40, 40, 256)
+c_ = sizes(read(split, scheduler(), 1024, rid="r3"))
+d_ = sizes(read(split, scheduler(), 200, rid="r4"))
+check("runtime values: cap on, off, and a 40-row scout chunk for prompts of more than 256 rows",
+      a_[:2] == [4096, 8192] and b_[0] == 8192 and c_ == [40, 920, 64] and d_ == [192, 8],
+      f"({a_[:3]} / {b_[:2]} / {c_} / {d_})")
+
+# 9. runtime values that do not fit: the last good ones stay, said once, and the prompt is read to its end
+said = []
+sched._LOG = lambda m: said.append(m)
+state = {"env": {"K31_PROMPT_FIRST_CHUNK": "1024,3072,4096", "K31_PROMPT_FIRST_ROWS": "1024,4096,8192"}}
+split = sched.wrap(ORIG, 4096, 4096, 0, live=lambda: sched.settings(state["env"]))
+a_ = sizes(read(split, scheduler(), 28672, rid="s1"))
+state["env"] = {"K31_PROMPT_FIRST_CHUNK": "1024,4096", "K31_PROMPT_FIRST_ROWS": "8192"}
+b_ = sizes(read(split, scheduler(), 28672, rid="s2"))
+state["env"] = {"K31_PROMPT_FIRST_CHUNK": "0"}
+c_ = sizes(read(split, scheduler(), 28672, rid="s3"))
+check("runtime lists: the ramp applies; values that do not fit keep the last good ones (said once); 0 switches off",
+      a_ == [1024, 3072, 4096, 8192, 8192, 4032, 64] and b_ == a_ and len(said) == 1 and "ignored" in said[0]
+      and c_[0] == 8192, f"({a_} / {b_} / {c_[:3]}; {len(said)} lines)")
 
 print(f"SCHED CAP: {'PASS' if not fails else f'FAIL ({len(fails)} checks: ' + '; '.join(fails[:3]) + ')'}")
 sys.exit(0 if not fails else 1)

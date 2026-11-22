@@ -207,7 +207,7 @@ def tick(world, st, rate, sim):
 
 
 def run_seq(seed, sizes, T_list, H, share, lanes, bufs, xside, spec, rate, forwards=3, between=4,
-            break_claim=False, spec_rows=0):
+            break_claim=False, spec_rows=0, same_ids=False, spec_last=0):
     """`forwards` prompt forwards over the layers -> [(layer, rows read, read list, ids)] per MegaMoE call, pool."""
     rng = random.Random(seed * 7919 + 13)
     world = World(rng, sizes, H)
@@ -259,7 +259,9 @@ def run_seq(seed, sizes, T_list, H, share, lanes, bufs, xside, spec, rate, forwa
     base.setflag("K31_PROMPT_CELANE_BUFS", bufs)
     base.setflag("K31_PROMPT_SPEC", int(spec))
     base.setflag("K31_PROMPT_SPEC_ROWS", spec_rows)      # 0: copies ahead whatever the forward's rows (the cases
-    order = sorted(world.layers)                         # here have 12-200 rows; the default is 256)
+    base.setflag("K31_PROMPT_SPEC_LAST", spec_last)      # here have 12-200 rows; the default is 256)
+    order = sorted(world.layers)
+    fixed = {}                                           # same_ids: a layer's picks are the same in every forward
     bad = []
     try:
         for f in range(forwards):
@@ -272,7 +274,10 @@ def run_seq(seed, sizes, T_list, H, share, lanes, bufs, xside, spec, rate, forwa
             for li, idx in enumerate(order):
                 st = world.layers[idx]
                 tick(world, st, rate, sim)
-                ids = torch.tensor([rng.sample(range(E), K) for _ in range(T)], dtype=torch.int32)
+                if same_ids and idx in fixed:
+                    ids = fixed[idx]
+                else:
+                    ids = fixed[idx] = torch.tensor([rng.sample(range(E), K) for _ in range(T)], dtype=torch.int32)
                 wts = torch.tensor([sorted((rng.random() for _ in range(K)), reverse=True) for _ in range(T)])
                 want = torch.tensor([[world.content.get((idx, int(st.bank_map[int(e)])), -9)
                                       if int(st.bank_map[int(e)]) >= 0 else -9 for e in row] for row in ids])
@@ -380,6 +385,24 @@ def part4():
           f"copied ahead, {hi.get('used', 0)} used)")
 
 
+def part4b():
+    """K31_PROMPT_SPEC_LAST: with the same picks in every forward and a bank hit in part, the copies ahead follow the
+    layer's last plan: more of them are used than with the slot-order guess; the rows and calls are the same."""
+    sizes, T = (640, 640, 640, 640), 24                  # 24 rows: a part of each bank is hit
+    ref, bad0, _ = run_seq(3, sizes, (T,), 20, 1.0, 2, 2, True, False, 0.0, forwards=4, between=0, same_ids=True)
+    a, bad1, sa = run_seq(3, sizes, (T,), 20, 1.0, 2, 2, True, True, 0.0, forwards=4, between=0, same_ids=True,
+                          spec_last=0)
+    b, bad2, sb = run_seq(3, sizes, (T,), 20, 1.0, 2, 2, True, True, 0.0, forwards=4, between=0, same_ids=True,
+                          spec_last=1)
+    fa = sa.get("used", 0) / max(1, sa.get("ahead", 0))
+    fb = sb.get("used", 0) / max(1, sb.get("ahead", 0))
+    check("copies ahead that follow the layer's last plan: same rows and calls, more of them used",
+          not (bad0 or bad1 or bad2) and same(a, ref) and same(b, ref) and sb.get("used", 0) > sa.get("used", 0)
+          and fb > fa,
+          f"(slot order: {sa.get('used', 0)} of {sa.get('ahead', 0)} used = {100 * fa:.0f}%; last plan: "
+          f"{sb.get('used', 0)} of {sb.get('ahead', 0)} = {100 * fb:.0f}%)")
+
+
 def part5():
     """K31_PROMPT_TICK_LATE: where the residency's in-forward tick falls in a layer's expert step (host order).
     Off: before the plan's first staging launch, as before. On: after the last MegaMoE call and the cut picks' mean
@@ -451,6 +474,7 @@ def main():
     part2()
     part3()
     part4()
+    part4b()
     part5()
     print(f"CELANE POOL CPU: {'PASS' if not fails else f'FAIL ({len(fails)} checks, first: ' + '; '.join(fails[:3]) + ')'}")
     sys.exit(0 if not fails else 1)

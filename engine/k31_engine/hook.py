@@ -1766,6 +1766,7 @@ def _patch_moe(module) -> None:
 
 
 MEM_REPORT = os.environ.get("K31_MEM_REPORT", "0") == "1"
+_MEMR = [False]                     # K31_MEM_REPLAYS: reported for this switch-on
 # K31_MEM_PEAK=<rows> at start-up: hooks for the memory peaks of steps of >= <rows> tokens (mempeak.py; the threshold
 # is then a runtime flag)
 MEM_PEAK = os.environ.get("K31_MEM_PEAK", "0") not in ("", "0")
@@ -1778,6 +1779,12 @@ def _mem_report(tag: str) -> None:
     g = 2 ** 30
     _LOG(f"memory {tag}: used {used / g:.2f} GiB of {total / g:.2f} (free {free / g:.2f}); torch allocated "
          f"{alloc / g:.2f}, reserved {res / g:.2f} (cached {(res - alloc) / g:.2f}); outside torch {(used - res) / g:.2f}")
+    if os.environ.get("K31_MEM_SNAPSHOT", "0") == "1":   # where the cached part sits (memgraphs.py)
+        try:                                             # a measurement must not stop a start
+            from . import memgraphs
+            memgraphs.report(tag)
+        except Exception as ex:                          # noqa: BLE001
+            _LOG(f"memory snapshot {tag}: failed ({type(ex).__name__}: {ex})")
 
 
 def _patch_runner(module) -> None:
@@ -1904,6 +1911,17 @@ def _patch_runner(module) -> None:
         # switch: the timer's line of the next step then shows the device's free memory at a peak without history.
         if ntok > 16 and _flags.on("K31_PROMPT_EMPTY_CACHE"):
             torch.cuda.empty_cache()
+        # K31_MEM_REPLAYS=1 (runtime flag, with K31_MEM_SNAPSHOT=1 at start-up): once per switch-on, the replays per
+        # captured graph so far and torch's memory snapshot now (memgraphs.py)
+        if _flags.on("K31_MEM_REPLAYS") != _MEMR[0]:
+            _MEMR[0] = not _MEMR[0]
+            if _MEMR[0] and os.environ.get("K31_MEM_SNAPSHOT", "0") == "1":
+                try:
+                    from . import memgraphs
+                    memgraphs.replays()
+                    _mem_report("now")
+                except Exception as ex:                          # noqa: BLE001
+                    _LOG(f"memory snapshot: failed ({type(ex).__name__}: {ex})")
         _STEPS[0] += 1
         if JOINT_STAT and _STEPS[0] % 2000 == 0 and _JT.get("stat") is not None:
             n = [int(v) for v in _JT["stat"].tolist()]
@@ -2595,6 +2613,12 @@ def install() -> None:
     if os.environ.get("K31_TIMING", "0") == "1":     # GPU time of every CUDA graph replay, logged every 30 s
         from . import timing
         timing.install()
+    if os.environ.get("K31_MEM_SNAPSHOT", "0") == "1":   # graph captures and torch's memory snapshot (memgraphs.py)
+        try:
+            from . import memgraphs
+            memgraphs.install()
+        except Exception as ex:                          # noqa: BLE001
+            sys.stderr.write(f"K31 K31_MEM_SNAPSHOT: not installed ({type(ex).__name__}: {ex})\n")
     for name, fn in PATCHES.items():
         if name in sys.modules:
             fn(sys.modules[name])

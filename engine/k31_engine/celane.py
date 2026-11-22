@@ -559,6 +559,7 @@ class Pool:
         self.reader = [None] * self.N
         self.live = set()
         self.spec = None
+        self.last = {}                               # layer idx -> the bank slots its last plan staged, in order
         self.n = {"layers": 0, "lane": 0, "ahead": 0, "used": 0, "stale": 0}
         self.logged = 0
 
@@ -642,6 +643,18 @@ class Pool:
             cand = _np().nonzero(r.bank_owner[j, :G] >= 0)[0]
         else:
             cand = _np().arange(G)
+        # The guess of the plan's order. Without history: every mapped record, in slot order (a chunk of 4,096 rows
+        # hits 78-97% of them). With the layer's last plan (K31_PROMPT_SPEC_LAST=1, a runtime flag, off by default):
+        # the records that plan staged and that are still mapped, in its order, then the other mapped ones;
+        # consecutive chunks of one prompt pick nearly the same records, so fewer copies ahead are wasted.
+        last = self.last.get(st.idx) if flags.on("K31_PROMPT_SPEC_LAST") else None
+        if last is not None and len(last):
+            np_ = _np()
+            keep = last[(last < G)]
+            if r is not None:
+                keep = keep[r.bank_owner[j, keep] >= 0]
+            rest = cand[~np_.isin(cand, keep)]
+            cand = np_.concatenate([keep, rest])
         n = int(cand.shape[0])
         slots = []
         for u in range(lane.bufs):
@@ -755,6 +768,7 @@ def rounds_pool(orig, mod, st, x, w, shared_experts, kept, kept_h, place, nat, n
         return [(kept_h[r * R + k], k) for k in range(h, m)]
 
     held = pool.claim(st, resv)
+    pool.last[st.idx] = _np().asarray(kept_h[:n_kept], dtype=_np().int64)[:lane.bufs * R]    # for the next guess
     first = min(lane.bufs, n_rounds)
     maps, miss = {}, {}
     for r in range(first):

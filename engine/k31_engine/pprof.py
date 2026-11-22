@@ -18,6 +18,9 @@ line is logged per step:
   (when it queued them: where the host's total is far below the stream's, the host runs ahead and the GPU or the link
   sets the pace; where they agree, the host does); the step's peak of torch's allocator (allocated, reserved) and the
   device's free memory after it.
+K31_PROMPT_PROF_TIERS=1 (runtime, with the timer): the step's picks by the tier that serves them (resident row, bank
+record, RTX band, nobody = the expert's mean), as counts and as routing weight: what a prompt's first chunk gets
+against its later ones. Adds about twenty small kernels per layer, so the phase times are a little longer with it.
 Every K31_PROMPT_PROF_SUM steps (default 0 = never) a summary by layer class is logged too: layers with a tick, DSA
 layers, the rest.
 The marks cost one event record each (about 460 per forward); the synchronize at the end of a step is the mode's only
@@ -49,6 +52,7 @@ def step_begin(rows: int) -> None:
         return
     _S["marks"] = []
     _S["rmarks"] = []
+    _S["tier"] = None
     _S["rows"] = rows
     _S["rounds"] = _S["records"] = 0
     _S["t0"] = time.perf_counter()
@@ -84,6 +88,23 @@ def round_mark(layer: int, r: int) -> None:
 def count(rounds: int, records: int) -> None:
     _S["rounds"] += rounds
     _S["records"] += records
+
+
+def tiers_on() -> bool:
+    """K31_PROMPT_PROF_TIERS=1 (with the timer): the step's picks by the tier that serves them."""
+    return _S["on"] and flags.on("K31_PROMPT_PROF_TIERS")
+
+
+def tiers(topk_weights, nat, place, is_band, cut) -> None:
+    """A layer's picks by tier, as counts and as routing weight: resident row, bank record, RTX band, nobody (the
+    expert's mean). Summed on the GPU; read once at the step's end."""
+    try:
+        w = topk_weights.float()
+        ms = (nat >= 0, place >= 0, is_band, cut)
+        v = torch.stack([m.sum().float() for m in ms] + [(w * m).sum() for m in ms])
+        _S["tier"] = v if _S.get("tier") is None else _S["tier"] + v
+    except Exception:                                    # noqa: BLE001
+        _S["tier"] = None
 
 
 def _memory() -> str:
@@ -158,6 +179,13 @@ def _step_end() -> None:
                 f"on the host: first {f2(hsum, 0)}, second {f2(hsum, 1)}, later {f2(hsum, 2)}")
     rtxt += (f"; host ms between the same points: dense {hst['dense']:.1f} + tick {hst['tick']:.1f} + plan "
              f"{hst['plan']:.1f} + rounds {hst['rounds']:.1f} + tail {hst['tail']:.1f}")
+    if _S.get("tier") is not None:                       # the picks by tier: counts, then routing weight
+        t = _S["tier"].tolist()
+        c, m = max(sum(t[:4]), 1.0), max(sum(t[4:]), 1e-9)
+        rtxt += ("; picks by tier: resident {:.1f}%, bank {:.1f}%, band {:.1f}%, cut {:.1f}% of {:.0f}; by routing "
+                 "weight: resident {:.1f}%, bank {:.1f}%, band {:.1f}%, cut {:.1f}%").format(
+                     *(100 * x / c for x in t[:4]), c, *(100 * x / m for x in t[4:]))
+        _S["tier"] = None
     total = _S["first"].elapsed_time(last)
     closing = prev_end.elapsed_time(last)
     wall = None if _S["prev_t0"] is None else 1e3 * (_S["t0"] - _S["prev_t0"])
