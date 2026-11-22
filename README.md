@@ -40,7 +40,7 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 | profile | decode, 1 / 2 / 4 conversations at once | reading a prompt (32K / 128K tokens) | GPQA Diamond (198 questions) |
 |---|---|---|---|
 | `default` (GB300 + RTX PRO 6000) | 76.2 / 95.5 / 111.0 tokens/s | 3,237 / 3,587 tokens/s (1.0: 2,117 / 2,163) | 186.3 (runs: 186, 185, 188) |
-| `nortx` (GB300 alone) | 70.8 / 87.9 / 108.8 tokens/s (1.2) | 3,678 / 3,039 tokens/s (1.2) | 183 (one run of 1.1; 1.0: 187.0, runs 188, 186); 1.2: 3 of 3 long-reasoning spot checks |
+| `nortx` (GB300 alone) | 71.6 / 86.8 / 108.8 tokens/s (1.2) | 3,696 / 4,049 tokens/s (1.2) | 183 (one run of 1.1; 1.0: 187.0, runs 188, 186); 1.2: 3 of 3 long-reasoning spot checks |
 | `fast` (GB300 + RTX PRO 6000) | 103.4 / not measured / not measured | 2,138 / 2,164 tokens/s | not measured |
 | `fast-nortx` (GB300 alone) | 88.3 / not measured / not measured | 2,246 / 2,215 tokens/s | not measured |
 
@@ -57,14 +57,16 @@ Every profile serves up to four conversations of up to 262,144 tokens each (a 26
 | the official model, for scale | 0.003 | under 0.01 on science questions, up to 0.8 on chat | 0 | | 0 / 0 |
 
 - **What 1.2 re-measured:** the packed forms are checked byte for byte and bit for bit (unit tests on the GB300 and
-  the RTX; MegaMoE on packed rows at decode and prompt sizes). `nortx` ran lil-bench: prompts 3,678 / 3,039 tokens/s
-  at 32K / 128K (the 128K number is being compared with 1.1 on the same bench) and decode 70.8 / 87.9 / 108.8 tokens/s
-  at 1 / 2 / 4 conversations (three runs for one conversation, two for the others; steps per second 1-3% below 1.1's,
-  and the drafter's acceptance came out low in two of the three runs). It also answered three long-reasoning GPQA
-  questions that 1.0 usually gets right (9,600 to 32,900 tokens each, picked at random): all three right, none looped,
-  including the one 1.1's run left at the token limit. On the development tree the packed scale factors lowered KLD
-  on the fixed-text screen to x0.927 (`nortx`) and x0.953 (`default`), paired. `default`'s own answers with four
-  conversations at once are being measured; its speed numbers are 1.1's.
+  the RTX; MegaMoE on packed rows at decode and prompt sizes). On the development tree the packed scale factors
+  lowered KLD on the fixed-text screen to x0.927 (`nortx`) and x0.953 (`default`), paired. `nortx` ran lil-bench
+  twice and 1.1's `nortx` once, on the same day: prompts 3,696 / 4,049 tokens/s at 32K / 128K against 1.1's 3,762 /
+  4,130 (-2%; 1.2's first run read 3,039 at 128K, which its second did not repeat); decode 71.6 / 86.8 / 108.8
+  tokens/s at 1 / 2 / 4 conversations against 1.1's 73.3 / 91.2 / 113.8 (steps per second -2% / -6% / -2%). Three
+  long-reasoning GPQA questions that 1.0 usually gets right (9,600 to 32,900 tokens each, picked at random): all
+  three right on `nortx`, none looped, including the one 1.1's run left at the token limit. `default`'s own answers
+  with four conversations at once, paired against 1.0 on the same 120 prompts: every difference within the noise
+  (distance 0.0906 against 0.0919, near-impossible tokens 1.10 against 1.23 per 1,000, confident mistakes 0.73
+  against 0.63), no loops. `default`'s speed numbers are 1.1's until its lil-bench run is in.
 - **What 1.1 re-measured:** `default` changes only how prompts are read, so its decode, GPQA and closeness numbers
   are 1.0's; its prompt numbers are 1.1's (lil-bench, where the GB300 now reaches its power limit while reading). The
   new prompt settings were checked for closeness on `nortx`: writing its own answers, every difference from 1.0 is within the noise (paired on the same 120 prompts, 0 loops in 240 answers); on
@@ -271,7 +273,8 @@ and about 2% longer on prompt chunks.
 
 Measured in 1.2 (see [How fast and how close](#how-fast-and-how-close)): on the development tree, KLD on the
 fixed-text screen x0.927 for `nortx` and x0.953 for `default`, paired against the same settings on the unpacked store;
-`nortx` decodes 1-3% fewer steps per second than 1.1 and answered three long-reasoning GPQA questions right.
+`nortx` reads prompts 2% slower and decodes 2-6% fewer steps per second than 1.1, and answered three long-reasoning
+GPQA questions right; `default`'s own answers with four conversations at once are as close as 1.0's.
 
 ## Policies
 
