@@ -44,11 +44,39 @@ print(f"device {torch.cuda.get_device_name(0)}; headers: {desc}; nvidia-smi befo
 group = c.init_group(29593)
 from vllm.model_executor.layers.fused_moe.prepare_megamoe import prepare_megamoe_inputs  # noqa: E402
 
-# scales over four values per row (120..123): a hi2-k2 record stores a row base and 2-bit offsets, and the official
-# checkpoint needs exception entries in 28 of 82,432 records; the common default of five values (119..123) would put
-# a fifth of the synthetic scales into exceptions and no record would fit (part 2 stages k2 records)
+# scales over four values per row (120..123): a hi2-k2 record stores a row base and 2-bit offsets (the common default
+# of five values, 119..123, would put a fifth of the synthetic scales into exceptions and no record would fit), plus
+# exception entries, at most 4 per tile of 128 scale rows. The official checkpoint has them in 28 of 82,432 records,
+# and that is where a coded-row bug would hide: experts EXC_ROWS get exceptions in five tiles of each scale tensor
+# (1, 4 in four rows, 4 in one row, 2, and 4 in the last tile incl. its last row and last K block; values above
+# and below the row's window), the other experts none, so staging, merging and extraction see both kinds.
 exp = c.make_experts(E, g, TMAX, "sf6rows.experts", scale_lo=120, scale_hi=123)
 b4 = c.bank(exp)                                    # w13 codes, w13 scales, w2 codes, w2 scales (uncoded)
+EXC_ROWS = (5, 40)
+EXC_PER_TENSOR = 1 + 4 + 4 + 2 + 4
+
+
+def inject_exceptions(sc, e):
+    """sc: one scale tensor [experts, scale rows, K groups] of 4 scale bytes per element. Overwrites single bytes of
+    expert e with values outside its row's four-value window."""
+    assert sc.dtype in (torch.int32, torch.uint32) and sc.dim() == 3, (sc.dtype, sc.shape)
+    n, kq = sc.shape[1], sc.shape[2]
+    last = n - 128
+    spots = [(7, 3, 1, 126),                                                         # tile 0: one
+             (128, 0, 0, 126), (150, kq - 1, 3, 117), (200, 5, 2, 126), (255, 9, 0, 117),   # tile 1: four rows
+             (300, 0, 0, 126), (300, 1, 1, 126), (300, 2, 2, 117), (300, kq - 1, 3, 126),   # tile 2: one row
+             (400, 4, 0, 117), (511, 6, 3, 126),                                     # tile 3: two (the unit's last row)
+             (last, 0, 0, 126), (last + 1, 2, 1, 117), (n - 1, kq - 1, 3, 126), (n - 1, 0, 0, 117)]   # the last tile
+    assert len(spots) == EXC_PER_TENSOR
+    for r, k, j, val in spots:
+        v = int(sc[e, r, k].item()) & 0xFFFFFFFF
+        v = (v & ~(0xFF << (8 * j))) | (val << (8 * j))
+        sc[e, r, k] = v - (1 << 32) if (v >= 1 << 31 and sc.dtype == torch.int32) else v
+
+
+for _e in EXC_ROWS:
+    inject_exceptions(b4[1], _e)
+    inject_exceptions(b4[3], _e)
 symm = dg.get_symm_buffer_for_mega_moe(group, E, TMAX, c.K, c.H, c.I, activation="situ", mma_type="fp8xfp4")
 
 
@@ -120,7 +148,10 @@ for j, r in enumerate(src_rows):
     stager.extract_record(un, r, LAYOUT_K1, hi[j])
     stager.extract_record(un, r, LAYOUT_K1, lo[j], low=True)
 hi_k2, fits = recfmt.k1_to_k2(hi, LAYOUT_K2)
-assert bool(fits.all())
+assert bool(fits.all()), "a synthetic record does not fit hi2-k2 (more than 4 exceptions in a tile)"
+n_exc = [len(x) for x in recfmt.exceptions(hi_k2, LAYOUT_K2)]
+print(f"exception entries of the staged k2 records (bank rows {src_rows}): {n_exc}", flush=True)
+assert n_exc == [2 * EXC_PER_TENSOR if r in EXC_ROWS else 0 for r in src_rows], "the injected exceptions did not land"
 hi_k2 = hi_k2.contiguous()
 SL = stager2.SLOTS
 for name, lay, bank in (("hi2-k1", LAYOUT_K1, hi), ("hi2-k2", LAYOUT_K2, hi_k2)):
