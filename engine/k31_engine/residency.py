@@ -26,6 +26,8 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 
+from . import storeio
+
 RING = 4
 MAX_FLIGHT = int(os.environ.get("K31_PROMOTE_FLIGHT", "16"))      # promotions in flight over all layers
 MERGE_BLOCKS = int(os.environ.get("K31_MERGE_BLOCKS", "152"))     # the merge runs between steps: all SMs
@@ -51,8 +53,19 @@ BAND_SWAP_FLIGHT = int(os.environ.get("K31_BAND_SWAP_FLIGHT", "64"))
 # tenth of what a bank -> band entry buys (78% of promotions and 52% of band entries were hand-offs, fw 11-18)
 PROMOTE_BAND_MARGIN = float(os.environ.get("K31_PROMOTE_BAND_MARGIN", "1.0"))
 # K31_FADV_RANDOM=1: the residency's record reads (promotions, refills) without the kernel's read-ahead: a 9.3 / 17.6 MB
-# record read pulled ~1.2 MB more past its end (~1.6 GB/s of the one model drive)
+# record read pulled ~1.2 MB more past its end (~1.6 GB/s of the one model drive). K31_ODIRECT=1: O_DIRECT record reads
+# instead (storeio.py: no read-ahead and no page cache; the drive gets the whole record at once)
 FADV_RANDOM = os.environ.get("K31_FADV_RANDOM", "0") == "1"
+# K31_CAPTURE_DRAIN_S: before CUDA graph capture, wait up to this long for the reader threads' jobs (vLLM's kernel
+# warm-up runs real steps right before capture, and their ticks start promotions); a reader thread's CUDA calls during
+# the capture would invalidate it. 0 turns the wait off (testing)
+CAPTURE_DRAIN_S = float(os.environ.get("K31_CAPTURE_DRAIN_S", "120"))
+# K31_READ_LAG_S: reads in flight are capped so a promotion decided now lands within about this long (the readers'
+# measured job time sets the cap; a fast drive keeps K31_PROMOTE_FLIGHT / K31_BANK_FLIGHT, a slow one queues less and
+# its promotions stay current instead of landing seconds after the routing moved on)
+READ_LAG_S = float(os.environ.get("K31_READ_LAG_S", "0.25"))
+# K31_HOLD_STARTUP=0 (testing): tick during vLLM's start-up steps as before 1.3 (graph capture still waits for reads)
+HOLD_STARTUP = os.environ.get("K31_HOLD_STARTUP", "1") == "1"
 # K31_HAND_FEED=1: a band member promoted to HBM frees its band slot (per-layer free list) instead of
 # taking the evicted expert in (a hand-off: an NVMe read for the band and a refill, ~2.1 GB/s); the evicted expert
 # goes to the bank by the write-back path; _band_feed fills free slots first with the layer's best bank candidate
@@ -162,7 +175,7 @@ class Residency:
             self.cw = np.array([wmap.get(st.idx, 1.0) for st in self.st])
         self.fcredit = np.zeros(n)
         self.feed_bjobs = []                                 # (j, victim, bank slot): refills queued by acked entries
-        self.n_feed = self.n_feed_ok = self.n_feed_fail = self.n_feed_refill = 0
+        self.n_feed = self.n_feed_ok = self.n_feed_fail = self.n_feed_refill = self.n_feed_drop = 0
         if all(getattr(st, "band_map", None) is not None for st in self.st):
             for j, st in enumerate(self.st):
                 self.band_slot[j] = st.band_map.cpu().numpy()
@@ -262,9 +275,35 @@ class Residency:
         self.t_log = time.time()
         self.n_done_log = 0
         self.bytes_log = 0
+        # No ticks until vLLM's start-up (profile run, kernel warm-up, graph capture) is over: its steps route dummy
+        # tokens, and promotions they started would still be reading during graph capture (start_serving releases)
+        self.hold = HOLD_STARTUP
+        self.workers = max(1, workers)
+        self.job_s = 0.0                   # readers' job time (EWMA), for the in-flight caps
+        self.n_read_err = 0
+        self.watch = storeio.Watch(self.store, workers)
+        if self.store and layout is not None:              # the model drive, read the way promotions read it
+            R, RL = int(layout["record_bytes"]), int(self.RL)
+            exts = ("hi2", "lo2") if self.merge_ok else ("hi2",)
+            cold, hot = [], []
+            for st in self.st:
+                for x in exts:
+                    f = os.path.join(self.store, f"L{st.idx:02d}.{x}")
+                    if os.path.exists(f):
+                        cold.append((f, R if x == "hi2" else RL))
+                        hot += [(f, int(e) * (R if x == "hi2" else RL), R if x == "hi2" else RL)
+                                for e in (getattr(st, "bank", None) or [])]
+            storeio.check(self.store, hot, cold, workers)
 
     # ------------------------------------------------------------------------------------------- reader threads
     def _job(self, j, e, buf, slot=-1):
+        t0 = time.perf_counter()
+        try:
+            return self._job_body(j, e, buf, slot)
+        finally:
+            self.job_s = 0.9 * self.job_s + 0.1 * (time.perf_counter() - t0) if self.job_s else time.perf_counter() - t0
+
+    def _job_body(self, j, e, buf, slot=-1):
         """Reader thread: the expert's hi2 record (the layer's Grace bank, or NVMe) and lo2 record (NVMe) into device
         buffer pair `buf` by copy-engine DMA (no SMs: a kernel beside the persistent MegaMoE calls would stall
         them). The merge into the row runs on the main stream between steps (tick). Without lo2 files: the official
@@ -305,6 +344,13 @@ class Residency:
         return t, loc.ck.last_bytes
 
     def _bank_job(self, j, e, slot, unmapped):
+        t0 = time.perf_counter()
+        try:
+            return self._bank_job_body(j, e, slot, unmapped)
+        finally:
+            self.job_s = 0.9 * self.job_s + 0.1 * (time.perf_counter() - t0) if self.job_s else time.perf_counter() - t0
+
+    def _bank_job_body(self, j, e, slot, unmapped):
         """Reader thread: refill bank slot `slot` of layer j with expert e's hi2 record, once no queued step can
         still read the slot (the event recorded after its unmap)."""
         loc = self.local
@@ -319,21 +365,77 @@ class Residency:
 
     @staticmethod
     def _pread(loc, path, buf, pos) -> int:
-        fd = loc.fds.get(path)
-        if fd is None:
-            fd = loc.fds[path] = os.open(path, os.O_RDONLY)
-            if FADV_RANDOM:                      # no read-ahead past a record (~1.6 GB/s of the model drive)
-                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
-        view, n = memoryview(buf.numpy()).cast("B"), 0
-        while view:
-            k = os.preadv(fd, [view], pos)
-            if k <= 0:
-                raise IOError(f"short read in {path} at {pos}")
-            view, pos, n = view[k:], pos + k, n + k
-        return n
+        rd = getattr(loc, "reader", None)
+        if rd is None:
+            rd = loc.reader = storeio.Reader()
+        return rd.read(path, buf.numpy(), pos)
+
+    def drain(self, timeout: float = CAPTURE_DRAIN_S) -> tuple:
+        """Hold the ticks and wait for every job of the reader threads (promotions, bank refills, ring copies) to
+        finish; their results land at the next tick. A guard: with ticks held from load nothing should be in flight.
+        Returns (jobs waited for, seconds). Raises when they do not finish within `timeout`."""
+        from concurrent.futures import wait
+        self.hold = True
+        self.tick_ev = None
+        futs = [f for (_, f, *_r) in self.flight.values()] + [f for (_, f) in self.bank_flight.values()] + \
+               [c[0] for c in self.ring_copy]
+        t0 = time.time()
+        left = [f for f in futs if not f.done()]
+        while left and time.time() - t0 < timeout:
+            _, left = wait(left, timeout=min(10.0, timeout - (time.time() - t0)))
+            if left:
+                _LOG(f"graph capture: {len(left)} of {len(futs)} reads from the model drive still in flight after "
+                     f"{time.time() - t0:.0f} s")
+        if left:
+            raise RuntimeError(f"K31: {len(left)} of {len(futs)} reads from the model drive still in flight after "
+                               f"{timeout:.0f} s, before CUDA graph capture: the drive is far too slow to serve from "
+                               f"(see the 'store check' line in the log; K31_CAPTURE_DRAIN_S sets this wait)")
+        return len(futs), time.time() - t0
+
+    def _read_error(self, what, j, e, ex) -> None:
+        self.n_read_err += 1
+        if self.n_read_err <= 5 or self.n_read_err % 1000 == 0:
+            _LOG(f"WARNING model drive read failed ({what}, layer {self.st[j].idx}, expert {e}): {type(ex).__name__}: "
+                 f"{ex} ({self.n_read_err} so far; the engine skips the record and keeps serving)")
+
+    def start_serving(self) -> None:
+        """vLLM's start-up is over: forget what its dummy steps routed and credited, and start ticking."""
+        if not HOLD_STARTUP:
+            self.hold = False
+            return
+        self.score.zero_()
+        self.stats.zero_()
+        self.acc.zero_()
+        self.pend_ids.fill_(-1)
+        self.pend_w2.zero_()
+        self.pend_t.zero_()
+        self.acc_seen = 0
+        self.eager_tokens = 0
+        self.credit[:] = 0
+        self.bcredit[:] = 0
+        self.fcredit[:] = 0
+        self.last_scores = self.last_stats = None
+        self.ring_tail = self.ring_head
+        self.tick_ev = None
+        self.t_log = time.time()
+        storeio.window()                                 # the start-up's reads are not serving reads
+        self.hold = False
+
+    def _caps(self) -> tuple:
+        """Promotions and bank refills allowed in flight: enough jobs to keep every reader busy, few enough that a
+        job queued now starts within about K31_READ_LAG_S (from the readers' measured job time)."""
+        W = self.workers
+        n = MAX_FLIGHT + BANK_FLIGHT
+        if self.job_s > 0:
+            n = max(W, min(int(W * READ_LAG_S / self.job_s), n))
+        cap_p = min(MAX_FLIGHT, max(W // 2, n * MAX_FLIGHT // (MAX_FLIGHT + BANK_FLIGHT)))
+        cap_b = min(BANK_FLIGHT, max(W // 4, n - cap_p))
+        return cap_p, cap_b
 
     # ------------------------------------------------------------------------------------------------- tick
     def tick(self, tokens: int = 1):
+        if self.hold:
+            return
         t0 = time.perf_counter()
         self.tokens = tokens
         self._tick()
@@ -394,8 +496,14 @@ class Residency:
         wb_issue = []                                                # write-backs to start after bupd is applied
         for key in [k for k, (_, f) in self.bank_flight.items() if f.done()]:  # 0. landed bank refills
             e, fut = self.bank_flight.pop(key)
-            nb = fut.result()
             j, slot = key
+            try:
+                nb = fut.result()
+            except Exception as ex:                      # noqa: BLE001  (the slot stays empty; serving goes on)
+                self._read_error("bank refill", j, e, ex)
+                self.bank_busy[j, slot] = False
+                self.bank_coming[j, e] = False
+                continue
             bupd.append((j, e, slot))
             self.bank_slot[j, e] = slot
             self.bank_owner[j, slot] = e
@@ -408,8 +516,20 @@ class Residency:
             e, fut, buf, bslot, v_out = self.flight[key]
             if bslot >= 0:
                 self.bank_ref[key[0], bslot] -= 1
-            res, nb = fut.result()
             j, row = key
+            try:
+                res, nb = fut.result()
+            except Exception as ex:                      # noqa: BLE001
+                self._read_error("promotion", j, e, ex)
+                self.coming_m[j, e] = False
+                del self.flight[key]
+                self.free.append(buf)
+                if v_out >= 0 and not self.resident[j, v_out]:
+                    self.row_of[j][v_out] = row
+                    self.res[j][row] = v_out
+                    self.resident[j, v_out] = True
+                    upd.append((j, v_out, row))
+                continue
             st = self.st[j]
             band_swap = False
             if HAND_FEED and self.band_cmd is not None and self.band_slot[j, e] >= 0:
@@ -533,7 +653,9 @@ class Residency:
                 if len(bjobs) == n0:
                     break
         if self.feed_bjobs:                            # victims of acked band entries take the entrants' bank slots
-            for j, e, slot in self.feed_bjobs:
+            room = 3 * self._caps()[1] - len(self.bank_flight) - len(bjobs)   # their own budget beside the
+            self.n_feed_drop += max(0, len(self.feed_bjobs) - max(room, 0))   # policy's; the rest keep no record
+            for j, e, slot in self.feed_bjobs[:max(room, 0)]:
                 if self.bank_busy[j, slot] or self.bank_ref[j, slot] > 0 or self.resident[j, e] or self.banded[j, e]:
                     continue
                 old = int(self.bank_owner[j, slot])
@@ -699,7 +821,7 @@ class Residency:
         """At most one swap per layer with credit: the strongest-scored expert of the layer's ideal top-S that is
         neither resident nor coming, against its weakest-scored resident expert, if it scores more (numpy over all
         layers at once; a row being filled holds no resident expert, so it is never a victim)."""
-        room = min(MAX_FLIGHT - len(self.flight), len(self.free)) - len(jobs)
+        room = min(self._caps()[0] - len(self.flight), len(self.free)) - len(jobs)
         cl = np.nonzero(self.credit >= 1)[0]
         if room <= 0 or cl.size == 0:
             return
@@ -852,7 +974,7 @@ class Residency:
         """At most one refill per layer with bank credit: the strongest-scored expert that is neither resident nor
         in the bank (nor coming) against the weakest bank slot that is free to change (no promotion reading it, not
         being refilled; slots holding resident experts count as weakest), if it scores more."""
-        room = BANK_FLIGHT - len(self.bank_flight) - len(bjobs)
+        room = self._caps()[1] - len(self.bank_flight) - len(bjobs)
         cl = np.nonzero(self.bcredit >= 1)[0]
         if room <= 0 or cl.size == 0:
             return
@@ -895,6 +1017,13 @@ class Residency:
               f"{self.n_bank - getattr(self, 'n_bank_log', 0)} bank refills ({len(self.bank_flight)} in flight), " \
               f"NVMe {(self.n_bytes - self.bytes_log) / dt / 1e9:.2f} GB/s, {nt} ticks of " \
               f"{1e6 * (self.tick_s - self.tick_s_log) / max(nt, 1):.0f} us on the host, {steps} execute_model calls"
+        sw = self.watch.line(storeio.window(), dt)
+        if sw:
+            msg += f", {sw}"
+        if self.n_feed_drop:
+            msg += f", {self.n_feed_drop} feed refills skipped (in-flight cap)"
+        if self.n_read_err:
+            msg += f", {self.n_read_err} failed reads"
         from .hook import _DEF
         if _DEF.get("count") is not None:
             nd = int(_DEF["count"].item())

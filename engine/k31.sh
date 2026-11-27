@@ -79,7 +79,8 @@ band_up() {
   log "starting the RTX band sidecar: $K31_BAND_N records per layer"
   docker run -d --name $NAME-band --restart no --entrypoint python3 --ipc host --cpuset-cpus ${BAND_CPUS:-48-49} \
     --memory 24g --ulimit core=0 --ulimit memlock=-1:-1 --user $RUN_AS -e HOME=/work/home -e CUDA_MODULE_LOADING=EAGER \
-    -e BAND_READAHEAD=${BAND_READAHEAD:-0} -e K31_FADV_RANDOM=${K31_FADV_RANDOM:-0} -e K31_BAND_RING=${K31_BAND_RING:-0} \
+    -e BAND_READAHEAD=${BAND_READAHEAD:-0} -e K31_FADV_RANDOM=${K31_FADV_RANDOM:-0} -e K31_ODIRECT=${K31_ODIRECT:-1} \
+    -e K31_BAND_RING=${K31_BAND_RING:-0} \
     -e K31_BAND_BULK=${K31_BAND_BULK:-0} -e K31_BAND_BULK_ROWS=${K31_BAND_BULK_ROWS:-4096} \
     --device nvidia.com/gpu=$RTX -v $REPO/sidecar:/work/code:ro -v $SIDECAR_BUILD:/work/build:ro \
     -v $STATE/band-home:/work/home -v $D:/engine:ro -v $HI2_DIR:/hi2:ro \

@@ -15,6 +15,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 
 import numpy as np
@@ -42,26 +43,34 @@ def log(msg: str) -> None:
     sys.stdout.flush()
 
 
-FADV_RANDOM = os.environ.get("K31_FADV_RANDOM", "0") == "1"
 # K31_BAND_RING=R (> 0): a /dev/shm ring of R hi2 records (<seg>.rec), pinned here; the engine copies an entrant's record
 # from its Grace bank into a row and posts the entry with rec = row + 1, so the entry reads nothing from the model drive
 RING = int(os.environ.get("K31_BAND_RING", "0") or 0)
 
 
+# Record reads go through the engine's storeio.Reader (O_DIRECT by default, K31_ODIRECT=0 for buffered reads; it falls
+# back to buffered reads when the file system refuses O_DIRECT): the engine folder is mounted at /engine
+_TLS = threading.local()
+_STOREIO = []
+
+
+def _storeio():
+    if not _STOREIO:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("k31_storeio", os.environ.get(
+            "K31_STOREIO", "/engine/k31_engine/storeio.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _STOREIO.append(mod)
+    return _STOREIO[0]
+
+
 def read_records(path: str, experts, out: np.ndarray) -> None:
-    fd = os.open(path, os.O_RDONLY)
-    if FADV_RANDOM:                              # no read-ahead past the record (wasted drive bandwidth)
-        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
-    try:
-        for j, e in enumerate(experts):
-            view, pos = memoryview(out[j]), int(e) * HI2_REC
-            while view:
-                k = os.preadv(fd, [view], pos)
-                if k <= 0:
-                    raise IOError(f"short read in {path} at {pos}")
-                view, pos = view[k:], pos + k
-    finally:
-        os.close(fd)
+    rd = getattr(_TLS, "reader", None)
+    if rd is None:
+        rd = _TLS.reader = _storeio().Reader(timed=False)
+    for j, e in enumerate(experts):
+        rd.read(path, out[j], int(e) * HI2_REC)
 
 
 def main() -> int:

@@ -111,7 +111,10 @@ Every profile serves up to four conversations of up to 262,144 tokens each (a 26
   (about 400 experts a second moving into GPU memory, and nearly as many 2-bit copies refreshed in CPU memory), and we
   have seen it keep the drive fully busy at 13.7 GB/s. Every number here was measured on a **WD_BLACK SN8100 4 TB**
   (PCIe Gen5 x4, 14 GB/s rated read). A Gen4 drive (about 7 GB/s) still works, but the experts follow the
-  conversation more slowly, so expect lower speed and higher KLD; we have not measured how much.
+  conversation more slowly, so expect lower speed and higher KLD; we have not measured how much. The drive should be
+  a local NVMe drive, not a network share or a RAID of slower disks. No tuning of the drive or of Linux is needed:
+  at every start the engine checks how fast the drive reads (a few seconds at most) and says in its log if it is slow
+  and what the likely cause is ([below](#if-the-log-warns-about-the-model-drive)).
 - Docker with the NVIDIA Container Toolkit (CDI device names), and the `vllm/vllm-openai:kimi-k31` image.
 - The official checkpoint (`moonshotai/Kimi-K3.1-Pro`) and the DSpark drafter (`Inferact/Kimi-K3.1-Pro-DSpark`).
 
@@ -458,6 +461,28 @@ From here on, speed is lil-bench's decode cell at the model card's sampling (tem
 | NRC1 | + row caps 4,4,2,1,1 | 88.3 | 36.6 | 0.1006 |
 </details>
 
+### If the log warns about the model drive
+
+At start the engine reads a few dozen expert records from the model drive and logs one `store check` line with how
+long one record takes and how many GB/s it gets with all its readers. While serving, every 30-second `residency` line
+shows the same for real reads. When the drive is slow enough to matter, the log says so with a `WARNING`, both at
+start and while serving (at most once every 10 minutes). The model still answers correctly, but it runs slower and its
+answers drift further from the official model, because the experts it needs arrive late. What usually helps, most
+likely first:
+
+- **Another program is using the drive.** Copies, downloads or backups on the same drive take its bandwidth.
+- **The store is not on a local NVMe drive.** Network shares, USB drives, SATA drives and RAID sets of slower disks
+  are much slower. Move the record store (`HI2_DIR`) to a local PCIe NVMe drive.
+- **The drive is hot.** The check line shows its temperature; above about 70 C many drives slow themselves down.
+- **The data has been read very many times.** Some NVMe drives read data slower after it has been read heavily
+  ("read disturbance"; [Park et al., SIGMETRICS 2026](https://arxiv.org/abs/2608.14073) measured its effect on 15
+  drives), and the engine reads its records over and over. A user who hit this got the speed back by rewriting the
+  data: copy the record store to a new folder and point `HI2_DIR` at the copy.
+- **The drive is a Gen4 drive.** It works, at about half the read speed of a Gen5 drive.
+
+A drive that wakes up from power saving can make the first reads after an idle period slow; that does not affect
+steady serving.
+
 <details>
 <summary>Settings (engine/profiles/default.env)</summary>
 
@@ -489,6 +514,9 @@ overridden when starting (`K31_X=... engine/k31.sh up`).
 | `K31_PROMPT_SPEC`, `K31_PROMPT_EMPTY_CACHE` | on, on (`fast`: off) | copies ahead of the plan; PyTorch's cached blocks returned after each prompt chunk |
 | `K31_PROMPT_FIRST_CHUNK`, `K31_PROMPT_FIRST_ROWS`, `K31_PROMPT_FIRST_FREE` | 4096,4096, 4096,8192, on (`fast`: off) | a new prompt's first two chunks at 4,096 tokens, the second only where it costs no extra pass |
 | `K31_BAND_BULK_ROWS` | 8,192 (`fast`: 4,096) | the RTX's prompt calls, in rows |
+| `K31_ODIRECT` | on | expert records are read with O_DIRECT (whole records at once, no page cache); off, or where the file system refuses it, buffered reads that ask for every 128 KiB piece at once (`K31_READ_PIECE_KB`), so the host's read-ahead settings do not matter |
+| `K31_STORE_CHECK`, `K31_STORE_CHECK_S` | on, 3.5 | the drive check at start and its time limit in seconds; `K31_STORE_NOTE_GBS`, `K31_STORE_WARN_GBS`, `K31_STORE_WARN_MS` (6, 3, 15) set when the log speaks up |
+| `K31_READ_LAG_S`, `K31_CAPTURE_DRAIN_S` | 0.25, 120 | reads in flight are limited so a promotion lands within about this long on a slow drive; how long start-up waits for reads still in flight before CUDA graph capture |
 
 Other `K31_*` switches in `engine/k31_engine` (deferral, the CPU-memory ring for band entries, other dense formats,
 pre-staging, the Grace pool, timing and checks) are experiments left off by default; each is described where it is
@@ -624,6 +652,8 @@ derpk31pro builds on:
 - brandonmusic's quantization KLD protocol, which the evaluation follows.
 - [ExLlamaV3](https://github.com/turboderp-org/exllamav3) (turboderp), whose graph and utility headers the int8 GEMV uses.
 - Moonshot AI's Kimi K3.1 Pro and Inferact's DSpark drafter.
+- [ebfio](https://github.com/ebfio), whose bug report and measurements (issue #1) found the start-up race with the drive
+  reads and the engine's dependence on the host's read-ahead settings.
 
 Papers behind what ships:
 

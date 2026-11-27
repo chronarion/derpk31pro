@@ -1879,6 +1879,25 @@ def _patch_runner(module) -> None:
         return out
 
     cls.load_model = load_model
+    # Graph capture waits for the residency's reader threads (a guard: the residency does not tick before vLLM's
+    # start-up is over, _patch_worker). vLLM's kernel warm-up runs real execute_model steps right before
+    # capture_model; promotions they started (1.2) were still reading on a slow drive, and a reader thread's CUDA calls
+    # (event waits, copies on its stream) during a global-mode capture invalidate it (cudaErrorStreamCaptureInvalidated).
+    orig_capture = getattr(cls, "capture_model", None)
+    if orig_capture is not None:
+        def capture_model(self, *a, **kw):
+            from .residency import CAPTURE_DRAIN_S
+            held = _RES[0].hold if _RES else True
+            if _RES and CAPTURE_DRAIN_S > 0:
+                n, dt = _RES[0].drain()
+                if n:
+                    _LOG(f"graph capture: waited {1e3 * dt:.0f} ms for {n} reads from the model drive in flight")
+            try:
+                return orig_capture(self, *a, **kw)
+            finally:
+                if _RES:
+                    _RES[0].hold = held
+        cls.capture_model = capture_model
     # K31_MEM_REPORT=1: GB300 memory at start-up milestones (after load_model, after the KV cache, after graph
     # capture): free (cudaMemGetInfo), torch allocated / reserved, and the rest (CUDA context, modules, graph pools,
     # allocations outside torch's caching allocator such as cuBLAS / DeepGEMM workspaces and registered buffers)
@@ -1907,7 +1926,7 @@ def _patch_runner(module) -> None:
     def execute_model(self, *args, **kwargs):
         so = args[0] if args else kwargs.get("scheduler_output")
         ntok = getattr(so, "total_num_scheduled_tokens", 1) or 1
-        if rewarm and _RES and eager[0] and ntok <= 16:          # the first decode step after prompt rows
+        if rewarm and _RES and eager[0] and ntok <= 16 and not _RES[0].hold:   # the first decode step after prompts
             t0 = time.time()
             n = _RES[0].rewarm()
             eager[0] = False
@@ -2606,7 +2625,27 @@ def _patch_gate(module) -> None:
     _LOG("router gate: decode-size calls by w8a16.linear16 (split-K, float32 logits)")
 
 
-PATCHES = {TARGET: _patch_moe, "vllm.third_party.deep_gemm.utils.mlopart": _patch_mlopart,
+def _patch_worker(module) -> None:
+    """The residency starts ticking when the worker's start-up (profile run, kernel warm-up steps, graph capture; or
+    the eager path) is over: residency.start_serving, also when start-up fails part-way."""
+    cls = getattr(module, "Worker", None)
+    f = getattr(cls, "compile_or_warm_up_model", None)
+    if f is None or getattr(f, "_k31", False):
+        return
+
+    def compile_or_warm_up_model(self, *a, **kw):
+        try:
+            return f(self, *a, **kw)
+        finally:
+            if _RES:
+                _RES[0].start_serving()
+                _LOG("residency: start-up over, promotions from here on follow real requests")
+    compile_or_warm_up_model._k31 = True
+    cls.compile_or_warm_up_model = compile_or_warm_up_model
+
+
+PATCHES = {TARGET: _patch_moe, "vllm.v1.worker.gpu_worker": _patch_worker,
+           "vllm.third_party.deep_gemm.utils.mlopart": _patch_mlopart,
            "vllm.model_executor.layers.fused_moe.router.gate_linear": _patch_gate,
            "vllm.model_executor.layers.quantization.online.fp8": _patch_fp8_online,
            "vllm.models.kimi_k3.nvidia.model": _patch_model,
