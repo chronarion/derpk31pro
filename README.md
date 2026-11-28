@@ -5,7 +5,15 @@ answered right (average of three runs; Moonshot reports 94.2%, 186.5 of 198), at
 conversation and 111 for four at once, reading prompts at 3,200 to 4,000 tokens per second. A `fast` profile trades
 some of that closeness for over 100 tokens per second.
 
-**New in 1.2:** the experts' scale factors are stored packed. That changes no computed bit but frees memory: about
+**New in 1.3:** the engine no longer depends on how fast or how tuned your model drive is to start up, and it tells
+you when the drive slows it down. 1.2 could fail at start-up on a slow drive, or on a drive with Linux's stock
+read-ahead settings, while capturing CUDA graphs (issue #1). 1.3 moves no experts until start-up is over, reads expert
+records with O_DIRECT (whole records at once, whatever the host's settings), queues fewer reads on a slow drive,
+checks the drive at every start (a few seconds at most) and explains in the log what to do when it is slow (see
+[If the log warns about the model drive](#if-the-log-warns-about-the-model-drive)). On our drive that is also about
+2% faster than 1.2, with the same closeness. No store conversion or rebuild is needed.
+
+**1.2:** the experts' scale factors are stored packed. That changes no computed bit but frees memory: about
 4,200 experts that used to get their average output now have a 2-bit copy or a place in GPU memory (see
 [Packed scale factors](#packed-scale-factors)). Upgrading from 1.1 needs a one-time conversion of the record store,
 which takes minutes on XFS or Btrfs. **1.1** made prompts read 1.5 to 1.9 times as fast as 1.0 (see
@@ -56,6 +64,10 @@ Every profile serves up to four conversations of up to 262,144 tokens each (a 26
 | an early build of `fast` | 0.300 (4 at once) | 10.8 | 3.84 | 6 of 64 | 0.0896 / 0.0619 |
 | the official model, for scale | 0.003 | under 0.01 on science questions, up to 0.8 on chat | 0 | | 0 / 0 |
 
+- **What 1.3 re-measured:** `default`, one conversation, two starts per setting: 29.4 engine steps per second with
+  O_DIRECT against 28.4 with buffered reads (1.2's reads: 28.7-28.8), KLD on the 32-conversation fixed-text screen
+  0.0415 against 0.0417. With every record read slowed to one second on purpose, start-up without the fix failed and
+  1.3 starts normally, serves at about 64 tokens per second and warns. The table's other numbers are 1.2's.
 - **What 1.2 re-measured:** the packed forms are checked byte for byte and bit for bit (unit tests on the GB300 and
   the RTX; MegaMoE on packed rows at decode and prompt sizes). On the development tree the packed scale factors
   lowered KLD on the fixed-text screen to x0.927 (`nortx`) and x0.953 (`default`), paired. `nortx` ran lil-bench
