@@ -1,8 +1,8 @@
 # derpk31pro
 
 Kimi K3.1 Pro on a single DGX Station GB300, as close to the official model as GPQA Diamond can tell: 186.3 of 198
-answered right (average of three runs; Moonshot reports 94.2%, 186.5 of 198), at about 76 tokens per second for one
-conversation and 111 for four at once, reading prompts at 3,200 to 4,000 tokens per second. A `fast` profile trades
+answered right (average of three runs; Moonshot reports 94.2%, 186.5 of 198), at about 75 tokens per second for one
+conversation and 111 for four at once, reading prompts at 3,200 to 4,100 tokens per second. A `fast` profile trades
 some of that closeness for over 100 tokens per second.
 
 **New in 1.3:** the engine no longer depends on how fast or how tuned your model drive is to start up, and it tells
@@ -47,8 +47,8 @@ MegaMoE, the expert kernel from DeepGEMM, which computes a whole expert layer in
 
 | profile | decode, 1 / 2 / 4 conversations at once | reading a prompt (32K / 128K tokens) | GPQA Diamond (198 questions) |
 |---|---|---|---|
-| `default` (GB300 + RTX PRO 6000) | 75.0 / 93.0 / 109.9 tokens/s (1.2) | 3,282 / 3,211 tokens/s (1.2) | 186.3 (runs: 186, 185, 188; 1.0) |
-| `nortx` (GB300 alone) | 71.6 / 86.8 / 108.8 tokens/s (1.2) | 3,696 / 4,049 tokens/s (1.2) | 183 (one run of 1.1; 1.0: 187.0, runs 188, 186); 1.2: 3 of 3 long-reasoning spot checks |
+| `default` (GB300 + RTX PRO 6000) | 74.6 / 94.0 / 110.6 tokens/s (1.3) | 3,231 / 3,709 tokens/s (1.3) | 186.3 (runs: 186, 185, 188; 1.0) |
+| `nortx` (GB300 alone) | 72.0 / 86.4 / 108.9 tokens/s (1.3) | 3,822 / 4,100 tokens/s (1.3) | 183 (one run of 1.1; 1.0: 187.0, runs 188, 186); 1.2: 3 of 3 long-reasoning spot checks |
 | `fast` (GB300 + RTX PRO 6000) | 103.4 / not measured / not measured | 2,138 / 2,164 tokens/s | not measured |
 | `fast-nortx` (GB300 alone) | 88.3 / not measured / not measured | 2,246 / 2,215 tokens/s | not measured |
 
@@ -67,7 +67,11 @@ Every profile serves up to four conversations of up to 262,144 tokens each (a 26
 - **What 1.3 re-measured:** `default`, one conversation, two starts per setting: 29.4 engine steps per second with
   O_DIRECT against 28.4 with buffered reads (1.2's reads: 28.7-28.8), KLD on the 32-conversation fixed-text screen
   0.0415 against 0.0417. With every record read slowed to one second on purpose, start-up without the fix failed and
-  1.3 starts normally, serves at about 64 tokens per second and warns. The table's other numbers are 1.2's.
+  1.3 starts normally, serves at about 64 tokens per second and warns. lil-bench, both profiles, the same day:
+  `default` decode 74.6 / 94.0 / 110.6 tokens/s at 1 / 2 / 4 conversations (1.2: 75.0 / 93.0 / 109.9), prompts
+  3,231 / 3,709 tokens/s at 32K / 128K (1.2: 3,282 / 3,211); `nortx` 72.0 / 86.4 / 108.9 (1.2: 71.6 / 86.8 / 108.8),
+  prompts 3,822 / 4,100 (1.2: 3,696 / 4,049). Decode is the same as 1.2 within run-to-run noise; the steps-per-second
+  gain above is too small to show in tokens per second.
 - **What 1.2 re-measured:** the packed forms are checked byte for byte and bit for bit (unit tests on the GB300 and
   the RTX; MegaMoE on packed rows at decode and prompt sizes). On the development tree the packed scale factors
   lowered KLD on the fixed-text screen to x0.927 (`nortx`) and x0.953 (`default`), paired. `nortx` ran lil-bench
